@@ -29,8 +29,14 @@ typedef intptr_t smm;
 #define F32_EPSILON FLT_EPSILON
 
 #define internal      static
-#define global        static
 #define local_persist static
+// `global` is not defined in CUDA translation units: nvcc expands __global__
+// through __attribute__((global)), which this macro would turn into
+// __attribute__((static)) and silently demote every kernel to a host function.
+// CUDA code uses plain `static` for file-scope state.
+#ifndef __CUDACC__
+#define global        static
+#endif
 
 // Build configuration (set by build.sh / build.bat, defaults for stray TUs):
 //   SIM_INTERNAL  1 = developer build (debug tables, asserts stay on)

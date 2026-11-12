@@ -9,7 +9,7 @@
 
 #include "particles.cpp"
 
-#define SIM_DT_FIXED (1.0f / 1000.0f)   // 1 ms master step
+#define SIM_DT_FIXED (1.0 / 1000.0)     // 1 ms master step (f64; cast to f32 for the kernels)
 #define SIM_MAX_STEPS_PER_FRAME 64      // spiral-of-death guard
 
 // Tunables applied every update, so editing one here and rebuilding the sim
@@ -34,8 +34,8 @@ struct SimState {
     Arena scratch;
     u64 scratch_high_water;
 
-    f32 dt_fixed;
-    f32 accumulator;
+    f64 dt_fixed;
+    f64 accumulator;   // f64 so N frames of a fixed dt yield exactly the expected step count
     u64 step_count;
     f64 sim_time;
     b32 paused;
@@ -55,7 +55,7 @@ internal void sim_reset_particles(SimState *state, SimMemory *memory) {
                    sqrtf(PARTICLE_SPRING));
     state->step_count = 0;
     state->sim_time = 0.0;
-    state->accumulator = 0.0f;
+    state->accumulator = 0.0;
 }
 
 internal void sim_initialize(SimMemory *memory) {
@@ -143,8 +143,8 @@ SIM_API SIM_UPDATE(sim_update) {
     // Fixed timestep: accumulate wall time, step deterministically.
     u32 steps = 0;
     if (!state->paused) {
-        state->accumulator += input->dt_frame;
-        f32 max_accum = state->dt_fixed * SIM_MAX_STEPS_PER_FRAME;
+        state->accumulator += (f64)input->dt_frame;
+        f64 max_accum = state->dt_fixed * SIM_MAX_STEPS_PER_FRAME;
         if (state->accumulator > max_accum) {
             state->accumulator = max_accum;
         }
@@ -153,12 +153,13 @@ SIM_API SIM_UPDATE(sim_update) {
         params.swirl = PARTICLE_SWIRL;
         params.damping = PARTICLE_DAMPING;
         params.bound = PARTICLE_BOUND;
+        f32 dt_step = (f32)state->dt_fixed;
         TIMED_BLOCK("fixed_steps");
         while (state->accumulator >= state->dt_fixed) {
-            particles_step(&state->particles, params, state->dt_fixed);
+            particles_step(&state->particles, params, dt_step);
             state->accumulator -= state->dt_fixed;
             state->step_count += 1;
-            state->sim_time += (f64)state->dt_fixed;
+            state->sim_time += state->dt_fixed;
             ++steps;
         }
     }
@@ -176,7 +177,7 @@ SIM_API SIM_UPDATE(sim_update) {
     stats->step_count = state->step_count;
     stats->steps_this_frame = steps;
     stats->sim_time = state->sim_time;
-    stats->dt_fixed = state->dt_fixed;
+    stats->dt_fixed = (f32)state->dt_fixed;
     stats->particle_count = state->particles.count;
     stats->state_hash = input->compute_state_hash ? particles_hash(&state->particles) : 0;
     stats->permanent_used = sizeof(SimState) + state->permanent.used;

@@ -58,7 +58,16 @@ echo "[build] simstack_sim.so  $(( ($(date +%s%N) - START) / 1000000 )) ms"
 
 # --- gpu module (optional; needs the CUDA toolkit) -------------------------------
 if [ "$CUDA" = 1 ]; then
-    NVCC=${NVCC:-nvcc}
+    # nvcc is often not on PATH (e.g. /opt/cuda/bin): honour NVCC, then CUDA_HOME.
+    if [ -z "${NVCC:-}" ]; then
+        if [ -n "${CUDA_HOME:-}" ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then NVCC="$CUDA_HOME/bin/nvcc"
+        elif command -v nvcc >/dev/null 2>&1; then NVCC=nvcc
+        elif [ -x /opt/cuda/bin/nvcc ]; then NVCC=/opt/cuda/bin/nvcc
+        elif [ -x /usr/local/cuda/bin/nvcc ]; then NVCC=/usr/local/cuda/bin/nvcc
+        else echo "[build] nvcc not found: set NVCC or CUDA_HOME"; exit 1
+        fi
+    fi
+    echo "[build] nvcc=$NVCC"
     $NVCC -arch=sm_86 -O3 -lineinfo --shared -Xcompiler -fPIC -Isrc src/gpu/kernels.cu -o build/simstack_gpu.so
     echo "[build] simstack_gpu.so"
 fi

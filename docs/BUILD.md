@@ -18,7 +18,7 @@ root file. Headers in `src/base/` and `src/sim_platform.h` are shared.
 - An x86-64 CPU with AVX2 + FMA (the build targets the i9-12900KF; no AVX-512 is used).
 - Linux: Xlib and OpenGL development headers (`libx11-dev`, `libgl-dev`, `libglx-dev` on Debian/Ubuntu). Any GL 3.3+ core driver works; 4.5 is requested first. Mesa `llvmpipe` is enough for the windowed demo.
 - Windows: Windows SDK (comes with Visual Studio); `opengl32.lib`, `user32.lib`, `gdi32.lib` are part of it.
-- Optional: CUDA toolkit 12.x with `nvcc` for the gpu module.
+- Optional: CUDA toolkit 12.x or 13.x with `nvcc` for the gpu module (13.4 confirmed on an RTX 3060 12 GB). If `nvcc` is not on `PATH` (e.g. `/opt/cuda/bin`), set `NVCC=/opt/cuda/bin/nvcc` or `CUDA_HOME=/opt/cuda`; `build.sh --cuda` also probes `/opt/cuda` and `/usr/local/cuda`.
 
 No third-party libraries. No C++ runtime library is linked on Linux (`-nostdlib++`):
 there are no exceptions, no RTTI, no `new`/`delete`, no STL.
@@ -33,6 +33,7 @@ there are no exceptions, no RTTI, no `new`/`delete`, no STL.
 ./build.sh debug --asan        # AddressSanitizer + UBSan
 ./build.sh release --sim-only  # rebuild only simstack_sim.so (hot reload)
 ./build.sh release --cuda      # also build simstack_gpu.so with nvcc
+CUDA_HOME=/opt/cuda ./build.sh release --cuda   # nvcc off PATH (or NVCC=/opt/cuda/bin/nvcc)
 CXX=g++ ./build.sh release     # use gcc instead of clang
 ```
 
@@ -72,8 +73,8 @@ particle positions and step counter carry over; the title bar shows
 [platform] file io selftest: ok
 [platform] memory 384 MB at 0x200000000000, sim /.../build/simstack_sim.so, 2400006 cycles/ms, simd=1
 [headless] 600 frames in 0.410 s (0.682 ms/frame avg, 0.628 min, 2.051 max), 0 reloads
-[headless] 9999 fixed steps (dt 0.0010 s), sim time 9.999 s, 65536 particles, 1601.2 M particle-steps/s
-[headless] state hash 7de8c8fb172e6309
+[headless] 10000 fixed steps (dt 0.0010 s), sim time 10.000 s, 65536 particles, 1601.2 M particle-steps/s
+[headless] state hash ad345be205e7478d
   arenas: permanent 1.5/256 MB  frame 0.00/64 MB  scratch high-water 32 B/64 MB
   timed block                  hits/frame cycles/frame   ms/frame
   sim_update                         1.00      1636757      0.682   (src/sim/simstack.cpp:129)
@@ -81,9 +82,14 @@ particle positions and step counter carry over; the title bar shows
 ```
 
 The state hash is an FNV-1a over the particle positions after the last frame.
-It must be identical across runs, across `--simd=0` / `--simd=1`, and across
-clang / gcc for the same particle count and seed (`-ffp-contract=off` and an
-explicit `fmadd` in both SIMD paths keep the arithmetic bit-exact).
+It must be identical across runs, across `--simd=0` / `--simd=1`, across
+debug / release / ship, and across clang / gcc for the same particle count and
+seed (`-ffp-contract=off` and an explicit `fmadd` in both SIMD paths keep the
+arithmetic bit-exact). Reference values for the defaults (65536 particles,
+seed 1): `--headless 120` gives 2000 steps and hash `d0dd6ee26223a1ec`;
+`--headless 600` gives 10000 steps and hash `ad345be205e7478d`. The step
+accumulator is `f64`, so N frames of the fixed 1/60 s headless dt always
+produce exactly the expected number of 1 ms steps.
 
 ## Windows
 

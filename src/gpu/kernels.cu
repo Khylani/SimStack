@@ -1,14 +1,17 @@
 // Simstack GPU module: the single nvcc translation unit.
 //   nvcc -arch=sm_86 -O3 -lineinfo --shared -Xcompiler -fPIC -Isrc src/gpu/kernels.cu -o build/simstack_gpu.so
 //
-// STATUS (milestone 1): compiles standalone with the CUDA 12.x toolkit; not yet
-// loaded by the platform and not exercised on this VM (no toolkit available).
-// The bump arena mirrors base_arena.h so host and device layouts stay in sync.
+// STATUS (milestone 1): compiles with CUDA 12.x / 13.x (13.4 confirmed on an
+// RTX 3060 12 GB, sm_86); not yet loaded by the platform. The bump arena
+// mirrors base_arena.h so host and device layouts stay in sync.
+//
+// Note: base_types.h does not define the `global` macro under __CUDACC__
+// (it would rewrite __global__ into __attribute__((static))); use `static`.
 
 #include <cuda_runtime.h>
 #include "gpu_api.h"
 
-#define GPU_ARENA_SIZE Gigabytes(1)   // placeholder; the plan targets ~9 GB on the RTX 3080
+#define GPU_ARENA_SIZE Gigabytes(1)   // placeholder; the plan targets most of the 12 GB on the RTX 3060
 
 struct GpuArena {
     u8 *base;
