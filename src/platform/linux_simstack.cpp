@@ -21,11 +21,16 @@
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sched.h>
 
 #define DEBUG_RECORD_BASE 0
 #include "../sim_platform.h"
 #include "platform_common.cpp"
 #include "render_gl.cpp"
+#include "linux_work_queue.cpp"
+#include "linux_gpu.cpp"
 
 #ifndef GLX_CONTEXT_MAJOR_VERSION_ARB
 #define GLX_CONTEXT_MAJOR_VERSION_ARB     0x2091
@@ -136,6 +141,7 @@ struct LinuxSimCode {
     void *handle;
     sim_update_fn *update;
     sim_on_reload_fn *on_reload;
+    sim_before_unload_fn *before_unload;   // optional
     u64 loaded_mtime_ns;
     u32 load_index;
     b32 is_valid;
@@ -146,6 +152,7 @@ struct LinuxPaths {
     char sim_so[PATH_MAX];
     char lock[PATH_MAX];
     char selftest[PATH_MAX];
+    char gpu_so[PATH_MAX];
 };
 
 internal void linux_build_paths(LinuxPaths *paths) {
@@ -157,6 +164,7 @@ internal void linux_build_paths(LinuxPaths *paths) {
     snprintf(paths->sim_so, sizeof(paths->sim_so), "%s/simstack_sim.so", paths->exe_dir);
     snprintf(paths->lock, sizeof(paths->lock), "%s/lock.tmp", paths->exe_dir);
     snprintf(paths->selftest, sizeof(paths->selftest), "%s/selftest.txt", paths->exe_dir);
+    snprintf(paths->gpu_so, sizeof(paths->gpu_so), "%s/simstack_gpu.so", paths->exe_dir);
 }
 
 internal void linux_unload_sim_code(LinuxSimCode *code) {
@@ -187,6 +195,7 @@ internal LinuxSimCode linux_load_sim_code(LinuxPaths *paths, u32 load_index) {
     }
     code.update = (sim_update_fn *)dlsym(code.handle, SIM_UPDATE_EXPORT_NAME);
     code.on_reload = (sim_on_reload_fn *)dlsym(code.handle, SIM_ON_RELOAD_EXPORT_NAME);
+    code.before_unload = (sim_before_unload_fn *)dlsym(code.handle, SIM_BEFORE_UNLOAD_EXPORT_NAME);
     code.is_valid = code.update && code.on_reload;
     if (!code.is_valid) {
         fprintf(stderr, "[platform] missing exports in %s\n", paths->sim_so);
@@ -202,6 +211,8 @@ internal b32 linux_check_reload(LinuxSimCode *code, LinuxPaths *paths, SimMemory
     if (mtime == 0 || linux_file_exists(paths->lock)) return 0;
     LinuxSimCode fresh = linux_load_sim_code(paths, code->load_index + 1);
     if (!fresh.is_valid) return 0;
+    if (memory->background_queue) linux_complete_all_work(memory->background_queue);   // no job may run across the swap
+    if (code->is_valid && code->before_unload && memory->is_initialized) code->before_unload(memory);
     linux_unload_sim_code(code);
     *code = fresh;
     code->on_reload(memory);
@@ -221,6 +232,8 @@ internal void linux_process_button(SimButtonState *button, b32 is_down) {
 internal void linux_begin_input_frame(SimInput *input) {
     for (u32 i = 0; i < SimKey_Count; ++i) input->keys[i].half_transition_count = 0;
     for (u32 i = 0; i < ArrayCount(input->mouse_buttons); ++i) input->mouse_buttons[i].half_transition_count = 0;
+    input->mouse_wheel = 0.0f;
+    input->text[0] = 0;
 }
 
 internal s32 linux_keysym_to_simkey(KeySym sym) {
@@ -234,6 +247,24 @@ internal s32 linux_keysym_to_simkey(KeySym sym) {
         case XK_Right:  return SimKey_Right;
         case XK_Up:     return SimKey_Up;
         case XK_Down:   return SimKey_Down;
+        case XK_Tab: case XK_ISO_Left_Tab: return SimKey_Tab;
+        case XK_Return: case XK_KP_Enter: return SimKey_Enter;
+        case XK_BackSpace: return SimKey_Backspace;
+        case XK_Delete: return SimKey_Delete;
+        case XK_Home:   return SimKey_Home;
+        case XK_End:    return SimKey_End;
+        case XK_Page_Up: return SimKey_PageUp;
+        case XK_Page_Down: return SimKey_PageDown;
+        case XK_Control_L: case XK_Control_R: return SimKey_Ctrl;
+        case XK_Shift_L: case XK_Shift_R: return SimKey_Shift;
+        case XK_Alt_L: case XK_Alt_R: return SimKey_Alt;
+        case XK_a: case XK_A: return SimKey_A;
+        case XK_c: case XK_C: return SimKey_C;
+        case XK_v: case XK_V: return SimKey_V;
+        case XK_x: case XK_X: return SimKey_X;
+        case XK_y: case XK_Y: return SimKey_Y;
+        case XK_z: case XK_Z: return SimKey_Z;
+        case XK_F2:     return SimKey_F2;
         default:        return -1;
     }
 }
@@ -283,7 +314,7 @@ internal b32 linux_create_window(LinuxWindow *win, u32 width, u32 height) {
     XSetWindowAttributes swa = {};
     swa.colormap = XCreateColormap(win->display, root, visual->visual, AllocNone);
     swa.event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask |
-                     PointerMotionMask | StructureNotifyMask | ExposureMask;
+                     PointerMotionMask | StructureNotifyMask | ExposureMask | EnterWindowMask | LeaveWindowMask;
     win->window = XCreateWindow(win->display, root, 0, 0, width, height, 0, visual->depth, InputOutput,
                                 visual->visual, CWColormap | CWEventMask, &swa);
     XFree(visual);
@@ -338,16 +369,35 @@ internal void linux_process_events(LinuxWindow *win, SimInput *input) {
                 KeySym sym = XkbKeycodeToKeysym(win->display, (KeyCode)ev.xkey.keycode, 0, 0);
                 s32 key = linux_keysym_to_simkey(sym);
                 if (key >= 0) linux_process_button(input->keys + key, ev.type == KeyPress);
+                if (ev.type == KeyPress && !(ev.xkey.state & ControlMask)) {
+                    char buf[16];
+                    KeySym ignored;
+                    int n = XLookupString(&ev.xkey, buf, sizeof(buf), &ignored, 0);
+                    u32 len = (u32)strlen(input->text);
+                    for (int i = 0; i < n; ++i) {
+                        u8 c = (u8)buf[i];
+                        if (c >= 32 && c != 127 && len + 1 < sizeof(input->text)) input->text[len++] = (char)c;
+                    }
+                    input->text[len] = 0;
+                }
             } break;
             case ButtonPress:
             case ButtonRelease: {
                 u32 b = ev.xbutton.button;
-                if (b >= 1 && b <= 3) linux_process_button(input->mouse_buttons + (b - 1), ev.type == ButtonPress);
+                // X11 buttons: 1 left, 2 middle, 3 right, 4/5 wheel. SimInput: 0 left, 1 right, 2 middle.
+                if (b == 1) linux_process_button(input->mouse_buttons + 0, ev.type == ButtonPress);
+                if (b == 3) linux_process_button(input->mouse_buttons + 1, ev.type == ButtonPress);
+                if (b == 2) linux_process_button(input->mouse_buttons + 2, ev.type == ButtonPress);
+                if (ev.type == ButtonPress && b == 4) input->mouse_wheel += 1.0f;
+                if (ev.type == ButtonPress && b == 5) input->mouse_wheel -= 1.0f;
             } break;
             case MotionNotify: {
                 input->mouse_x = (f32)ev.xmotion.x;
                 input->mouse_y = (f32)ev.xmotion.y;
+                input->mouse_inside = 1;
             } break;
+            case EnterNotify: input->mouse_inside = 1; break;
+            case LeaveNotify: input->mouse_inside = 0; break;
             case ConfigureNotify: {
                 win->width = (u32)ev.xconfigure.width;
                 win->height = (u32)ev.xconfigure.height;
@@ -393,12 +443,40 @@ int main(int argc, char **argv) {
     memory.frame_base = (u8 *)block + PLATFORM_PERMANENT_SIZE;
     memory.scratch_size = PLATFORM_SCRATCH_SIZE;
     memory.scratch_base = (u8 *)block + PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE;
+    memory.ui_size = PLATFORM_UI_SIZE;
+    memory.ui_base = (u8 *)memory.scratch_base + PLATFORM_SCRATCH_SIZE;
+    memory.config.scene = args.scene;
     memory.config.particle_count = args.particle_count;
+    memory.config.zone_count = args.zone_count;
+    memory.config.backend = args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
+    memory.config.averaged = args.averaged;
+    memory.config.precision = args.precision;
+    memory.config.chem_steps = args.chem_steps;
+    memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
     memory.platform.read_entire_file = linux_read_entire_file;
     memory.platform.write_entire_file = linux_write_entire_file;
     memory.platform.now_ns = linux_now_ns;
     memory.platform.log = platform_log_stdout;
+    memory.platform.add_work_entry = linux_add_work_entry;
+    memory.platform.complete_all_work = linux_complete_all_work;
+
+    static PlatformWorkQueue work_queue, background_queue;
+    linux_make_work_queue(&work_queue, args.threads - 1, 2, 2);
+    linux_make_work_queue(&background_queue, 1, 1, 1);
+    memory.work_queue = &work_queue;
+    memory.worker_count = args.threads;
+    memory.background_queue = &background_queue;
+
+    if (args.gpu) {
+        if (linux_load_gpu_module(paths.gpu_so, Megabytes((u64)args.gpu_mem_mb), &memory.gpu)) {
+            GpuInfo *gi = &memory.gpu.info;
+            printf("[gpu] %s (sm_%u%u, %u SMs), %.0f of %.0f MB free, arena %u MB\n", gi->name, gi->sm_major, gi->sm_minor,
+                   gi->multiprocessors, (f64)gi->free_bytes / 1048576.0, (f64)gi->total_bytes / 1048576.0, args.gpu_mem_mb);
+        } else {
+            printf("[gpu] unavailable, running on the CPU\n");
+        }
+    }
 
     DebugTable debug_table = {};
 #if SIM_INTERNAL
@@ -420,8 +498,9 @@ int main(int argc, char **argv) {
     }
     sim.on_reload(&memory);
     f64 cycles_per_ms = linux_measure_cycles_per_ms();
-    printf("[platform] memory %llu MB at %p, sim %s, %.0f cycles/ms, simd=%d\n",
-           (unsigned long long)(PLATFORM_TOTAL_SIZE >> 20), block, paths.sim_so, cycles_per_ms, SIM_SIMD);
+    debug_table.cycles_per_ms = cycles_per_ms;
+    printf("[platform] memory %llu MB at %p, sim %s, %.0f cycles/ms, simd=%d, threads %u\n",
+           (unsigned long long)(PLATFORM_TOTAL_SIZE >> 20), block, paths.sim_so, cycles_per_ms, SIM_SIMD, args.threads);
 
     SimInput input = {};
     RenderCommands render = {};
@@ -450,10 +529,17 @@ int main(int argc, char **argv) {
         printf("[headless] %u frames in %.3f s (%.3f ms/frame avg, %.3f min, %.3f max), %u reloads\n",
                args.headless_frames, wall, (f64)sum_ns * 1e-6 / (f64)args.headless_frames,
                (f64)min_ns * 1e-6, (f64)max_ns * 1e-6, reloads);
-        printf("[headless] %llu fixed steps (dt %.4f s), sim time %.3f s, %u particles, "
-               "%.1f M particle-steps/s\n",
-               (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,
-               (f64)stats.step_count * (f64)stats.particle_count / ((f64)sum_ns * 1e-9) * 1e-6);
+        if (args.scene == SimScene_Particles) {
+            printf("[headless] %llu fixed steps (dt %.4f s), sim time %.3f s, %u particles, "
+                   "%.1f M particle-steps/s\n",
+                   (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,
+                   (f64)stats.step_count * (f64)stats.particle_count / ((f64)sum_ns * 1e-9) * 1e-6);
+        } else {
+            printf("[headless] %llu master steps (dt %.4f s), sim time %.3f s, %u zones, %.2f sim-s per wall-s\n",
+                   (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,
+                   stats.sim_time / ((f64)sum_ns * 1e-9));
+            printf("[headless] %s\n", stats.summary);
+        }
         printf("[headless] state hash %016llx\n", (unsigned long long)stats.state_hash);
         platform_print_memory_stats(&stats);
         platform_print_debug_table(&debug_table, args.headless_frames, cycles_per_ms, 1);
@@ -470,7 +556,7 @@ int main(int argc, char **argv) {
     u32 frames_in_window = 0;
     u64 frame_index = 0;
     while (win.running) {
-        linux_check_reload(&sim, &paths, &memory);
+        if (linux_check_reload(&sim, &paths, &memory)) gl_drop_ui_textures(&renderer);
 
         linux_begin_input_frame(&input);
         linux_process_events(&win, &input);
@@ -480,11 +566,13 @@ int main(int argc, char **argv) {
         input.dt_frame = Clamp((f32)linux_seconds_between(last_ns, now_ns), 0.0f, PLATFORM_MAX_FRAME_DT);
         last_ns = now_ns;
 
+        u64 work_start_ns = linux_now_ns();
         if (sim.is_valid) sim.update(&memory, &input, &render, &stats);
         {
             TIMED_BLOCK("gl_render_frame");
             gl_render_frame(&renderer, &render, win.width, win.height);
         }
+        debug_table_end_frame(&debug_table);
         ++frames_in_window;
         ++frame_index;
         if (args.windowed_frames && frame_index >= args.windowed_frames) win.running = 0;
@@ -493,6 +581,7 @@ int main(int argc, char **argv) {
             printf("[platform] screenshot %s: %s\n", args.screenshot_path,
                    gl_write_screenshot_ppm(&memory.platform, &platform_scratch, args.screenshot_path, win.width, win.height) ? "ok" : "FAILED");
         }
+        input.last_work_ms = (f32)((f64)(linux_now_ns() - work_start_ns) * 1e-6);
         {
             TIMED_BLOCK("glXSwapBuffers");
             glXSwapBuffers(win.display, win.window);
@@ -502,20 +591,22 @@ int main(int argc, char **argv) {
             u64 t = linux_now_ns();
             f64 ms_per_frame = linux_seconds_between(window_start_ns, t) * 1000.0 / (f64)frames_in_window;
             char title[256];
-            snprintf(title, sizeof(title), "simstack  %.2f ms/frame  step %llu  %u particles%s%s", ms_per_frame,
-                     (unsigned long long)stats.step_count, stats.particle_count,
+            snprintf(title, sizeof(title), "simstack  %.2f ms/frame  step %llu  t %.2f s  %u %s%s%s", ms_per_frame,
+                     (unsigned long long)stats.step_count, stats.sim_time, stats.particle_count,
+                     args.scene == SimScene_Particles ? "particles" : "zones",
                      stats.paused ? "  [paused]" : "", stats.reload_count ? "  [reloaded]" : "");
             XStoreName(win.display, win.window, title);
             if (!args.quiet) {
                 printf("[frame %llu] %.2f ms/frame, %u steps/frame, sim t=%.2f s, reloads %u\n",
                        (unsigned long long)frame_index, ms_per_frame, stats.steps_this_frame, stats.sim_time,
                        stats.reload_count);
+                if (stats.summary[0]) printf("  %s\n", stats.summary);
                 platform_print_memory_stats(&stats);
                 platform_print_debug_table(&debug_table, frames_in_window, cycles_per_ms, 0);
             }
             frames_in_window = 0;
             window_start_ns = t;
-            debug_table_end_frame(&debug_table);
+            debug_table_reset_window(&debug_table);
         }
     }
 

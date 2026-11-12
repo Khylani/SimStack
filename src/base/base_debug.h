@@ -32,11 +32,16 @@ struct DebugRecord {
     u64 cycles;           // this frame
     u64 total_hits;       // since start
     u64 total_cycles;     // since start
+    u32 last_hits;        // previous frame (what a UI can show)
+    u64 last_cycles;
+    u64 window_hits;      // since the platform's last periodic print
+    u64 window_cycles;
 };
 
 struct DebugTable {
     DebugRecord records[DEBUG_MAX_RECORDS];
     u64 frame_index;
+    f64 cycles_per_ms;    // measured by the platform at startup
 };
 
 #if SIM_INTERNAL
@@ -80,10 +85,22 @@ struct TimedBlock {
 
 SIM_FORCE_INLINE void debug_table_end_frame(DebugTable *table) {
     for (u32 i = 0; i < DEBUG_MAX_RECORDS; ++i) {
-        table->records[i].cycles = 0;
-        table->records[i].hit_count = 0;
+        DebugRecord *r = table->records + i;
+        r->last_cycles = r->cycles;
+        r->last_hits = r->hit_count;
+        r->window_cycles += r->cycles;
+        r->window_hits += r->hit_count;
+        r->cycles = 0;
+        r->hit_count = 0;
     }
     ++table->frame_index;
+}
+
+SIM_FORCE_INLINE void debug_table_reset_window(DebugTable *table) {
+    for (u32 i = 0; i < DEBUG_MAX_RECORDS; ++i) {
+        table->records[i].window_cycles = 0;
+        table->records[i].window_hits = 0;
+    }
 }
 
 #else
@@ -91,6 +108,7 @@ SIM_FORCE_INLINE void debug_table_end_frame(DebugTable *table) {
 #define TIMED_BLOCK(name)
 #define TIMED_FUNCTION()
 SIM_FORCE_INLINE void debug_table_end_frame(DebugTable *table) { (void)table; }
+SIM_FORCE_INLINE void debug_table_reset_window(DebugTable *table) { (void)table; }
 
 #endif // SIM_INTERNAL
 

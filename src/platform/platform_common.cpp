@@ -10,9 +10,10 @@
 // address in internal builds so pointers are stable across runs (useful for
 // debugging and later for replay snapshots).
 #define PLATFORM_PERMANENT_SIZE Megabytes(256)
-#define PLATFORM_FRAME_SIZE     Megabytes(64)
+#define PLATFORM_FRAME_SIZE     Megabytes(128)
 #define PLATFORM_SCRATCH_SIZE   Megabytes(64)
-#define PLATFORM_TOTAL_SIZE     (PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE + PLATFORM_SCRATCH_SIZE)
+#define PLATFORM_UI_SIZE        Megabytes(256)
+#define PLATFORM_TOTAL_SIZE     (PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE + PLATFORM_SCRATCH_SIZE + PLATFORM_UI_SIZE)
 #if SIM_INTERNAL
 #define PLATFORM_MEMORY_BASE_ADDRESS ((void *)0x200000000000ull)
 #else
@@ -26,7 +27,16 @@
 struct PlatformArgs {
     b32 headless;
     u32 headless_frames;
+    u32 scene;            // SimScene
     u32 particle_count;
+    u32 zone_count;
+    u32 threads;          // work queue threads including the main thread
+    b32 gpu;
+    u32 gpu_mem_mb;
+    b32 averaged;
+    u32 precision;        // 0 f32, 1 f64 (SimConfig::precision)
+    u32 chem_steps;       // SimConfig::chem_steps
+    const char *csv_path;
     u32 seed;
     u32 window_width;
     u32 window_height;
@@ -36,12 +46,23 @@ struct PlatformArgs {
 };
 
 internal void platform_print_usage(const char *exe) {
-    printf("usage: %s [--headless N] [--particles N] [--seed N] [--size WxH] [--quiet]\n"
-           "          [--frames N] [--screenshot file.ppm]\n"
+    printf("usage: %s [--scene particles|dbd|sweep] [--headless N] [--zones N] [--threads N] [--gpu]\n"
+           "          [--gpu-mem MB] [--averaged] [--precision f32|f64] [--csv file] [--particles N] [--seed N] [--size WxH]\n"
+           "          [--quiet] [--frames N] [--screenshot file.ppm]\n"
+           "  --scene S      particles (M1 demo, default), dbd (plug-flow DBD reactor), sweep (power x humidity grid)\n"
            "  --headless N   run N frames without a window at a fixed 1/60 s frame dt, print timings\n"
+           "  --zones N      dbd: axial zones (default 64); sweep: grid points (rounded down to a square, default 256)\n"
+           "  --threads N    worker threads including the main thread (default 8, one per P-core)\n"
+           "  --gpu          load build/simstack_gpu.so and run the chemistry on CUDA\n"
+           "  --gpu-mem MB   device arena size (default 512)\n"
+           "  --averaged     continuous discharge source instead of one pulse per half-cycle\n"
+           "  --chem-dt N    chemistry advance every N ms (master steps); reactor default 1, sweep 20\n"
+           "  --precision P  chemistry lanes: f32 (default: 8 zones per AVX2 register, CUDA FP32 units)\n"
+           "                 or f64 (reference: exact atom bookkeeping for long runs)\n"
+           "  --csv F        dbd: outlet time series (rewritten every simulated second); sweep: final grid\n"
            "  --frames N     windowed: quit after N frames\n"
            "  --screenshot F windowed: write the last frame as a binary PPM to F\n"
-           "  --particles N  dummy particle count (default 65536)\n"
+           "  --particles N  particles scene: count (default 65536)\n"
            "  --seed N       particle seed (default 1)\n"
            "  --size WxH     window size (default 1280x720)\n"
            "  --quiet        no periodic timing dump in windowed mode\n"
@@ -51,6 +72,8 @@ internal void platform_print_usage(const char *exe) {
 internal PlatformArgs platform_parse_args(int argc, char **argv) {
     PlatformArgs args = {};
     args.particle_count = 65536;
+    args.threads = 8;
+    args.gpu_mem_mb = 512;
     args.seed = 1;
     args.window_width = 1280;
     args.window_height = 720;
@@ -61,6 +84,31 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             args.headless = 1;
             args.headless_frames = 600;
             if (next && next[0] != '-') { args.headless_frames = (u32)atoi(next); ++i; }
+        } else if (strcmp(a, "--scene") == 0 && next) {
+            if (strcmp(next, "particles") == 0) args.scene = SimScene_Particles;
+            else if (strcmp(next, "dbd") == 0) args.scene = SimScene_Dbd;
+            else if (strcmp(next, "sweep") == 0) args.scene = SimScene_Sweep;
+            else { printf("unknown scene %s\n", next); exit(1); }
+            ++i;
+        } else if (strcmp(a, "--zones") == 0 && next) {
+            args.zone_count = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--threads") == 0 && next) {
+            args.threads = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--gpu") == 0) {
+            args.gpu = 1;
+        } else if (strcmp(a, "--gpu-mem") == 0 && next) {
+            args.gpu_mem_mb = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--precision") == 0 && next) {
+            if (strcmp(next, "f32") == 0) args.precision = 0;
+            else if (strcmp(next, "f64") == 0) args.precision = 1;
+            else { printf("unknown precision %s (f32 | f64)\n", next); exit(1); }
+            ++i;
+        } else if (strcmp(a, "--chem-dt") == 0 && next) {
+            args.chem_steps = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--averaged") == 0) {
+            args.averaged = 1;
+        } else if (strcmp(a, "--csv") == 0 && next) {
+            args.csv_path = next; ++i;
         } else if (strcmp(a, "--particles") == 0 && next) {
             args.particle_count = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--seed") == 0 && next) {
@@ -81,6 +129,10 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
         }
     }
     if (args.particle_count == 0) args.particle_count = 8;
+    if (args.zone_count == 0) args.zone_count = args.scene == SimScene_Sweep ? 256 : 64;
+    if (args.threads == 0) args.threads = 1;
+    if (args.threads > 64) args.threads = 64;
+    if (args.gpu_mem_mb == 0) args.gpu_mem_mb = 512;
     return args;
 }
 
@@ -108,13 +160,13 @@ internal void platform_print_debug_table(DebugTable *table, u64 frames, f64 cycl
     u32 n = 0;
     for (u32 i = 0; i < DEBUG_MAX_RECORDS; ++i) {
         DebugRecord *r = table->records + i;
-        u64 cycles = use_totals ? r->total_cycles : r->cycles;
+        u64 cycles = use_totals ? r->total_cycles : r->window_cycles;
         if (r->name && cycles) {
             // insertion sort by cycles, descending
             u32 j = n++;
             while (j > 0) {
                 DebugRecord *prev = table->records + order[j - 1];
-                u64 prev_cycles = use_totals ? prev->total_cycles : prev->cycles;
+                u64 prev_cycles = use_totals ? prev->total_cycles : prev->window_cycles;
                 if (prev_cycles >= cycles) break;
                 order[j] = order[j - 1];
                 --j;
@@ -125,8 +177,8 @@ internal void platform_print_debug_table(DebugTable *table, u64 frames, f64 cycl
     printf("  %-28s %10s %12s %10s\n", "timed block", "hits/frame", "cycles/frame", "ms/frame");
     for (u32 k = 0; k < n; ++k) {
         DebugRecord *r = table->records + order[k];
-        u64 cycles = use_totals ? r->total_cycles : r->cycles;
-        u64 hits = use_totals ? r->total_hits : r->hit_count;
+        u64 cycles = use_totals ? r->total_cycles : r->window_cycles;
+        u64 hits = use_totals ? r->total_hits : r->window_hits;
         f64 cpf = (f64)cycles / (f64)frames;
         printf("  %-28s %10.2f %12.0f %10.3f   (%s:%u)\n", r->name, (f64)hits / (f64)frames, cpf,
                cycles_per_ms > 0 ? cpf / cycles_per_ms : 0.0, r->file, r->line);
