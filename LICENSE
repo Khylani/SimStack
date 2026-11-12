@@ -1,0 +1,8 @@
+License: TBD
+
+The license for Simstack has not been decided yet. Until a license is chosen
+and this file is replaced, all rights are reserved by the repository owner.
+
+Third-party components that are later vendored or linked (see the architecture
+plan: Cantera/ChemPlasKin, IPhreeqc, etc.) keep their own licenses and will be
+listed in THIRD_PARTY.md.

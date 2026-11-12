@@ -1,0 +1,23 @@
+# Build output
+build/
+*.o
+*.obj
+*.so
+*.dll
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.exe
+
+# Editor / OS noise
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Runtime artefacts
+runs/
+*.simscene.bak

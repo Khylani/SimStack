@@ -1,1 +1,5 @@
-# SimStack
+# Simstack
+
+Simstack is a pure C++ simulation stack for a plasma-activated-water (PAW) hydroponics system: dielectric barrier discharge (DBD) reactor speciation, nutrient film technique (NFT) solution chemistry, channel flow, and fog/mist droplet transport. The code targets a single workstation (i9-12900KF, AVX2/FMA, RTX 3080) and is written in the Handmade Hero style: C-style C++20, no exceptions, no RTTI, no STL containers in the simulation layer, arena allocation everywhere, structure-of-arrays data with explicit SIMD lanes, and a unity build of one translation unit per target.
+
+The repository is split into a thin platform executable (window, input, timing, file IO, OpenGL, hot reload) and a simulation shared library that holds all state inside fixed memory blocks handed to it by the platform. Editing and rebuilding the simulation library while the executable runs swaps the code in place and preserves the simulation state. See `docs/BUILD.md` for build and run instructions and the per-milestone notes for what is implemented so far.
