@@ -26,7 +26,14 @@
 struct PlatformArgs {
     b32 headless;
     u32 headless_frames;
+    u32 scene;            // SimScene
     u32 particle_count;
+    u32 zone_count;
+    u32 threads;          // work queue threads including the main thread
+    b32 gpu;
+    u32 gpu_mem_mb;
+    b32 averaged;
+    const char *csv_path;
     u32 seed;
     u32 window_width;
     u32 window_height;
@@ -36,12 +43,20 @@ struct PlatformArgs {
 };
 
 internal void platform_print_usage(const char *exe) {
-    printf("usage: %s [--headless N] [--particles N] [--seed N] [--size WxH] [--quiet]\n"
-           "          [--frames N] [--screenshot file.ppm]\n"
+    printf("usage: %s [--scene particles|dbd|sweep] [--headless N] [--zones N] [--threads N] [--gpu]\n"
+           "          [--gpu-mem MB] [--averaged] [--csv file] [--particles N] [--seed N] [--size WxH]\n"
+           "          [--quiet] [--frames N] [--screenshot file.ppm]\n"
+           "  --scene S      particles (M1 demo, default), dbd (plug-flow DBD reactor), sweep (power x humidity grid)\n"
            "  --headless N   run N frames without a window at a fixed 1/60 s frame dt, print timings\n"
+           "  --zones N      dbd: axial zones (default 16); sweep: grid points (rounded down to a square, default 256)\n"
+           "  --threads N    worker threads including the main thread (default 8, one per P-core)\n"
+           "  --gpu          load build/simstack_gpu.so and run the chemistry on CUDA\n"
+           "  --gpu-mem MB   device arena size (default 512)\n"
+           "  --averaged     continuous discharge source instead of one pulse per half-cycle\n"
+           "  --csv F        dbd: outlet time series (rewritten every simulated second); sweep: final grid\n"
            "  --frames N     windowed: quit after N frames\n"
            "  --screenshot F windowed: write the last frame as a binary PPM to F\n"
-           "  --particles N  dummy particle count (default 65536)\n"
+           "  --particles N  particles scene: count (default 65536)\n"
            "  --seed N       particle seed (default 1)\n"
            "  --size WxH     window size (default 1280x720)\n"
            "  --quiet        no periodic timing dump in windowed mode\n"
@@ -51,6 +66,8 @@ internal void platform_print_usage(const char *exe) {
 internal PlatformArgs platform_parse_args(int argc, char **argv) {
     PlatformArgs args = {};
     args.particle_count = 65536;
+    args.threads = 8;
+    args.gpu_mem_mb = 512;
     args.seed = 1;
     args.window_width = 1280;
     args.window_height = 720;
@@ -61,6 +78,24 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             args.headless = 1;
             args.headless_frames = 600;
             if (next && next[0] != '-') { args.headless_frames = (u32)atoi(next); ++i; }
+        } else if (strcmp(a, "--scene") == 0 && next) {
+            if (strcmp(next, "particles") == 0) args.scene = SimScene_Particles;
+            else if (strcmp(next, "dbd") == 0) args.scene = SimScene_Dbd;
+            else if (strcmp(next, "sweep") == 0) args.scene = SimScene_Sweep;
+            else { printf("unknown scene %s\n", next); exit(1); }
+            ++i;
+        } else if (strcmp(a, "--zones") == 0 && next) {
+            args.zone_count = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--threads") == 0 && next) {
+            args.threads = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--gpu") == 0) {
+            args.gpu = 1;
+        } else if (strcmp(a, "--gpu-mem") == 0 && next) {
+            args.gpu_mem_mb = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--averaged") == 0) {
+            args.averaged = 1;
+        } else if (strcmp(a, "--csv") == 0 && next) {
+            args.csv_path = next; ++i;
         } else if (strcmp(a, "--particles") == 0 && next) {
             args.particle_count = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--seed") == 0 && next) {
@@ -81,6 +116,10 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
         }
     }
     if (args.particle_count == 0) args.particle_count = 8;
+    if (args.zone_count == 0) args.zone_count = args.scene == SimScene_Sweep ? 256 : 16;
+    if (args.threads == 0) args.threads = 1;
+    if (args.threads > 64) args.threads = 64;
+    if (args.gpu_mem_mb == 0) args.gpu_mem_mb = 512;
     return args;
 }
 

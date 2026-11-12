@@ -38,9 +38,10 @@ struct KinReaction {
     u16 jac_index[KIN_MAX_REACTANTS][KIN_MAX_NET];
 };
 
-// One step of no-pivot LU in IKJ order: L(i,k) = A(i,k) / A(k,k); then for
+// One step of no-pivot LU in IKJ order: L(i,k) = A(i,k) * (1 / A(k,k)); then for
 // each listed (i,j),(k,j): A(i,j) -= L(i,k) * A(k,j). Indices are into the
-// compact non-zero array.
+// compact non-zero array. After row k is finished its diagonal entry holds
+// 1/U(k,k), so elimination and the triangular solves never divide.
 struct KinLuDiv {
     u16 ik, kk;
     u16 sub_begin, sub_end;
@@ -64,6 +65,7 @@ struct KinMech {
     u32 nnz;                               // non-zeros of J plus diagonal plus LU fill-in
     u16 diag[KIN_MAX_SPECIES];             // compact index of (i,i)
     u32 lu_div_count, lu_sub_count;
+    u16 div_begin[KIN_MAX_SPECIES + 1];    // lu_div ops of row i: [div_begin[i], div_begin[i+1])
     KinLuDiv lu_div[KIN_MAX_LU_DIV];
     KinLuSub lu_sub[KIN_MAX_LU_SUB];
     u16 lower_begin[KIN_MAX_SPECIES + 1];  // into lower[]: strictly-lower entries of row i, ascending col

@@ -1,4 +1,4 @@
-// OpenGL function loading and the milestone-1 point renderer.
+// OpenGL function loading and the point-batch renderer.
 // Included by the platform TU after <GL/gl.h> is available. The platform
 // provides gl_get_proc(name) (glXGetProcAddressARB / wglGetProcAddress) and a
 // current context before calling gl_renderer_init.
@@ -161,21 +161,24 @@ internal void gl_render_frame(GLRenderer *r, RenderCommands *cmds, u32 width, u3
     glViewport(0, 0, (GLsizei)width, (GLsizei)height);
     glClearColor(cmds->clear_color.r, cmds->clear_color.g, cmds->clear_color.b, cmds->clear_color.a);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    if (!cmds->point_count || !cmds->px) return;
+    if (!cmds->batch_count) return;
 
     glUseProgram(r->program);
     glUniformMatrix4fv(r->u_view_proj, 1, GL_FALSE, &cmds->view_proj.e[0][0]);
-    glUniform1f(r->u_point_size, cmds->point_size);
-    glUniform4fv(r->u_color, 1, cmds->point_color.e);
-
     glBindVertexArray(r->vao);
-    GLsizeiptr bytes = (GLsizeiptr)cmds->point_count * (GLsizeiptr)sizeof(f32);
-    const f32 *axes[3] = { cmds->px, cmds->py, cmds->pz };
-    for (u32 axis = 0; axis < 3; ++axis) {
-        glBindBuffer(GL_ARRAY_BUFFER, r->vbo[axis]);
-        glBufferData(GL_ARRAY_BUFFER, bytes, axes[axis], GL_STREAM_DRAW);   // orphan + upload
+    for (u32 b = 0; b < cmds->batch_count && b < RENDER_MAX_BATCHES; ++b) {
+        RenderPointBatch *batch = cmds->batches + b;
+        if (!batch->count || !batch->px) continue;
+        glUniform1f(r->u_point_size, batch->point_size);
+        glUniform4fv(r->u_color, 1, batch->color.e);
+        GLsizeiptr bytes = (GLsizeiptr)batch->count * (GLsizeiptr)sizeof(f32);
+        const f32 *axes[3] = { batch->px, batch->py, batch->pz };
+        for (u32 axis = 0; axis < 3; ++axis) {
+            glBindBuffer(GL_ARRAY_BUFFER, r->vbo[axis]);
+            glBufferData(GL_ARRAY_BUFFER, bytes, axes[axis], GL_STREAM_DRAW);   // orphan + upload
+        }
+        glDrawArrays(GL_POINTS, 0, (GLsizei)batch->count);
     }
-    glDrawArrays(GL_POINTS, 0, (GLsizei)cmds->point_count);
     glBindVertexArray(0);
 }
 

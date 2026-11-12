@@ -178,7 +178,9 @@ internal void kin_mech_finalize(KinModel *model) {
     for (u32 i = 0; i < n; ++i) m->diag[i] = index[i][i];
 
     m->lu_div_count = m->lu_sub_count = 0;
-    for (u32 i = 1; i < n; ++i)
+    m->div_begin[0] = 0;
+    for (u32 i = 0; i < n; ++i) {
+        m->div_begin[i] = (u16)m->lu_div_count;
         for (u32 k = 0; k < i; ++k) {
             if (!pattern[i][k]) continue;
             if (m->lu_div_count >= KIN_MAX_LU_DIV) { kin_fail(model, "mechanism too large", "KIN_MAX_LU_DIV"); return; }
@@ -195,6 +197,8 @@ internal void kin_mech_finalize(KinModel *model) {
             }
             d->sub_end = (u16)m->lu_sub_count;
         }
+    }
+    m->div_begin[n] = (u16)m->lu_div_count;
 
     u32 lo = 0, up = 0;
     for (u32 i = 0; i < n; ++i) {

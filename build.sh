@@ -70,20 +70,25 @@ if [ "$CUDA" = 1 ]; then
         fi
     fi
     echo "[build] nvcc=$NVCC"
-    $NVCC -arch=sm_86 -O3 -lineinfo --shared -Xcompiler -fPIC -Isrc src/gpu/kernels.cu -o build/simstack_gpu.so
-    echo "[build] simstack_gpu.so"
+    # -fmad=false: no implicit FMA contraction, so the kinetics kernel is
+    # bit-identical to the CPU path (explicit fma() calls are still fused).
+    START=$(date +%s%N)
+    $NVCC -arch=sm_86 -O3 -fmad=false -lineinfo -Xptxas -warn-spills --shared -Xcompiler -fPIC -Isrc \
+          src/gpu/kernels.cu -o build/simstack_gpu.so.tmp
+    mv -f build/simstack_gpu.so.tmp build/simstack_gpu.so
+    echo "[build] simstack_gpu.so  $(( ($(date +%s%N) - START) / 1000000 )) ms"
 fi
 
 # --- tests (kinetics solver; no window, no sim module) --------------------------
 if [ "$TESTS" = 1 ]; then
     START=$(date +%s%N)
-    $CXX $COMMON $CFG src/tests/test_kinetics.cpp -o build/simstack_tests -lm -ldl
+    $CXX $COMMON $CFG src/tests/test_kinetics.cpp -o build/simstack_tests -lm -ldl -lpthread
     echo "[build] simstack_tests   $(( ($(date +%s%N) - START) / 1000000 )) ms"
 fi
 
 # --- platform exe -----------------------------------------------------------------
 if [ "$SIM_ONLY" = 0 ]; then
     START=$(date +%s%N)
-    $CXX $COMMON $CFG src/platform/linux_simstack.cpp -o build/simstack -lX11 -lGL -ldl -lm
+    $CXX $COMMON $CFG src/platform/linux_simstack.cpp -o build/simstack -lX11 -lGL -ldl -lm -lpthread
     echo "[build] simstack         $(( ($(date +%s%N) - START) / 1000000 )) ms"
 fi

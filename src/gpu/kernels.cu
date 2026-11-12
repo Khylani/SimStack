@@ -1,17 +1,19 @@
 // Simstack GPU module: the single nvcc translation unit.
-//   nvcc -arch=sm_86 -O3 -lineinfo --shared -Xcompiler -fPIC -Isrc src/gpu/kernels.cu -o build/simstack_gpu.so
+//   nvcc -arch=sm_86 -O3 -fmad=false -lineinfo --shared -Xcompiler -fPIC -Isrc src/gpu/kernels.cu -o build/simstack_gpu.so
 //
-// STATUS (milestone 1): compiles with CUDA 12.x / 13.x (13.4 confirmed on an
-// RTX 3060 12 GB, sm_86); not yet loaded by the platform. The bump arena
-// mirrors base_arena.h so host and device layouts stay in sync.
+// -fmad=false is required: the kinetics kernel must perform exactly the
+// operations the CPU path performs (fused only where the source says
+// lane_fmadd / lane_fnmadd) so CPU and GPU results are bit-identical.
 //
 // Note: base_types.h does not define the `global` macro under __CUDACC__
 // (it would rewrite __global__ into __attribute__((static))); use `static`.
 
 #include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "gpu_api.h"
-
-#define GPU_ARENA_SIZE Gigabytes(1)   // placeholder; the plan targets most of the 12 GB on the RTX 3060
+#include "../sim/dbd_lanes.h"
 
 struct GpuArena {
     u8 *base;
@@ -20,6 +22,24 @@ struct GpuArena {
 };
 
 static GpuArena g_gpu_arena;
+static cudaEvent_t g_kin_start, g_kin_stop;
+static u32 g_kin_block = 64;
+
+// Per-thread capacities for the GPU instantiation. Every lane's Jacobian/LU,
+// stage vectors and rate constants live in local memory, about
+// 8 * (nnz + 9 * species + reactions) bytes per lane. The humid-air
+// mechanism is 17 species / 40 reactions / 213 non-zeros (~4 KB per lane).
+struct KinCapGpu { enum { species = 24, reactions = 48, nnz = 256 }; };
+
+// Mechanism tables: read in the same order by every thread (uniform), so
+// constant-memory broadcasts. Staging them in shared memory instead was
+// measured slower (30 KB per block costs occupancy), see docs/M2_KINETICS.md.
+__constant__ KinMech c_mech;
+__constant__ KinMethod c_method;
+__constant__ KinControl c_control;
+
+// ----------------------------------------------------------------------------
+// Kernels
 
 __global__ void step_points_kernel(f32 *x, f32 *y, f32 *z, f32 *vx, f32 *vy, f32 *vz, u32 count, f32 dt) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -38,16 +58,50 @@ __global__ void step_points_kernel(f32 *x, f32 *y, f32 *z, f32 *vx, f32 *vy, f32
     z[i] = fmaf(nvz, dt, pz);
 }
 
+// One thread per lane (zone): the same dbd_advance_group the CPU runs, with V = f64.
+__global__ void __launch_bounds__(64) kin_advance_kernel(GpuKinLaunch L) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= L.padded) return;
+    dbd_advance_group<f64, KinCapGpu>(&c_mech, &c_method, &c_control, L.y, L.k, L.src, L.pulse, L.period, L.h,
+                                      L.pulse_index, L.steps, L.rejects, L.pulses, L.failed, L.y, L.padded, i, L.t0, L.t1);
+}
+
+// ----------------------------------------------------------------------------
+// Exports
+
 GPU_API GPU_INIT(gpu_init) {
+    memset(info, 0, sizeof(*info));
     cudaError_t err = cudaSetDevice((int)device_index);
     if (err != cudaSuccess) return (s32)err;
+    cudaDeviceProp prop;
+    err = cudaGetDeviceProperties(&prop, (int)device_index);
+    if (err != cudaSuccess) return (s32)err;
+    snprintf(info->name, sizeof(info->name), "%s", prop.name);
+    info->sm_major = (u32)prop.major;
+    info->sm_minor = (u32)prop.minor;
+    info->multiprocessors = (u32)prop.multiProcessorCount;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    info->free_bytes = free_b;
+    info->total_bytes = total_b;
+
     void *base = 0;
-    err = cudaMalloc(&base, GPU_ARENA_SIZE);
+    err = cudaMalloc(&base, arena_bytes);
     if (err != cudaSuccess) return (s32)err;
     g_gpu_arena.base = (u8 *)base;
-    g_gpu_arena.size = GPU_ARENA_SIZE;
+    g_gpu_arena.size = arena_bytes;
     g_gpu_arena.used = 0;
+    info->arena_bytes = arena_bytes;
+
+    cudaEventCreate(&g_kin_start);
+    cudaEventCreate(&g_kin_stop);
+    const char *block = getenv("SIMSTACK_KIN_BLOCK");   // experiments only
+    if (block && atoi(block) > 0 && atoi(block) <= 64) g_kin_block = (u32)atoi(block);
     return 0;
+}
+
+GPU_API GPU_ERROR_STRING(gpu_error_string) {
+    return cudaGetErrorString((cudaError_t)error);
 }
 
 GPU_API GPU_ALLOC(gpu_alloc) {
@@ -56,6 +110,10 @@ GPU_API GPU_ALLOC(gpu_alloc) {
     void *result = g_gpu_arena.base + g_gpu_arena.used;
     g_gpu_arena.used += aligned;
     return result;
+}
+
+GPU_API GPU_ARENA_USED(gpu_arena_used) {
+    return g_gpu_arena.used;
 }
 
 GPU_API GPU_COPY_TO_DEVICE(gpu_copy_to_device) {
@@ -75,4 +133,26 @@ GPU_API GPU_STEP_POINTS(gpu_step_points) {
 
 GPU_API GPU_SYNC(gpu_sync) {
     return (s32)cudaDeviceSynchronize();
+}
+
+GPU_API GPU_KIN_SET_MECH(gpu_kin_set_mech) {
+    if (!kin_capacity_ok<KinCapGpu>(mech)) return (s32)cudaErrorInvalidValue;   // raise KinCapGpu and rebuild
+    cudaError_t err = cudaMemcpyToSymbol(c_mech, mech, sizeof(KinMech));
+    if (err == cudaSuccess) err = cudaMemcpyToSymbol(c_method, method, sizeof(KinMethod));
+    if (err == cudaSuccess) err = cudaMemcpyToSymbol(c_control, control, sizeof(KinControl));
+    return (s32)err;
+}
+
+GPU_API GPU_KIN_ADVANCE(gpu_kin_advance) {
+    u32 block = g_kin_block;
+    u32 grid = (launch->padded + block - 1) / block;
+    cudaEventRecord(g_kin_start);
+    kin_advance_kernel<<<grid, block>>>(*launch);
+    cudaEventRecord(g_kin_stop);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return (s32)err;
+    err = cudaEventSynchronize(g_kin_stop);
+    if (err != cudaSuccess) return (s32)err;
+    if (kernel_ms) cudaEventElapsedTime(kernel_ms, g_kin_start, g_kin_stop);
+    return (s32)cudaGetLastError();
 }

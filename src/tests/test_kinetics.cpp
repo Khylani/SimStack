@@ -9,14 +9,17 @@
 #include <math.h>
 #include <dlfcn.h>
 #include <time.h>
+#include <unistd.h>
+
+#include <pthread.h>
+#include <semaphore.h>
+#include <sched.h>
 
 #define DEBUG_RECORD_BASE 0
-#include "../base/base_types.h"
-#include "../base/base_arena.h"
-#include "../base/base_simd.h"
-#include "../base/base_debug.h"
+#include "../sim_platform.h"
 #include "../sim/dbd.cpp"
-#include "../gpu/gpu_api.h"
+#include "../platform/linux_gpu.cpp"
+#include "../platform/linux_work_queue.cpp"
 
 global u32 g_checks, g_failures;
 
@@ -303,6 +306,90 @@ internal void test_ozone_yield(KinModel *model, AirSpecies *sp, AirSourceModel *
     CHECK(z.pulses[0] == 200.0, "expected 200 pulses, got %.0f", z.pulses[0]);
 }
 
+// Cost of each solver kernel on one f64x4 lane group, in TSC cycles.
+internal void bench_kernels(KinModel *model, AirSpecies *sp) {
+    KinMech *m = &model->mech;
+    u32 n = m->species_count;
+    f64 y1[KIN_MAX_SPECIES], k1[KIN_MAX_REACTIONS];
+    f64 total = air_feed(sp, n, 300.0, 101325.0, 0.01, y1);
+    for (u32 s = 0; s < n; ++s) if (y1[s] == 0.0) y1[s] = total * 1e-7;
+    kin_eval_rate_constants(model, 300.0, total, k1);
+    f64x4 y[KIN_MAX_SPECIES], k[KIN_MAX_REACTIONS], src[KIN_MAX_SPECIES], f[KIN_MAX_SPECIES], x[KIN_MAX_SPECIES];
+    for (u32 s = 0; s < n; ++s) { y[s] = lane_splat((f64x4 *)0, y1[s]); src[s] = lane_splat((f64x4 *)0, 0.0); x[s] = y[s]; }
+    for (u32 r = 0; r < m->reaction_count; ++r) k[r] = lane_splat((f64x4 *)0, k1[r]);
+    static f64x4 jac[KIN_MAX_NNZ], lu[KIN_MAX_NNZ];
+    const u32 reps = 20000;
+    u64 c0 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { kin_fun(m, k, src, y, f); y[0] = y[0] + f[1] * lane_splat((f64x4 *)0, 1e-300); }
+    u64 c1 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { kin_jac(m, k, y, jac); y[0] = y[0] + jac[3] * lane_splat((f64x4 *)0, 1e-300); }
+    u64 c2 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { kin_decomp(m, jac, lane_splat((f64x4 *)0, 1e6 + i), lu); }
+    u64 c3 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { kin_solve(m, lu, x); }
+    u64 c4 = read_cpu_timer();
+    f64x4 acc = lane_splat((f64x4 *)0, 0.5);
+    for (u32 i = 0; i < reps; ++i) { acc = acc + lane_cbrt_clamped(acc); }
+    u64 c5 = read_cpu_timer();
+    printf("[kernels] f64x4 TSC cycles per call: fun %.0f  jac %.0f  decomp %.0f  solve %.0f  cbrt %.0f  (sink %g)\n",
+           (f64)(c1 - c0) / reps, (f64)(c2 - c1) / reps, (f64)(c3 - c2) / reps, (f64)(c4 - c3) / reps,
+           (f64)(c5 - c4) / reps, lane_get(x[0], 0) + lane_get(acc, 1) + lane_get(lu[5], 2));
+}
+
+// Accuracy vs cost: 8 synchronized humid-air zones, 20 ms pulsed, against a
+// tight-tolerance reference. Error = worst relative error over the
+// long-lived products that matter downstream (above 1e-6 ppm).
+internal void bench_tolerance(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
+    Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
+    u32 watch[] = { sp->O3, sp->NO, sp->NO2, sp->NO3, sp->N2O5, sp->N2O, sp->HNO2, sp->HNO3, sp->H2O2 };
+    struct Run { KinMethodId method; f64 rtol, atol; } runs[] = {
+        { KinMethod_Rodas3, 1e-9, 1e-3 },   // reference
+        { KinMethod_Rodas3, 1e-5, 1e2 }, { KinMethod_Rodas3, 1e-4, 1e2 }, { KinMethod_Rodas3, 1e-3, 1e2 },
+        { KinMethod_Rodas3, 1e-3, 1e4 }, { KinMethod_Rodas3, 1e-2, 1e4 },
+        { KinMethod_Ros3, 1e-4, 1e2 }, { KinMethod_Ros3, 1e-3, 1e4 },
+        { KinMethod_Ros2, 1e-3, 1e4 },
+    };
+    f64 ref[KIN_MAX_SPECIES][8];
+    for (u32 mode = 0; mode < 2; ++mode) {
+        for (u32 ri = 0; ri < ArrayCount(runs); ++ri) {
+            arena.used = 0;
+            DbdZones z;
+            dbd_zones_alloc(&z, &arena, model, 8);
+            for (u32 i = 0; i < 8; ++i) {
+                z.T_K[i] = 310.0; z.p_Pa[i] = 101325.0; z.x_H2O[i] = 0.02;
+                z.power_W_cm3[i] = 0.05 * (f64)(i + 1); z.freq_Hz[i] = 10000.0;
+            }
+            dbd_zones_fill_padding(&z);
+            dbd_zones_reset(&z, sp);
+            KinMethod method = kin_method(runs[ri].method);
+            KinControl ctl = dbd_default_control();
+            ctl.rtol = runs[ri].rtol; ctl.atol = runs[ri].atol; ctl.max_steps = 1000000;
+            f64 t_start = now_s();
+            for (u32 step = 0; step < 20; ++step) {
+                dbd_zones_prepare(&z, model, sp, src, (DbdDischargeMode)mode);
+                dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
+            }
+            f64 wall = now_s() - t_start;
+            f64 worst = 0.0, steps = 0.0;
+            u32 worst_s = 0;
+            for (u32 i = 0; i < 8; ++i) {
+                steps += z.steps[i];
+                for (u32 w = 0; w < ArrayCount(watch); ++w) {
+                    u32 sp_i = watch[w];
+                    f64 v = z.y[sp_i * z.padded + i];
+                    if (ri == 0) { ref[sp_i][i] = v; continue; }
+                    if (dbd_ppm(&z, sp_i, i) < 1e-6) continue;
+                    f64 e = rel_err(v, ref[sp_i][i]);
+                    if (e > worst) { worst = e; worst_s = sp_i; }
+                }
+            }
+            printf("[tolerance] %s %-6s rtol %.0e atol %.0e: %7.0f steps/zone, %6.1f ms wall, worst error %.1e (%s)\n",
+                   mode == 0 ? "pulsed  " : "averaged", method.name, runs[ri].rtol, runs[ri].atol, steps / 8.0,
+                   wall * 1e3, worst, ri ? model->species_name[worst_s] : "reference");
+        }
+    }
+}
+
 internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
     KinMethod method = kin_method(KinMethod_Rodas3);
@@ -331,7 +418,7 @@ internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
 
 // ---------------------------------------------------------------------------
 
-internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src);
+internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32 bench);
 
 int main(int argc, char **argv) {
     b32 want_gpu = 0, want_bench = 0;
@@ -352,14 +439,90 @@ int main(int argc, char **argv) {
     test_simd_matches_scalar(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
-    if (want_gpu) test_gpu(model, &sp, &src);
-    if (want_bench) bench_cpu(model, &sp, &src);
+    if (want_gpu) test_gpu(model, &sp, &src, want_bench);
+    if (want_bench) { bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }
 
     printf("%u checks, %u failed (simd=%d)\n", g_checks, g_failures, SIM_SIMD);
     free(model);
     return (int)g_failures;
 }
 
-internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
-    printf("[gpu] not wired yet\n");
+// CUDA path: bit-identical to the CPU path, then throughput vs zone count.
+internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32 bench) {
+    char path[512];
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    path[len > 0 ? len : 0] = 0;
+    char *slash = strrchr(path, '/');
+    snprintf(slash ? slash + 1 : path, sizeof(path) - (slash ? (u64)(slash + 1 - path) : 0), "simstack_gpu.so");
+    GpuAPI gpu;
+    if (!linux_load_gpu_module(path, Megabytes(512), &gpu)) {
+        CHECK(0, "gpu module not available");
+        return;
+    }
+    printf("[gpu] %s, sm_%u%u, %u SMs, %.0f MB free of %.0f MB at init\n", gpu.info.name, gpu.info.sm_major,
+           gpu.info.sm_minor, gpu.info.multiprocessors, gpu.info.free_bytes / 1048576.0, gpu.info.total_bytes / 1048576.0);
+
+    KinMethod method = kin_method(KinMethod_Rodas3);
+    KinControl ctl = dbd_default_control();
+    s32 err = gpu.gpu_kin_set_mech(&model->mech, &method, &ctl);
+    CHECK(err == 0, "gpu_kin_set_mech: %s", gpu.gpu_error_string(err));
+
+    Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
+    for (u32 mode = 0; mode < 2; ++mode) {
+        DbdZones a, b;
+        DbdGpu g = {};
+        setup_zones(&a, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
+        setup_zones(&b, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
+        for (u32 step = 0; step < 5; ++step) {
+            f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+            dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
+            dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
+            err = dbd_advance_gpu(&a, &gpu, &g, t0, t1);
+            CHECK(err == 0, "gpu advance: %s", gpu.gpu_error_string(err));
+            dbd_advance_cpu<f64x4>(&b, &model->mech, &method, &ctl, t0, t1);
+        }
+        u64 bytes = sizeof(f64) * (u64)a.n_species * a.padded;
+        b32 same = memcmp(a.y, b.y, bytes) == 0 && memcmp(a.h, b.h, sizeof(f64) * a.padded) == 0 &&
+                   memcmp(a.steps, b.steps, sizeof(f64) * a.padded) == 0;
+        f64 worst = 0.0;
+        for (u64 i = 0; i < (u64)a.n_species * a.padded; ++i) worst = fmax(worst, rel_err(a.y[i], b.y[i]));
+        printf("[gpu] %s, 12 zones x 5 ms: CUDA vs AVX2 %s (hash %016llx, worst relative difference %.1e)\n",
+               mode == 0 ? "pulsed  " : "averaged", same ? "bit-identical" : "DIFFERENT",
+               (unsigned long long)hash_fnv1a_64(a.y, bytes), worst);
+        CHECK(same, "gpu and cpu paths differ (mode %u)", mode);
+    }
+    if (!bench) return;
+
+    // Throughput: averaged mode, 10 ms per run; one launch per 1 ms master step.
+    u32 counts[] = { 64, 256, 1024, 4096, 16384 };
+    for (u32 ci = 0; ci < ArrayCount(counts); ++ci) {
+        for (u32 mode = 0; mode < 2; ++mode) {
+            u32 n = counts[ci];
+            u32 ms = mode == 0 ? 2 : 10;
+            DbdZones a, b;
+            DbdGpu g = {};
+            arena.used = 0;
+            setup_zones(&a, &arena, model, sp, src, n, (DbdDischargeMode)mode);
+            setup_zones(&b, &arena, model, sp, src, n, (DbdDischargeMode)mode);
+            f64 gpu_s = 0.0, cpu_s = 0.0, kernel_ms = 0.0;
+            for (u32 step = 0; step < ms; ++step) {
+                f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+                dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
+                dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
+                f64 s0 = now_s();
+                dbd_advance_gpu(&a, &gpu, &g, t0, t1);
+                f64 s1 = now_s();
+                if (n <= 4096) dbd_advance_cpu<f64x4>(&b, &model->mech, &method, &ctl, t0, t1);
+                f64 s2 = now_s();
+                gpu_s += s1 - s0; cpu_s += s2 - s1; kernel_ms += g.last_kernel_ms;
+            }
+            if (n <= 4096) {
+                printf("[gpu bench] %s %5u zones x %2u ms: CUDA %8.1f ms (kernel %8.1f)  AVX2 1 thread %8.1f ms  ratio %.2fx\n",
+                       mode == 0 ? "pulsed  " : "averaged", n, ms, gpu_s * 1e3, kernel_ms, cpu_s * 1e3, cpu_s / gpu_s);
+            } else {
+                printf("[gpu bench] %s %5u zones x %2u ms: CUDA %8.1f ms (kernel %8.1f)  AVX2 skipped\n",
+                       mode == 0 ? "pulsed  " : "averaged", n, ms, gpu_s * 1e3, kernel_ms);
+            }
+        }
+    }
 }

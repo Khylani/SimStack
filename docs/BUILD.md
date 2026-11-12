@@ -1,13 +1,14 @@
 # Building and running Simstack
 
 Simstack is a unity build: one compiler invocation per target, no build system.
-Two targets exist in milestone 1, a third is optional:
+Two targets are always built; the GPU module and the test executable are optional:
 
 | Target | Source root | Output (Linux / Windows) |
 | --- | --- | --- |
 | platform executable | `src/platform/linux_simstack.cpp` / `src/platform/win32_simstack.cpp` | `build/simstack` / `build\simstack.exe` |
 | sim module (hot-reloadable) | `src/sim/simstack.cpp` | `build/simstack_sim.so` / `build\simstack_sim.dll` |
-| gpu module (optional, needs CUDA 12.x) | `src/gpu/kernels.cu` | `build/simstack_gpu.so` / not wired on Windows yet |
+| gpu module (optional, needs CUDA 12.x / 13.x) | `src/gpu/kernels.cu` | `build/simstack_gpu.so` / not wired on Windows yet |
+| tests (optional) | `src/tests/test_kinetics.cpp` | `build/simstack_tests` / not wired on Windows yet |
 
 Every other `.cpp` under `src/sim/` and `src/platform/` is `#include`d by its
 root file. Headers in `src/base/` and `src/sim_platform.h` are shared.
@@ -32,7 +33,8 @@ there are no exceptions, no RTTI, no `new`/`delete`, no STL.
 ./build.sh release --simd=0    # scalar f32x8 fallback (determinism check)
 ./build.sh debug --asan        # AddressSanitizer + UBSan
 ./build.sh release --sim-only  # rebuild only simstack_sim.so (hot reload)
-./build.sh release --cuda      # also build simstack_gpu.so with nvcc
+./build.sh release --cuda      # also build simstack_gpu.so with nvcc (-fmad=false: bit-identical to the CPU)
+./build.sh release --tests     # also build build/simstack_tests
 CUDA_HOME=/opt/cuda ./build.sh release --cuda   # nvcc off PATH (or NVCC=/opt/cuda/bin/nvcc)
 CXX=g++ ./build.sh release     # use gcc instead of clang
 ```
@@ -40,17 +42,34 @@ CXX=g++ ./build.sh release     # use gcc instead of clang
 A full debug build of both targets takes well under a second on a modern
 desktop; the sim module alone is ~0.3 s, which is what makes hot reload useful.
 
+Tests (exit code = failed checks):
+
+```sh
+./build/simstack_tests                    # kinetics solver and mechanism, AVX2 == scalar
+./build/simstack_tests --gpu              # also CUDA == AVX2 (needs build/simstack_gpu.so)
+./build/simstack_tests --gpu --bench      # kernel cycles, tolerance study, CPU/GPU throughput
+```
+
 Run:
 
 ```sh
-./build/simstack                          # windowed, 65536 particles
+./build/simstack --scene dbd              # 16-zone DBD plug-flow reactor, species profiles (see docs/M2_KINETICS.md)
+./build/simstack --scene dbd --headless 300 --csv runs/reactor.csv   # 5 s of chemistry, outlet time series
+./build/simstack --scene sweep --zones 1024 --averaged --headless 121 --csv runs/sweep.csv [--gpu]
+./build/simstack                          # windowed, 65536 particles (M1 demo scene)
 ./build/simstack --particles 262144 --size 1920x1080
 ./build/simstack --headless 600           # no window: 600 frames at a fixed 1/60 s, timings on stdout
 ./build/simstack --frames 240 --screenshot out.ppm   # windowed, quit after 240 frames, dump the last frame
 ./build/simstack --help
 ```
 
-Keys in the window: `Space`/`P` pause, `R` reset particles, `F1` toggle camera
+Chemistry options: `--threads N` (work-queue threads including the main
+thread, default 8, workers pinned one per P-core), `--gpu` (load
+`build/simstack_gpu.so`, run zones on CUDA), `--gpu-mem MB` (device arena,
+default 512), `--averaged` (continuous discharge source instead of one pulse
+per half-cycle), `--zones N`.
+
+Keys in the window: `Space`/`P` pause, `R` reset the scene, `F1` toggle camera
 auto-orbit, arrow keys orbit, `Esc` quit. The window title shows ms/frame; the
 profiler table and arena usage are printed to stdout every 120 frames unless
 `--quiet` is given.
@@ -80,6 +99,14 @@ particle positions and step counter carry over; the title bar shows
   sim_update                         1.00      1636757      0.682   (src/sim/simstack.cpp:129)
   ...
 ```
+
+For the dbd/sweep scenes the hash covers every zone's species densities.
+Reference: `--scene dbd --headless 30` gives 500 master steps and hash
+`1d27d1d629fbc024` for clang and gcc, debug (including ASan) and release,
+`--simd=0`, any `--threads`, and `--gpu`.
+
+ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
+`__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.
 
 The state hash is an FNV-1a over the particle positions after the last frame.
 It must be identical across runs, across `--simd=0` / `--simd=1`, across
@@ -133,19 +160,28 @@ Architecture flags: `-mavx2 -mfma -mbmi2 -mf16c -ffp-contract=off` (Linux) and
 ```
 build.sh  build.bat
 src/
-  sim_platform.h            platform <-> sim contract: SimMemory, SimInput, RenderCommands, PlatformAPI, exports
+  sim_platform.h            platform <-> sim contract: SimMemory (+ work queue, GpuAPI), SimInput, RenderCommands, PlatformAPI, exports
   base/base_types.h         u8..f64, Assert, Kilobytes, hash, xorshift RNG
   base/base_arena.h         Arena, push_struct/push_array, TempMemory, arena_split, SoA helpers
   base/base_math.h          v2/v3/v4/m4
-  base/base_simd.h          f32x8 (AVX2 or scalar)
+  base/base_simd.h          f32x8 and f64x4/b64x4 (AVX2 or scalar)
+  base/base_lane.h          lane vocabulary shared by scalar, AVX2 and CUDA code
   base/base_debug.h         TIMED_BLOCK cycle counters, DebugTable
   platform/linux_simstack.cpp   Xlib/GLX exe: window, input, timing, file IO, mmap, dlopen hot reload, headless
-  platform/win32_simstack.cpp   Win32/WGL exe, same interface (untested)
+  platform/linux_work_queue.cpp work queue + P-core pinned workers (Handmade Hero style)
+  platform/linux_gpu.cpp        dlopen of simstack_gpu.so into GpuAPI
+  platform/win32_simstack.cpp   Win32/WGL exe, same interface (untested; no work queue / GPU yet)
   platform/platform_common.cpp  args, memory sizes, profiler printing (included by both)
-  platform/render_gl.cpp        GL loader + SoA point renderer + PPM screenshot (included by both)
-  sim/simstack.cpp          sim module root: fixed-step loop, camera, exports
-  sim/particles.cpp         SoA particle system stepped with f32x8
-  gpu/gpu_api.h             C ABI of the optional CUDA module
-  gpu/kernels.cu            nvcc TU: GPU bump arena + point kernel (optional)
+  platform/render_gl.cpp        GL loader + coloured SoA point batches + PPM screenshot (included by both)
+  sim/simstack.cpp          sim module root: scenes, fixed-step loop, camera, exports
+  sim/particles.cpp         M1 SoA particle system stepped with f32x8
+  sim/kinetics/             batched Rosenbrock solver, mechanism builder, humid-air mechanism
+  sim/dbd_lanes.h           per-lane-group DBD advance shared by CPU and CUDA
+  sim/dbd.cpp               DBD zones: SoA block, discharge source, CPU (threads) / GPU advance, plug flow
+  sim/dbd_scene.cpp         reactor and sweep scenes, CSV, render batches
+  gpu/gpu_api.h             C ABI + GpuAPI table of the optional CUDA module
+  gpu/kernels.cu            nvcc TU: GPU bump arena, kinetics kernel, point kernel
+  tests/test_kinetics.cpp   solver/mechanism tests and benchmarks
 docs/BUILD.md               this file
+docs/M2_KINETICS.md         the DBD chemistry solver: design, verification, measurements
 ```

@@ -21,11 +21,16 @@
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sched.h>
 
 #define DEBUG_RECORD_BASE 0
 #include "../sim_platform.h"
 #include "platform_common.cpp"
 #include "render_gl.cpp"
+#include "linux_work_queue.cpp"
+#include "linux_gpu.cpp"
 
 #ifndef GLX_CONTEXT_MAJOR_VERSION_ARB
 #define GLX_CONTEXT_MAJOR_VERSION_ARB     0x2091
@@ -146,6 +151,7 @@ struct LinuxPaths {
     char sim_so[PATH_MAX];
     char lock[PATH_MAX];
     char selftest[PATH_MAX];
+    char gpu_so[PATH_MAX];
 };
 
 internal void linux_build_paths(LinuxPaths *paths) {
@@ -157,6 +163,7 @@ internal void linux_build_paths(LinuxPaths *paths) {
     snprintf(paths->sim_so, sizeof(paths->sim_so), "%s/simstack_sim.so", paths->exe_dir);
     snprintf(paths->lock, sizeof(paths->lock), "%s/lock.tmp", paths->exe_dir);
     snprintf(paths->selftest, sizeof(paths->selftest), "%s/selftest.txt", paths->exe_dir);
+    snprintf(paths->gpu_so, sizeof(paths->gpu_so), "%s/simstack_gpu.so", paths->exe_dir);
 }
 
 internal void linux_unload_sim_code(LinuxSimCode *code) {
@@ -393,12 +400,34 @@ int main(int argc, char **argv) {
     memory.frame_base = (u8 *)block + PLATFORM_PERMANENT_SIZE;
     memory.scratch_size = PLATFORM_SCRATCH_SIZE;
     memory.scratch_base = (u8 *)block + PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE;
+    memory.config.scene = args.scene;
     memory.config.particle_count = args.particle_count;
+    memory.config.zone_count = args.zone_count;
+    memory.config.backend = args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
+    memory.config.averaged = args.averaged;
+    memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
     memory.platform.read_entire_file = linux_read_entire_file;
     memory.platform.write_entire_file = linux_write_entire_file;
     memory.platform.now_ns = linux_now_ns;
     memory.platform.log = platform_log_stdout;
+    memory.platform.add_work_entry = linux_add_work_entry;
+    memory.platform.complete_all_work = linux_complete_all_work;
+
+    static PlatformWorkQueue work_queue;
+    linux_make_work_queue(&work_queue, args.threads);
+    memory.work_queue = &work_queue;
+    memory.worker_count = args.threads;
+
+    if (args.gpu) {
+        if (linux_load_gpu_module(paths.gpu_so, Megabytes((u64)args.gpu_mem_mb), &memory.gpu)) {
+            GpuInfo *gi = &memory.gpu.info;
+            printf("[gpu] %s (sm_%u%u, %u SMs), %.0f of %.0f MB free, arena %u MB\n", gi->name, gi->sm_major, gi->sm_minor,
+                   gi->multiprocessors, (f64)gi->free_bytes / 1048576.0, (f64)gi->total_bytes / 1048576.0, args.gpu_mem_mb);
+        } else {
+            printf("[gpu] unavailable, running on the CPU\n");
+        }
+    }
 
     DebugTable debug_table = {};
 #if SIM_INTERNAL
@@ -420,8 +449,8 @@ int main(int argc, char **argv) {
     }
     sim.on_reload(&memory);
     f64 cycles_per_ms = linux_measure_cycles_per_ms();
-    printf("[platform] memory %llu MB at %p, sim %s, %.0f cycles/ms, simd=%d\n",
-           (unsigned long long)(PLATFORM_TOTAL_SIZE >> 20), block, paths.sim_so, cycles_per_ms, SIM_SIMD);
+    printf("[platform] memory %llu MB at %p, sim %s, %.0f cycles/ms, simd=%d, threads %u\n",
+           (unsigned long long)(PLATFORM_TOTAL_SIZE >> 20), block, paths.sim_so, cycles_per_ms, SIM_SIMD, args.threads);
 
     SimInput input = {};
     RenderCommands render = {};
@@ -450,10 +479,17 @@ int main(int argc, char **argv) {
         printf("[headless] %u frames in %.3f s (%.3f ms/frame avg, %.3f min, %.3f max), %u reloads\n",
                args.headless_frames, wall, (f64)sum_ns * 1e-6 / (f64)args.headless_frames,
                (f64)min_ns * 1e-6, (f64)max_ns * 1e-6, reloads);
-        printf("[headless] %llu fixed steps (dt %.4f s), sim time %.3f s, %u particles, "
-               "%.1f M particle-steps/s\n",
-               (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,
-               (f64)stats.step_count * (f64)stats.particle_count / ((f64)sum_ns * 1e-9) * 1e-6);
+        if (args.scene == SimScene_Particles) {
+            printf("[headless] %llu fixed steps (dt %.4f s), sim time %.3f s, %u particles, "
+                   "%.1f M particle-steps/s\n",
+                   (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,
+                   (f64)stats.step_count * (f64)stats.particle_count / ((f64)sum_ns * 1e-9) * 1e-6);
+        } else {
+            printf("[headless] %llu master steps (dt %.4f s), sim time %.3f s, %u zones, %.2f sim-s per wall-s\n",
+                   (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,
+                   stats.sim_time / ((f64)sum_ns * 1e-9));
+            printf("[headless] %s\n", stats.summary);
+        }
         printf("[headless] state hash %016llx\n", (unsigned long long)stats.state_hash);
         platform_print_memory_stats(&stats);
         platform_print_debug_table(&debug_table, args.headless_frames, cycles_per_ms, 1);
@@ -502,14 +538,16 @@ int main(int argc, char **argv) {
             u64 t = linux_now_ns();
             f64 ms_per_frame = linux_seconds_between(window_start_ns, t) * 1000.0 / (f64)frames_in_window;
             char title[256];
-            snprintf(title, sizeof(title), "simstack  %.2f ms/frame  step %llu  %u particles%s%s", ms_per_frame,
-                     (unsigned long long)stats.step_count, stats.particle_count,
+            snprintf(title, sizeof(title), "simstack  %.2f ms/frame  step %llu  t %.2f s  %u %s%s%s", ms_per_frame,
+                     (unsigned long long)stats.step_count, stats.sim_time, stats.particle_count,
+                     args.scene == SimScene_Particles ? "particles" : "zones",
                      stats.paused ? "  [paused]" : "", stats.reload_count ? "  [reloaded]" : "");
             XStoreName(win.display, win.window, title);
             if (!args.quiet) {
                 printf("[frame %llu] %.2f ms/frame, %u steps/frame, sim t=%.2f s, reloads %u\n",
                        (unsigned long long)frame_index, ms_per_frame, stats.steps_this_frame, stats.sim_time,
                        stats.reload_count);
+                if (stats.summary[0]) printf("  %s\n", stats.summary);
                 platform_print_memory_stats(&stats);
                 platform_print_debug_table(&debug_table, frames_in_window, cycles_per_ms, 0);
             }

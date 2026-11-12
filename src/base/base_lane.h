@@ -76,16 +76,19 @@ SIM_HD void lane_set(f64 *a, u32, f64 x) { *a = x; }
 
 // x^(1/3) for x in [1e-4, 1e4], from arithmetic only (no libm), identical on
 // every path. Used by step-size control, where the argument is clamped first.
+// x^(1/4) * x^(1/16) * x^(1/64) = x^(21/64) is within 5 % of the cube root
+// on this range (6 square roots); two Newton steps take it to ~1e-6.
 template <class V>
 SIM_HD V lane_cbrt_clamped(V x) {
     V lo = lane_splat((V *)0, 1e-4), hi = lane_splat((V *)0, 1e4);
     x = lane_min(lane_max(x, lo), hi);
-    // Newton on g^3 = x from g0 = 22 >= cbrt(1e4): monotone decreasing, then quadratic.
-    V g = lane_splat((V *)0, 22.0);
+    V r4 = lane_sqrt(lane_sqrt(x));
+    V r16 = lane_sqrt(lane_sqrt(r4));
+    V r64 = lane_sqrt(lane_sqrt(r16));
+    V g = r4 * r16 * r64;
     V two = lane_splat((V *)0, 2.0), third = lane_splat((V *)0, 1.0 / 3.0);
-    for (u32 it = 0; it < 24; ++it) {
-        g = (two * g + x / (g * g)) * third;
-    }
+    g = (two * g + x / (g * g)) * third;
+    g = (two * g + x / (g * g)) * third;
     return g;
 }
 

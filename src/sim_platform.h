@@ -16,6 +16,7 @@
 #include "base/base_math.h"
 #include "base/base_simd.h"
 #include "base/base_debug.h"
+#include "gpu/gpu_api.h"
 
 // ----------------------------------------------------------------------------
 // Platform services exposed to the sim (function pointer table).
@@ -37,20 +38,52 @@ typedef PLATFORM_NOW_NS(platform_now_ns_fn);
 #define PLATFORM_LOG(name) void name(const char *fmt, ...)
 typedef PLATFORM_LOG(platform_log_fn);
 
+// Work queue (Handmade Hero style): the sim pushes (callback, data) entries
+// and then calls complete_all_work, which helps until every entry has run.
+// Entries must be complete before sim_update returns, so no callback pointer
+// into the sim module survives a hot reload.
+struct PlatformWorkQueue;
+#define PLATFORM_WORK_QUEUE_CALLBACK(name) void name(PlatformWorkQueue *queue, void *data)
+typedef PLATFORM_WORK_QUEUE_CALLBACK(platform_work_queue_callback);
+
+#define PLATFORM_ADD_WORK_ENTRY(name) void name(PlatformWorkQueue *queue, platform_work_queue_callback *callback, void *data)
+typedef PLATFORM_ADD_WORK_ENTRY(platform_add_work_entry_fn);
+
+#define PLATFORM_COMPLETE_ALL_WORK(name) void name(PlatformWorkQueue *queue)
+typedef PLATFORM_COMPLETE_ALL_WORK(platform_complete_all_work_fn);
+
 struct PlatformAPI {
     platform_read_entire_file_fn *read_entire_file;
     platform_write_entire_file_fn *write_entire_file;
     platform_now_ns_fn *now_ns;
     platform_log_fn *log;
+    platform_add_work_entry_fn *add_work_entry;
+    platform_complete_all_work_fn *complete_all_work;
 };
 
 // ----------------------------------------------------------------------------
 // Memory handed to the sim. Fixed sizes chosen by the platform at startup;
 // the sim carves its arenas out of these on its first update.
 
+enum SimScene {
+    SimScene_Particles,   // M1 demo: SoA particle swirl
+    SimScene_Dbd,         // M2: DBD reactor zones (plug flow), plasma chemistry
+    SimScene_Sweep,       // M2: independent zones over an operating-point grid
+};
+
+enum SimBackend {
+    SimBackend_Cpu,       // AVX2 lanes across the work queue
+    SimBackend_Gpu,       // CUDA, one thread per zone (bit-identical to the CPU)
+};
+
 struct SimConfig {
-    u32 particle_count;   // dummy particle system size for milestone 1
+    u32 scene;            // SimScene
+    u32 particle_count;   // particles scene
     u32 seed;
+    u32 zone_count;       // dbd / sweep scenes
+    u32 backend;          // SimBackend
+    b32 averaged;         // dbd / sweep: continuous source instead of discharge pulses
+    const char *csv_path; // dbd / sweep: write results here (0: none)
 };
 
 struct SimMemory {
@@ -65,6 +98,9 @@ struct SimMemory {
 
     SimConfig config;
     PlatformAPI platform;
+    PlatformWorkQueue *work_queue;   // threads = worker_count (including the caller)
+    u32 worker_count;
+    GpuAPI gpu;                      // gpu.available == 0 without --gpu or without the module
     DebugTable *debug;    // platform-owned profiler table (may be 0 when SIM_INTERNAL=0)
 };
 
@@ -109,17 +145,23 @@ struct SimInput {
 };
 
 // ----------------------------------------------------------------------------
-// Output. Milestone 1 renders one SoA point cloud; the platform uploads the
-// three arrays straight into vertex buffers.
+// Output: a few batches of SoA points, each with its own colour and size.
+// The platform uploads each batch's three arrays straight into vertex buffers.
+
+struct RenderPointBatch {
+    u32 count;                // valid entries (padded count may be larger)
+    const f32 *px, *py, *pz;  // SoA positions in sim memory (valid until next update)
+    v4 color;
+    f32 point_size;
+};
+
+#define RENDER_MAX_BATCHES 32
 
 struct RenderCommands {
     v4 clear_color;
     m4 view_proj;
-    f32 point_size;
-    v4 point_color;
-
-    u32 point_count;          // valid entries (padded count may be larger)
-    const f32 *px, *py, *pz;  // SoA positions in sim memory (valid until next update)
+    u32 batch_count;
+    RenderPointBatch batches[RENDER_MAX_BATCHES];
 };
 
 struct SimStats {
@@ -134,6 +176,8 @@ struct SimStats {
     u64 scratch_high_water, scratch_size;
     b32 paused;
     u32 reload_count;         // incremented by sim_on_reload
+    u32 thread_count;         // threads the sim used for its batches
+    char summary[512];        // scene-specific one-liner for headless / periodic prints
 };
 
 // ----------------------------------------------------------------------------

@@ -9,12 +9,12 @@
 #include "kinetics/kin_solver.h"
 
 // One group of LaneTraits<V>::width zones starting at lane i0.
-template <class V>
+template <class V, class Cap = KinCapDefault>
 SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const KinControl *ctl,
                               const f64 *y_soa, const f64 *k_soa, const f64 *src_soa, const f64 *pulse_soa,
                               const f64 *period, f64 *h_soa, f64 *pulse_index, f64 *steps, f64 *rejects,
                               f64 *pulses, f64 *failed, f64 *y_out, u32 padded, u32 i0, f64 t0, f64 t1) {
-    V y[KIN_MAX_SPECIES], k[KIN_MAX_REACTIONS], src[KIN_MAX_SPECIES], pulse[KIN_MAX_SPECIES];
+    V y[Cap::species], k[Cap::reactions], src[Cap::species], pulse[Cap::species];
     for (u32 s = 0; s < m->species_count; ++s) {
         y[s] = lane_load(y_soa + s * padded + i0, (V *)0);
         src[s] = lane_load(src_soa + s * padded + i0, (V *)0);
@@ -30,7 +30,7 @@ SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const K
     st.pulses = lane_load(pulses + i0, (V *)0);
     st.failed = lane_load(failed + i0, (V *)0);
 
-    kin_advance(m, method, ctl, k, src, pulse, per, y, lane_splat((V *)0, t0), lane_splat((V *)0, t1), h, pidx, st);
+    kin_advance<V, Cap>(m, method, ctl, k, src, pulse, per, y, lane_splat((V *)0, t0), lane_splat((V *)0, t1), h, pidx, st);
 
     for (u32 s = 0; s < m->species_count; ++s) lane_store(y_out + s * padded + i0, y[s]);
     lane_store(h_soa + i0, h);
