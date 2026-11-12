@@ -424,8 +424,58 @@ internal void ui_frame_begin(SimState *state, SimMemory *memory, SimInput *input
     ui_plots(state);
 }
 
+// 3D view overlay: species picker, colour bar, inlet/outlet labels projected
+// with this frame's camera.
+internal void ui_view_overlay(SimState *state, RenderCommands *render) {
+    UiState *ui = &state->ui;
+    DbdScene *scene = state->dbd;
+    if (!scene || render->scene_w <= 0) return;
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImVec2 origin = ImVec2(vp->Pos.x + render->scene_x, vp->Pos.y + render->scene_y);
+    ImGui::SetNextWindowPos(ImVec2(origin.x + 10, origin.y + 10));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##view_overlay", 0, flags)) {
+        const char *names[DBD_PLOT_SPECIES];
+        for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) names[p] = dbd_plot_species[p].name;
+        ImGui::SetNextItemWidth(90);
+        ImGui::Combo("##viewspecies", &ui->view_species, names, DBD_PLOT_SPECIES);
+        ImGui::SameLine();
+        ImGui::TextDisabled(scene->chained ? "along the tube, log10 ppm" : "over power x humidity, log10 ppm");
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        f32 w = 260.0f, h = 12.0f;
+        const u32 segments = 32;
+        for (u32 i = 0; i < segments; ++i) {
+            ImU32 c0 = dbd_colormap((f32)i / segments), c1 = dbd_colormap((f32)(i + 1) / segments);
+            dl->AddRectFilledMultiColor(ImVec2(p0.x + w * i / segments, p0.y), ImVec2(p0.x + w * (i + 1) / segments, p0.y + h),
+                                        c0, c1, c1, c0);
+        }
+        ImGui::Dummy(ImVec2(w, h));
+        ImGui::Text("%-10.3g", pow(10.0, scene->view_lo));
+        ImGui::SameLine(w - 60);
+        ImGui::Text("%10.3g ppm", pow(10.0, scene->view_hi));
+    }
+    ImGui::End();
+
+    // labels at projected 3D positions
+    if (scene->chained) {
+        ImDrawList *fg = ImGui::GetForegroundDrawList();
+        struct { v3 p; const char *text; } labels[] = { { V3(-1.6f, 0.55f, 0.0f), "inlet" }, { V3(1.6f, 0.55f, 0.0f), "outlet" } };
+        for (u32 i = 0; i < ArrayCount(labels); ++i) {
+            v4 clip = render->view_proj * V4(labels[i].p.x, labels[i].p.y, labels[i].p.z, 1.0f);
+            if (clip.w <= 0.0f) continue;
+            f32 nx = clip.x / clip.w, ny = clip.y / clip.w;
+            ImVec2 pos = ImVec2(origin.x + (nx * 0.5f + 0.5f) * render->scene_w, origin.y + (0.5f - ny * 0.5f) * render->scene_h);
+            fg->AddText(pos, IM_COL32(220, 225, 235, 220), labels[i].text);
+        }
+    }
+}
+
 internal void ui_frame_end(SimState *state, SimInput *input, RenderCommands *render) {
     UiState *ui = &state->ui;
+    ui_view_overlay(state, render);
     // history ring
     f32 frame_ms = input->dt_frame * 1000.0f;
     f64 advanced = state->sim_time - ui->last_sim_time;

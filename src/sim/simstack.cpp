@@ -136,10 +136,10 @@ internal void sim_fill_render(SimState *state, SimInput *input, RenderCommands *
     m4 proj = m4_perspective(radians(50.0f), aspect, 0.05f, 100.0f);
     m4 view = m4_look_at(eye, V3(0.0f), V3(0.0f, 1.0f, 0.0f));
 
-    render->clear_color = V4(0.05f, 0.06f, 0.08f, 1.0f);
+    render->clear_color = V4(0.035f, 0.04f, 0.055f, 1.0f);
     render->view_proj = proj * view;
     if (state->dbd) {
-        dbd_scene_fill_render(state->dbd, render);
+        dbd_scene_fill_render(state->dbd, render, (u32)state->ui.view_species);
         return;
     }
     render->batch_count = 1;
@@ -150,6 +150,7 @@ internal void sim_fill_render(SimState *state, SimInput *input, RenderCommands *
     b->px = state->particles.x;
     b->py = state->particles.y;
     b->pz = state->particles.z;
+    b->rgba = 0;
 }
 
 SIM_API SIM_ON_RELOAD(sim_on_reload) {

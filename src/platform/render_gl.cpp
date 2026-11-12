@@ -58,6 +58,7 @@ typedef ptrdiff_t GLintptr;
     X(void, glGenVertexArrays, GLsizei n, GLuint *arrays) \
     X(void, glBindVertexArray, GLuint array) \
     X(void, glEnableVertexAttribArray, GLuint index) \
+    X(void, glDisableVertexAttribArray, GLuint index) \
     X(void, glVertexAttribPointer, GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer) \
     X(void, glUniform1i, GLint location, GLint v0) \
     X(void, glBlendFuncSeparate, GLenum src_rgb, GLenum dst_rgb, GLenum src_a, GLenum dst_a) \
@@ -91,10 +92,11 @@ struct GLUiTexture {
 struct GLRenderer {
     GLuint program;
     GLuint vao;
-    GLuint vbo[3];        // one buffer per SoA axis: x, y, z
+    GLuint vbo[4];        // one buffer per SoA axis: x, y, z; [3] per-point colour
     GLint u_view_proj;
     GLint u_point_size;
     GLint u_color;
+    GLint u_use_vcol;
 
     GLuint ui_program;
     GLuint ui_vao, ui_vbo, ui_ibo;
@@ -131,22 +133,27 @@ global const char *gl_point_vertex_src =
     "layout(location = 0) in float px;\n"
     "layout(location = 1) in float py;\n"
     "layout(location = 2) in float pz;\n"
+    "layout(location = 3) in vec4 pcol;\n"
     "uniform mat4 u_view_proj;\n"
     "uniform float u_point_size;\n"
+    "uniform vec4 u_color;\n"
+    "uniform int u_use_vcol;\n"
+    "out vec4 v_col;\n"
     "void main() {\n"
     "    gl_Position = u_view_proj * vec4(px, py, pz, 1.0);\n"
     "    gl_PointSize = u_point_size;\n"
+    "    v_col = u_use_vcol != 0 ? pcol : u_color;\n"
     "}\n";
 
 global const char *gl_point_fragment_src =
     "#version 330 core\n"
-    "uniform vec4 u_color;\n"
+    "in vec4 v_col;\n"
     "out vec4 frag_color;\n"
     "void main() {\n"
     "    vec2 d = gl_PointCoord * 2.0 - 1.0;\n"
     "    float r2 = dot(d, d);\n"
     "    if (r2 > 1.0) discard;\n"
-    "    frag_color = vec4(u_color.rgb * (1.0 - 0.35 * r2), u_color.a);\n"   // soft round dots
+    "    frag_color = vec4(v_col.rgb * (1.0 - 0.35 * r2), v_col.a);\n"   // soft round dots
     "}\n";
 
 internal GLuint gl_compile_shader(GLenum type, const char *src) {
@@ -312,15 +319,18 @@ internal b32 gl_renderer_init(GLRenderer *r) {
     r->u_view_proj = glGetUniformLocation(r->program, "u_view_proj");
     r->u_point_size = glGetUniformLocation(r->program, "u_point_size");
     r->u_color = glGetUniformLocation(r->program, "u_color");
+    r->u_use_vcol = glGetUniformLocation(r->program, "u_use_vcol");
 
     glGenVertexArrays(1, &r->vao);
     glBindVertexArray(r->vao);
-    glGenBuffers(3, r->vbo);
+    glGenBuffers(4, r->vbo);
     for (u32 axis = 0; axis < 3; ++axis) {
         glBindBuffer(GL_ARRAY_BUFFER, r->vbo[axis]);
         glEnableVertexAttribArray(axis);
         glVertexAttribPointer(axis, 1, GL_FLOAT, GL_FALSE, 0, 0);
     }
+    glBindBuffer(GL_ARRAY_BUFFER, r->vbo[3]);
+    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, 0);   // enabled per batch
     glBindVertexArray(0);
     glEnable(GL_PROGRAM_POINT_SIZE);
     glEnable(GL_DEPTH_TEST);
@@ -356,6 +366,14 @@ internal void gl_render_frame(GLRenderer *r, RenderCommands *cmds, u32 width, u3
                 glBindBuffer(GL_ARRAY_BUFFER, r->vbo[axis]);
                 glBufferData(GL_ARRAY_BUFFER, bytes, axes[axis], GL_STREAM_DRAW);   // orphan + upload
             }
+            if (batch->rgba) {
+                glBindBuffer(GL_ARRAY_BUFFER, r->vbo[3]);
+                glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)batch->count * 4, batch->rgba, GL_STREAM_DRAW);
+                glEnableVertexAttribArray(3);
+            } else {
+                glDisableVertexAttribArray(3);
+            }
+            glUniform1i(r->u_use_vcol, batch->rgba ? 1 : 0);
             glDrawArrays(GL_POINTS, 0, (GLsizei)batch->count);
         }
         glBindVertexArray(0);

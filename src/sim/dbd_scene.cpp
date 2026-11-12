@@ -13,6 +13,7 @@
 
 #define DBD_PLOT_SPECIES 8
 #define DBD_SERIES_CAPACITY 65536   // outlet rows kept for the reactor CSV
+#define DBD_TUBE_RING       28      // points per axial ring in the 3D reactor view
 
 struct DbdPlotSpecies {
     const char *name;
@@ -59,7 +60,11 @@ struct DbdScene {
     f64 last_step_wall_ms;
     f64 wall_ms_total;
     u32 plot_index[DBD_PLOT_SPECIES];
-    f32 *plot_x[DBD_PLOT_SPECIES], *plot_y[DBD_PLOT_SPECIES], *plot_z[DBD_PLOT_SPECIES];
+    // 3D view (allocated once at init): reactor = tube of rings, sweep = surface
+    u32 view_count;
+    f32 *view_x, *view_y, *view_z;
+    u32 *view_rgba;
+    f64 view_lo, view_hi;      // log10 ppm range of the coloured species (for the colour bar)
 
     DbdOperating op;           // operating point the UI edits (sweep: power/humidity are the grid axes)
 
@@ -141,10 +146,12 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
         s32 s = kin_find_species(&scene->model, dbd_plot_species[p].name);
         Assert(s >= 0);
         scene->plot_index[p] = (u32)s;
-        scene->plot_x[p] = SoaPush(arena, f32, count);
-        scene->plot_y[p] = SoaPush(arena, f32, count);
-        scene->plot_z[p] = SoaPush(arena, f32, count);
     }
+    scene->view_count = sweep ? count : count * DBD_TUBE_RING;
+    scene->view_x = SoaPush(arena, f32, scene->view_count);
+    scene->view_y = SoaPush(arena, f32, scene->view_count);
+    scene->view_z = SoaPush(arena, f32, scene->view_count);
+    scene->view_rgba = push_array_aligned(arena, u32, SoaPadCount(scene->view_count), SIMD_ALIGN);
     scene->series = push_array(arena, f64, (u64)DBD_SERIES_CAPACITY * (1 + DBD_PLOT_SPECIES));
     scene->series_every = 10;
     scene->next_csv_t = 1.0;
@@ -270,35 +277,71 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
 
 // --- render -----------------------------------------------------------------
 
-// reactor: x = position along the tube, y = log10(ppm) from 1e-3 to 1e4,
-//          z = one row per species.
-// sweep:   x = log power, z = humidity, y = log10(ppm); one surface per species.
-internal void dbd_scene_fill_render(DbdScene *scene, RenderCommands *render) {
+// Perceptual colormap (viridis control points), t in [0, 1] -> 0xAABBGGRR.
+internal u32 dbd_colormap(f32 t) {
+    static const f32 cm[6][3] = {
+        {0.267f, 0.005f, 0.329f}, {0.231f, 0.322f, 0.545f}, {0.128f, 0.567f, 0.551f},
+        {0.267f, 0.749f, 0.441f}, {0.741f, 0.873f, 0.150f}, {0.993f, 0.906f, 0.144f},
+    };
+    t = Clamp(t, 0.0f, 1.0f) * 5.0f;
+    u32 i = (u32)t;
+    if (i > 4) i = 4;
+    f32 f = t - (f32)i;
+    u32 rgb[3];
+    for (u32 c = 0; c < 3; ++c) rgb[c] = (u32)(255.0f * (cm[i][c] + f * (cm[i + 1][c] - cm[i][c])) + 0.5f);
+    return 0xFF000000u | (rgb[2] << 16) | (rgb[1] << 8) | rgb[0];
+}
+
+// reactor: a tube along x, one ring of points per zone, coloured by the chosen
+//          species' log10 mole fraction (inlet at -x).
+// sweep:   x = log power, z = humidity, y and colour = log10 mole fraction.
+internal void dbd_scene_fill_render(DbdScene *scene, RenderCommands *render, u32 view_species) {
     TIMED_FUNCTION();
     DbdZones *z = &scene->zones;
-    render->batch_count = 0;
-    for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) {
-        f32 *px = scene->plot_x[p], *py = scene->plot_y[p], *pz = scene->plot_z[p];
-        for (u32 i = 0; i < z->count; ++i) {
-            f64 ppm = dbd_ppm(z, scene->plot_index[p], i);
-            f32 lg = (f32)log10(ppm > 1e-3 ? ppm : 1e-3);
-            f32 y = (lg + 3.0f) / 7.0f * 2.0f - 1.0f;
-            if (scene->chained) {
-                px[i] = z->count > 1 ? -1.5f + 3.0f * (f32)i / (f32)(z->count - 1) : 0.0f;
-                pz[i] = -0.9f + 1.8f * (f32)p / (f32)(DBD_PLOT_SPECIES - 1);
-            } else {
-                u32 ix = i % scene->sweep_nx, iy = i / scene->sweep_nx;
-                px[i] = -1.2f + 2.4f * (f32)ix / (f32)Maximum(scene->sweep_nx - 1, 1u);
-                pz[i] = -1.2f + 2.4f * (f32)iy / (f32)Maximum(scene->sweep_ny - 1, 1u);
-            }
-            py[i] = y;
-        }
-        RenderPointBatch *b = render->batches + render->batch_count++;
-        b->count = z->count;
-        b->px = px; b->py = py; b->pz = pz;
-        b->color = dbd_plot_species[p].color;
-        b->point_size = scene->chained ? 9.0f : 5.0f;
+    u32 s = scene->plot_index[view_species % DBD_PLOT_SPECIES];
+    f64 lo = 1e300, hi = -1e300;
+    for (u32 i = 0; i < z->count; ++i) {
+        f64 ppm = dbd_ppm(z, s, i);
+        f64 v = log10(ppm > 1e-6 ? ppm : 1e-6);
+        lo = Minimum(lo, v); hi = Maximum(hi, v);
     }
+    if (hi - lo < 0.5) { f64 mid = 0.5 * (hi + lo); lo = mid - 0.25; hi = mid + 0.25; }
+    scene->view_lo = lo;
+    scene->view_hi = hi;
+    f32 inv = (f32)(1.0 / (hi - lo));
+    if (scene->chained) {
+        for (u32 i = 0; i < z->count; ++i) {
+            f64 ppm = dbd_ppm(z, s, i);
+            f32 t = ((f32)log10(ppm > 1e-6 ? ppm : 1e-6) - (f32)lo) * inv;
+            u32 rgba = dbd_colormap(t);
+            f32 x = z->count > 1 ? -1.6f + 3.2f * (f32)i / (f32)(z->count - 1) : 0.0f;
+            for (u32 k = 0; k < DBD_TUBE_RING; ++k) {
+                f32 a = TAU32 * (f32)k / (f32)DBD_TUBE_RING;
+                u32 j = i * DBD_TUBE_RING + k;
+                scene->view_x[j] = x;
+                scene->view_y[j] = 0.38f * cosf(a);
+                scene->view_z[j] = 0.38f * sinf(a);
+                scene->view_rgba[j] = rgba;
+            }
+        }
+    } else {
+        for (u32 i = 0; i < z->count; ++i) {
+            u32 ix = i % scene->sweep_nx, iy = i / scene->sweep_nx;
+            f64 ppm = dbd_ppm(z, s, i);
+            f32 t = ((f32)log10(ppm > 1e-6 ? ppm : 1e-6) - (f32)lo) * inv;
+            scene->view_x[i] = -1.4f + 2.8f * (f32)ix / (f32)Maximum(scene->sweep_nx - 1, 1u);
+            scene->view_z[i] = -1.4f + 2.8f * (f32)iy / (f32)Maximum(scene->sweep_ny - 1, 1u);
+            scene->view_y[i] = -0.6f + 1.2f * t;
+            scene->view_rgba[i] = dbd_colormap(t);
+        }
+    }
+    render->batch_count = 1;
+    RenderPointBatch *b = render->batches;
+    b->count = scene->view_count;
+    b->px = scene->view_x; b->py = scene->view_y; b->pz = scene->view_z;
+    b->rgba = scene->view_rgba;
+    b->color = V4(1, 1, 1, 1);
+    b->point_size = scene->chained ? (z->count <= 64 ? 9.0f : 6.0f) : (z->count <= 1024 ? 7.0f : 4.0f);
 }
 
 internal void dbd_scene_summary(DbdScene *scene, char *out, u32 size, u32 threads) {

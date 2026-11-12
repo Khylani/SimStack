@@ -56,6 +56,7 @@ struct UiState {
     b32 max_speed;              // ignore speed, spend the whole chemistry budget
     b32 step_once;
     s32 heat_species;
+    s32 view_species;           // coloured in the 3D view
     s32 profile_x_time;         // axial profile x axis: 0 = zone index, 1 = residence time
     char export_path[256];
     b32 dragging;

@@ -179,6 +179,7 @@ struct SimInput {
 struct RenderPointBatch {
     u32 count;                // valid entries (padded count may be larger)
     const f32 *px, *py, *pz;  // SoA positions in sim memory (valid until next update)
+    const u32 *rgba;          // optional per-point colour (0xAABBGGRR); 0: use `color`
     v4 color;
     f32 point_size;
 };
