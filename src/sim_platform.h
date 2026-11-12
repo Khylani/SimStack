@@ -84,6 +84,7 @@ struct SimConfig {
     u32 backend;          // SimBackend
     b32 averaged;         // dbd / sweep: continuous source instead of discharge pulses
     u32 precision;        // dbd / sweep: 0 = f32 lanes (fast, default), 1 = f64 lanes (reference)
+    u32 chem_steps;       // dbd / sweep: master steps per chemistry advance (0 = scene default)
     const char *csv_path; // dbd / sweep: write results here (0: none)
 };
 

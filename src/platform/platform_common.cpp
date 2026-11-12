@@ -35,6 +35,7 @@ struct PlatformArgs {
     u32 gpu_mem_mb;
     b32 averaged;
     u32 precision;        // 0 f32, 1 f64 (SimConfig::precision)
+    u32 chem_steps;       // SimConfig::chem_steps
     const char *csv_path;
     u32 seed;
     u32 window_width;
@@ -55,6 +56,7 @@ internal void platform_print_usage(const char *exe) {
            "  --gpu          load build/simstack_gpu.so and run the chemistry on CUDA\n"
            "  --gpu-mem MB   device arena size (default 512)\n"
            "  --averaged     continuous discharge source instead of one pulse per half-cycle\n"
+           "  --chem-dt N    chemistry advance every N ms (master steps); reactor default 1, sweep 20\n"
            "  --precision P  chemistry lanes: f32 (default: 8 zones per AVX2 register, CUDA FP32 units)\n"
            "                 or f64 (reference: exact atom bookkeeping for long runs)\n"
            "  --csv F        dbd: outlet time series (rewritten every simulated second); sweep: final grid\n"
@@ -101,6 +103,8 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             else if (strcmp(next, "f64") == 0) args.precision = 1;
             else { printf("unknown precision %s (f32 | f64)\n", next); exit(1); }
             ++i;
+        } else if (strcmp(a, "--chem-dt") == 0 && next) {
+            args.chem_steps = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--averaged") == 0) {
             args.averaged = 1;
         } else if (strcmp(a, "--csv") == 0 && next) {

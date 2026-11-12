@@ -199,18 +199,21 @@ internal u32 sim_run_chemistry(SimState *state, SimMemory *memory, f64 budget_ms
     u32 steps = 0;
     u64 start_ns = memory->platform.now_ns();
     f64 per_step_ms = state->dbd->last_step_wall_ms;
-    while (state->accumulator >= state->dt_fixed && !state->dbd->finished) {
+    // One chemistry advance covers chem_steps master steps (the coupling interval).
+    u32 k = Maximum(state->dbd->chem_steps, 1u);
+    f64 dt_chem = state->dt_fixed * (f64)k;
+    while (state->accumulator >= dt_chem - 1e-12 && !state->dbd->finished) {
         f64 spent_ms = (f64)(memory->platform.now_ns() - start_ns) * 1e-6;
         if (budget_ms > 0.0 && steps > 0 && spent_ms + per_step_ms > budget_ms) {
             state->accumulator = 0.0;
             break;
         }
-        dbd_scene_step(state->dbd, memory, &state->frame, state->dt_fixed);
+        dbd_scene_step(state->dbd, memory, &state->frame, dt_chem);
         per_step_ms = state->dbd->last_step_wall_ms;
-        state->accumulator -= state->dt_fixed;
-        state->step_count += 1;
-        state->sim_time += state->dt_fixed;
-        ++steps;
+        state->accumulator -= dt_chem;
+        state->step_count += k;
+        state->sim_time += dt_chem;
+        steps += k;
     }
     if (state->dbd->finished) state->accumulator = 0.0;
     state->ui.chem_ms_frame = (f32)((f64)(memory->platform.now_ns() - start_ns) * 1e-6);
@@ -266,11 +269,12 @@ SIM_API SIM_UPDATE(sim_update) {
         if (ui_on && state->dbd && state->ui.max_speed) speed = 1e9;
         state->accumulator += (f64)input->dt_frame * speed;
         u32 max_steps = (ui_on && state->dbd) ? 1000000 : SIM_MAX_STEPS_PER_FRAME;   // windowed chemistry: wall budget instead
+        if (state->dbd) max_steps = Maximum(max_steps, state->dbd->chem_steps);   // room for one chemistry advance
         f64 max_accum = state->dt_fixed * max_steps;
         if (state->accumulator > max_accum) {
             state->accumulator = max_accum;
         }
-        if (step_once) state->accumulator = state->dt_fixed;
+        if (step_once) state->accumulator = state->dt_fixed * (state->dbd ? (f64)Maximum(state->dbd->chem_steps, 1u) : 1.0);
         TIMED_BLOCK("fixed_steps");
         if (state->dbd) {
             if (async_chem) {

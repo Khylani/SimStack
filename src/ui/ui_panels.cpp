@@ -151,7 +151,14 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
         if (ImGui::SliderFloat("Gas T K", &T, 270.0f, 500.0f, "%.0f")) { op->T_K = T; changed = 1; }
         f32 p_kPa = (f32)(op->p_Pa / 1000.0);
         if (ImGui::SliderFloat("Pressure kPa", &p_kPa, 20.0f, 200.0f, "%.1f")) { op->p_Pa = p_kPa * 1000.0f; changed = 1; }
-        f64 min_res = (f64)scene->zones.count * state->dt_fixed * 1.01;
+        s32 chem_ms = (s32)scene->chem_steps;
+        ImGui::SetNextItemWidth(-110);
+        if (ImGui::SliderInt("Chem step ms", &chem_ms, 1, 50)) scene->chem_steps = (u32)chem_ms;
+        ui_help("Chemistry advances (and, in the reactor, plug-flow exchanges) happen every N master "
+                "steps of 1 ms. Inside a step the solver chooses its own sub-steps; larger N lets it take "
+                "long steps in quasi-steady chemistry and cuts per-step overhead (and GPU transfers).");
+        f64 min_res = (f64)scene->zones.count * state->dt_fixed * (f64)scene->chem_steps * 1.01;
+        if (scene->chained && scene->residence_s < min_res) scene->residence_s = min_res;
         if (ui_slider_log(scene->chained ? "Residence s" : "Duration s", &scene->residence_s, Maximum(0.05, min_res), 60.0, "%.2f")) {
             scene->residence_s = Maximum(scene->residence_s, min_res);
         }

@@ -44,6 +44,7 @@ struct DbdScene {
     KinControl control;
     DbdDischargeMode mode;
     b32 chained;               // reactor: plug flow; sweep: independent
+    u32 chem_steps;            // master steps per chemistry advance (coupling interval = chem_steps * dt)
     f64 residence_s;           // reactor: total gas residence; sweep: batch duration
     u32 sweep_nx, sweep_ny;    // sweep grid (power x humidity)
 
@@ -122,6 +123,7 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
     scene->control = dbd_default_control();
     scene->mode = config->averaged ? DbdDischarge_Averaged : DbdDischarge_Pulsed;
     scene->chained = !sweep;
+    scene->chem_steps = config->chem_steps ? config->chem_steps : (sweep ? 20 : 1);
     scene->residence_s = 2.0;
     scene->use_gpu = config->backend == SimBackend_Gpu;
     scene->csv_path = config->csv_path;
@@ -249,7 +251,7 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
     scene->wall_ms_total += scene->last_step_wall_ms;
 
     // outlet (reactor) / corner (sweep) sample into the ring
-    if (scene->master_steps % scene->series_every == 0) {
+    if (scene->master_steps % Maximum(scene->series_every / scene->chem_steps, 1u) == 0) {
         u32 slot;
         if (scene->series_count < DBD_SERIES_CAPACITY) {
             slot = (scene->series_head + scene->series_count++) % DBD_SERIES_CAPACITY;

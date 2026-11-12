@@ -451,6 +451,7 @@ int main(int argc, char **argv) {
     memory.config.backend = args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
     memory.config.averaged = args.averaged;
     memory.config.precision = args.precision;
+    memory.config.chem_steps = args.chem_steps;
     memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
     memory.platform.read_entire_file = linux_read_entire_file;
