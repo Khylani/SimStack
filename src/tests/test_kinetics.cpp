@@ -222,7 +222,7 @@ internal void setup_zones(DbdZones *z, Arena *arena, KinModel *model, AirSpecies
     }
     dbd_zones_fill_padding(z);
     dbd_zones_reset(z, sp);
-    dbd_zones_prepare(z, model, sp, src, mode);
+    dbd_zones_prepare_rates(z, model);
 }
 
 // AVX2 lanes must reproduce the scalar reference bit for bit.
@@ -236,10 +236,8 @@ internal void test_simd_matches_scalar(KinModel *model, AirSpecies *sp, AirSourc
         setup_zones(&b, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
         for (u32 step = 0; step < 5; ++step) {
             f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
-            dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
-            dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
-            dbd_advance_cpu<f64x4>(&a, &model->mech, &method, &ctl, t0, t1);
-            dbd_advance_cpu<f64>(&b, &model->mech, &method, &ctl, t0, t1);
+            dbd_step_cpu<f64x4>(&a, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+            dbd_step_cpu<f64>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
         }
         u64 bytes = sizeof(f64) * (u64)a.n_species * a.padded;
         b32 same = memcmp(a.y, b.y, bytes) == 0 && memcmp(a.h, b.h, sizeof(f64) * a.padded) == 0 &&
@@ -263,10 +261,8 @@ internal void test_generated_matches_table(KinModel *model, AirSpecies *sp, AirS
         setup_zones(&b, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
         for (u32 step = 0; step < 5; ++step) {
             f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
-            dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
-            dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
-            dbd_advance_cpu<f64x4, AirGenOps>(&a, &model->mech, &method, &ctl, t0, t1);
-            dbd_advance_cpu<f64x4>(&b, &model->mech, &method, &ctl, t0, t1);
+            dbd_step_cpu<f64x4, AirGenOps>(&a, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+            dbd_step_cpu<f64x4>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
         }
         u64 bytes = sizeof(f64) * (u64)a.n_species * a.padded;
         b32 same = memcmp(a.y, b.y, bytes) == 0 && memcmp(a.steps, b.steps, sizeof(f64) * a.padded) == 0;
@@ -290,8 +286,7 @@ internal void test_conservation(KinModel *model, AirSpecies *sp, AirSourceModel 
         kin_count_elements(model, y, before[i]);
     }
     for (u32 step = 0; step < 50; ++step) {
-        dbd_zones_prepare(&z, model, sp, src, DbdDischarge_Pulsed);
-        dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
+        dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, DbdDischarge_Pulsed, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
     }
     f64 worst = 0.0;
     for (u32 i = 0; i < 8; ++i) {
@@ -317,9 +312,9 @@ internal void test_ozone_yield(KinModel *model, AirSpecies *sp, AirSourceModel *
     z.T_K[0] = 300.0; z.p_Pa[0] = 101325.0; z.x_H2O[0] = 0.0; z.power_W_cm3[0] = 0.01; z.freq_Hz[0] = 10000.0;
     dbd_zones_fill_padding(&z);
     dbd_zones_reset(&z, sp);
+    dbd_zones_prepare_rates(&z, model);
     for (u32 step = 0; step < 10; ++step) {
-        dbd_zones_prepare(&z, model, sp, src, DbdDischarge_Pulsed);
-        dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
+        dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, DbdDischarge_Pulsed, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
     }
     f64 energy = 0.01 * 10e-3;   // J/cm^3
     // Odd oxygen made: O from O2 dissociation, plus one O per N atom
@@ -398,13 +393,13 @@ internal void bench_tolerance(KinModel *model, AirSpecies *sp, AirSourceModel *s
             }
             dbd_zones_fill_padding(&z);
             dbd_zones_reset(&z, sp);
+    dbd_zones_prepare_rates(&z, model);
             KinMethod method = kin_method(runs[ri].method);
             KinControl ctl = dbd_default_control();
             ctl.rtol = runs[ri].rtol; ctl.atol = runs[ri].atol; ctl.max_steps = 1000000;
             f64 t_start = now_s();
             for (u32 step = 0; step < 20; ++step) {
-                dbd_zones_prepare(&z, model, sp, src, (DbdDischargeMode)mode);
-                dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
+                dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
             }
             f64 wall = now_s() - t_start;
             f64 worst = 0.0, steps = 0.0;
@@ -439,11 +434,10 @@ internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
             f64 t_start = now_s();
             u32 ms = 20;
             for (u32 step = 0; step < ms; ++step) {
-                dbd_zones_prepare(&z, model, sp, src, (DbdDischargeMode)mode);
                 f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
-                if (variant == 0) dbd_advance_cpu<f64>(&z, &model->mech, &method, &ctl, t0, t1);
-                else if (variant == 1) dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, t0, t1);
-                else dbd_advance_cpu<f64x4, AirGenOps>(&z, &model->mech, &method, &ctl, t0, t1);
+                if (variant == 0) dbd_step_cpu<f64>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+                else if (variant == 1) dbd_step_cpu<f64x4>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+                else dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
             }
             f64 wall = now_s() - t_start;
             f64 steps = 0.0;
@@ -515,11 +509,11 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
         setup_zones(&b, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
         for (u32 step = 0; step < 5; ++step) {
             f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
-            dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
-            dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
-            err = dbd_advance_gpu(&a, &gpu, &g, t0, t1);
+            dbd_zones_prepare_source(&a, sp, src, (DbdDischargeMode)mode, t0, t1);
+            err = dbd_advance_gpu(&a, &gpu, &g, t1 - t0);
+            dbd_zones_commit_pulses(&a);
             CHECK(err == 0, "gpu advance: %s", gpu.gpu_error_string(err));
-            dbd_advance_cpu<f64x4>(&b, &model->mech, &method, &ctl, t0, t1);
+            dbd_step_cpu<f64x4>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
         }
         u64 bytes = sizeof(f64) * (u64)a.n_species * a.padded;
         b32 same = memcmp(a.y, b.y, bytes) == 0 && memcmp(a.h, b.h, sizeof(f64) * a.padded) == 0 &&
@@ -547,12 +541,12 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
             f64 gpu_s = 0.0, cpu_s = 0.0, kernel_ms = 0.0;
             for (u32 step = 0; step < ms; ++step) {
                 f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
-                dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
-                dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
                 f64 s0 = now_s();
-                dbd_advance_gpu(&a, &gpu, &g, t0, t1);
+                dbd_zones_prepare_source(&a, sp, src, (DbdDischargeMode)mode, t0, t1);
+                dbd_advance_gpu(&a, &gpu, &g, t1 - t0);
+                dbd_zones_commit_pulses(&a);
                 f64 s1 = now_s();
-                if (n <= 4096) dbd_advance_cpu<f64x4, AirGenOps>(&b, &model->mech, &method, &ctl, t0, t1);
+                if (n <= 4096) dbd_step_cpu<f64x4, AirGenOps>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
                 f64 s2 = now_s();
                 gpu_s += s1 - s0; cpu_s += s2 - s1; kernel_ms += g.last_kernel_ms;
             }

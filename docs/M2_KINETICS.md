@@ -95,7 +95,7 @@ low frequency or high energy per pulse, where radical–radical recombination be
 | CUDA vs AVX2, pulsed and averaged | bit-identical |
 | N/O/H atom conservation, 8 zones × 50 ms pulsed | drift 6e-13 |
 | Dry-air O3 yield at 0.1 mJ/cm³ | 0.97 of the odd oxygen made (O + N atoms) |
-| Reactor state hash, 30 frames | `1d27d1d629fbc024` for clang/gcc, -O0/-O2, ASan, `--simd=0`, 1/8 threads |
+| Reactor state hash, 30 frames | `3d961503dd103e85` for clang/gcc, -O0/-O2, ASan, `--simd=0`, 1/8 threads |
 | Hot reload ×2 during a 5 s pulsed run | same final hash as without reloads (`e77be511ffd6c8e6`) |
 
 ## Performance (i9-12900KF, RTX 3060 12 GB)

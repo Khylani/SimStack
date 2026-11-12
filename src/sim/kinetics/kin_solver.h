@@ -292,33 +292,36 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
     }
 }
 
-// Advances [t0, t1] with optional discharge pulses: an instantaneous source
-// `pulse` added at t = (pulse_index + 1) * period (period <= 0: no pulses).
+// Advances local time [0, duration] with `pulse_count` discharge pulses: an
+// instantaneous source `pulse` added at t = first_pulse + j * period,
+// j = 0 .. pulse_count-1 (computed by the host in f64 from absolute time, so
+// the solver never sees large time values and lane precision can be f32).
 // Integration stops exactly on each pulse, applies it, restarts with h_start.
+// A pulse whose time rounds past `duration` is applied at `duration`, so the
+// count is always honoured.
 template <class V, class Ops = KinOpsDefault>
 SIM_HD void kin_advance(const KinMech *m, const KinMethod *method, const KinControl *ctl, const V *k,
-                        const V *src, const V *pulse, V period, V *y, V t0, V t1, V &h, V &pulse_index,
-                        KinLaneStats<V> &stats) {
+                        const V *src, const V *pulse, V period, V first_pulse, V pulse_count, V *y, V duration,
+                        V &h, KinLaneStats<V> &stats) {
     typedef typename LaneTraits<V>::Mask M;
     const u32 n = Ops::n(m);
     const V zero = lane_splat((V *)0, 0.0), one = lane_splat((V *)0, 1.0);
-    const V never = lane_splat((V *)0, 1e300);
-    M pulsed = lane_gt(period, zero);
-    V t = t0;
+    V t = zero, applied = zero;
     for (;;) {
-        V next_pulse = lane_select(pulsed, (pulse_index + one) * period, never);
-        V seg_end = lane_min(next_pulse, t1);
+        M pending = lane_lt(applied, pulse_count);
+        V next_pulse = lane_fmadd(applied, period, first_pulse);
+        V seg_end = lane_select(pending, lane_min(next_pulse, duration), duration);
         kin_integrate<V, Ops>(m, method, ctl, k, src, y, t, seg_end, h, stats);
 
         M alive = lane_not(lane_gt(stats.failed, zero));
-        M hit = lane_and(lane_and(pulsed, alive), lane_and(lane_le(next_pulse, t), lane_le(next_pulse, t1)));
+        M hit = lane_and(lane_and(pending, alive), lane_ge(t, seg_end));
         if (lane_any(hit)) {
             for (u32 s = 0; s < n; ++s) y[s] = y[s] + lane_select(hit, pulse[s], zero);
-            pulse_index = pulse_index + lane_select(hit, one, zero);
+            applied = applied + lane_select(hit, one, zero);
             stats.pulses = stats.pulses + lane_select(hit, one, zero);
             h = lane_select(hit, lane_splat((V *)0, ctl->h_start), h);
         }
-        M done = lane_or(lane_ge(t, t1), lane_not(alive));
+        M done = lane_or(lane_and(lane_ge(t, duration), lane_ge(applied, pulse_count)), lane_not(alive));
         if (lane_all(done)) break;
     }
 }

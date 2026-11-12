@@ -65,8 +65,12 @@ template <class Ops>
 __global__ void __launch_bounds__(64) kin_advance_kernel(GpuKinLaunch L) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= L.padded) return;
-    dbd_advance_group<f64, Ops>(&c_mech, &c_method, &c_control, L.y, L.k, L.src, L.pulse, L.period, L.h,
-                                L.pulse_index, L.steps, L.rejects, L.pulses, L.failed, L.y, L.padded, i, L.t0, L.t1);
+    DbdLaneArrays a;
+    a.y = L.y; a.h = L.h; a.steps = L.steps; a.rejects = L.rejects; a.pulses = L.pulses; a.failed = L.failed;
+    a.k = L.k; a.src = L.src; a.pulse = L.pulse; a.period = L.period;
+    a.pulse_first = L.pulse_first; a.pulse_count = L.pulse_count;
+    a.padded = L.padded;
+    dbd_advance_group<f64, Ops>(&c_mech, &c_method, &c_control, a, i, L.duration);
 }
 
 // ----------------------------------------------------------------------------

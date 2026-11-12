@@ -8,38 +8,51 @@
 
 #include "kinetics/kin_solver.h"
 
-// One group of LaneTraits<V>::width zones starting at lane i0.
+// Pointers into the DbdZones SoA block that one advance needs. Plain data,
+// passed by value to the CUDA kernel.
+struct DbdLaneArrays {
+    // solver writes
+    f64 *y, *h, *steps, *rejects, *pulses, *failed;
+    // solver reads
+    const f64 *k, *src, *pulse, *period, *pulse_first, *pulse_count;
+    u32 padded;
+};
+
+// One group of LaneTraits<V>::width zones starting at lane i0, over local
+// time [0, duration]. Storage is f64 whatever the lane precision: V = f32 /
+// f32x8 converts on load and store. Counters are per call and added to the
+// f64 totals, so f32 lanes never hold large integers.
 template <class V, class Ops = KinOpsDefault>
 SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const KinControl *ctl,
-                              const f64 *y_soa, const f64 *k_soa, const f64 *src_soa, const f64 *pulse_soa,
-                              const f64 *period, f64 *h_soa, f64 *pulse_index, f64 *steps, f64 *rejects,
-                              f64 *pulses, f64 *failed, f64 *y_out, u32 padded, u32 i0, f64 t0, f64 t1) {
+                              DbdLaneArrays a, u32 i0, f64 duration) {
     V y[Ops::species], k[Ops::reactions], src[Ops::species], pulse[Ops::species];
     const u32 n = Ops::n(m);
+    const u32 p = a.padded;
     for (u32 s = 0; s < n; ++s) {
-        y[s] = lane_load(y_soa + s * padded + i0, (V *)0);
-        src[s] = lane_load(src_soa + s * padded + i0, (V *)0);
-        pulse[s] = lane_load(pulse_soa + s * padded + i0, (V *)0);
+        y[s] = lane_load_f64(a.y + s * p + i0, (V *)0);
+        src[s] = lane_load_f64(a.src + s * p + i0, (V *)0);
+        pulse[s] = lane_load_f64(a.pulse + s * p + i0, (V *)0);
     }
-    for (u32 r = 0; r < (u32)Ops::reactions && r < m->reaction_count; ++r) k[r] = lane_load(k_soa + r * padded + i0, (V *)0);
-    V h = lane_load(h_soa + i0, (V *)0);
-    V pidx = lane_load(pulse_index + i0, (V *)0);
-    V per = lane_load(period + i0, (V *)0);
+    for (u32 r = 0; r < (u32)Ops::reactions && r < m->reaction_count; ++r) k[r] = lane_load_f64(a.k + r * p + i0, (V *)0);
+    V h = lane_load_f64(a.h + i0, (V *)0);
+    V per = lane_load_f64(a.period + i0, (V *)0);
+    V first = lane_load_f64(a.pulse_first + i0, (V *)0);
+    V count = lane_load_f64(a.pulse_count + i0, (V *)0);
+    V zero = lane_splat((V *)0, 0.0);
     KinLaneStats<V> st;
-    st.steps = lane_load(steps + i0, (V *)0);
-    st.rejects = lane_load(rejects + i0, (V *)0);
-    st.pulses = lane_load(pulses + i0, (V *)0);
-    st.failed = lane_load(failed + i0, (V *)0);
+    st.steps = zero;
+    st.rejects = zero;
+    st.pulses = zero;
+    st.failed = lane_load_f64(a.failed + i0, (V *)0);
 
-    kin_advance<V, Ops>(m, method, ctl, k, src, pulse, per, y, lane_splat((V *)0, t0), lane_splat((V *)0, t1), h, pidx, st);
+    kin_advance<V, Ops>(m, method, ctl, k, src, pulse, per, first, count, y, lane_splat((V *)0, duration), h, st);
 
-    for (u32 s = 0; s < n; ++s) lane_store(y_out + s * padded + i0, y[s]);
-    lane_store(h_soa + i0, h);
-    lane_store(pulse_index + i0, pidx);
-    lane_store(steps + i0, st.steps);
-    lane_store(rejects + i0, st.rejects);
-    lane_store(pulses + i0, st.pulses);
-    lane_store(failed + i0, st.failed);
+    for (u32 s = 0; s < n; ++s) lane_store_f64(a.y + s * p + i0, y[s]);
+    lane_store_f64(a.h + i0, h);
+    lane_store_f64(a.failed + i0, st.failed);
+    lane_accumulate_f64(a.steps + i0, st.steps);
+    lane_accumulate_f64(a.rejects + i0, st.rejects);
+    lane_accumulate_f64(a.pulses + i0, st.pulses);
 }
 
 #endif // DBD_LANES_H

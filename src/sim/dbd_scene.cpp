@@ -176,8 +176,8 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
     DbdZones *z = &scene->zones;
     u64 w0 = memory->platform.now_ns();
 
-    dbd_zones_prepare_source(z, &scene->sp, &scene->source, scene->mode);
     f64 t0 = scene->t, t1 = scene->t + dt;
+    dbd_zones_prepare_source(z, &scene->sp, &scene->source, scene->mode, t0, t1);
     s32 err = 0;
     if (scene->use_gpu && memory->gpu.available) {
         if (!scene->gpu_ready) {
@@ -189,18 +189,21 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
             scene->gpu_ready = 1;
         }
     }
+    b32 done_on_gpu = 0;
     if (scene->use_gpu && memory->gpu.available) {
-        err = dbd_advance_gpu(z, &memory->gpu, &scene->gpu, t0, t1);
+        err = dbd_advance_gpu(z, &memory->gpu, &scene->gpu, dt);
         if (err) {
             memory->platform.log("[dbd] gpu advance failed: %s; falling back to the CPU\n", memory->gpu.gpu_error_string(err));
             scene->use_gpu = 0;
-            dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, t0, t1, scene->generated, &memory->platform,
-                                memory->work_queue, memory->worker_count, frame);
+        } else {
+            done_on_gpu = 1;
         }
-    } else {
-        dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, t0, t1, scene->generated, &memory->platform,
-                            memory->work_queue, memory->worker_count, frame);
     }
+    if (!done_on_gpu) {
+        dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, dt, scene->generated,
+                            &memory->platform, memory->work_queue, memory->worker_count, frame);
+    }
+    dbd_zones_commit_pulses(z);
     if (scene->chained) dbd_flow_exchange(z, &scene->sp, scene->residence_s, dt);
     scene->t = t1;
     ++scene->master_steps;

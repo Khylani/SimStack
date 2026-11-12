@@ -71,6 +71,11 @@ SIM_HD bool lane_select_mask(bool m, bool a, bool b) { return m ? a : b; }
 // a is finite (not NaN, not +-inf). x - x is 0 for finite x and NaN otherwise.
 SIM_HD bool lane_is_finite(f64 a) { f64 d = a - a; return d == d; }
 
+// Storage is f64 for every lane precision; these convert on the way in/out.
+SIM_HD f64  lane_load_f64(const f64 *p, f64 *) { return *p; }
+SIM_HD void lane_store_f64(f64 *p, f64 a) { *p = a; }
+SIM_HD void lane_accumulate_f64(f64 *p, f64 a) { *p += a; }
+
 SIM_HD f64  lane_get(f64 a, u32) { return a; }
 SIM_HD void lane_set(f64 *a, u32, f64 x) { *a = x; }
 

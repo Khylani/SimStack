@@ -245,6 +245,10 @@ SIM_FORCE_INLINE void lane_set(f64x4 *a, u32 i, f64 x) { a->e[i] = x; }
 #undef B64X4_OP
 #endif // SIM_SIMD
 
+SIM_FORCE_INLINE f64x4 lane_load_f64(const f64 *p, f64x4 *) { return lane_load(p, (f64x4 *)0); }
+SIM_FORCE_INLINE void  lane_store_f64(f64 *p, f64x4 a) { lane_store(p, a); }
+SIM_FORCE_INLINE void  lane_accumulate_f64(f64 *p, f64x4 a) { lane_store(p, lane_load(p, (f64x4 *)0) + a); }
+
 template <> struct LaneTraits<f64x4> {
     typedef b64x4 Mask;
     enum { width = 4 };

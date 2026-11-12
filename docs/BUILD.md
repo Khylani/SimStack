@@ -102,7 +102,7 @@ particle positions and step counter carry over; the title bar shows
 
 For the dbd/sweep scenes the hash covers every zone's species densities.
 Reference: `--scene dbd --headless 30` gives 500 master steps and hash
-`1d27d1d629fbc024` for clang and gcc, debug (including ASan) and release,
+`3d961503dd103e85` for clang and gcc, debug (including ASan) and release,
 `--simd=0`, any `--threads`, and `--gpu`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs

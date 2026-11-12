@@ -47,11 +47,13 @@ struct DbdZones {
     u64 mutable_count;  // doubles from block start that the solver writes
 
     // solver state (written by the solver), [species][padded] / [padded]
-    f64 *y, *h, *pulse_index;
+    f64 *y, *h;
     f64 *steps, *rejects, *pulses, *failed;
     // solver inputs, [reaction][padded] / [species][padded] / [padded]
     f64 *k, *src, *pulse, *period;
-    // operating point per zone
+    f64 *pulse_first, *pulse_count;   // this master step, local time (host computes from pulse_index)
+    // host only
+    f64 *pulse_index;                 // pulses applied since reset (absolute pulse clock)
     f64 *T_K, *p_Pa, *x_H2O, *power_W_cm3, *freq_Hz;
 };
 
@@ -62,9 +64,10 @@ internal void dbd_zones_alloc(DbdZones *z, Arena *arena, KinModel *model, u32 co
     z->n_reactions = model->mech.reaction_count;
     u64 p = z->padded, ns = z->n_species, nr = z->n_reactions;
     struct { f64 **ptr; u64 count; } layout[] = {
-        { &z->y, ns * p }, { &z->h, p }, { &z->pulse_index, p },
+        { &z->y, ns * p }, { &z->h, p },
         { &z->steps, p }, { &z->rejects, p }, { &z->pulses, p }, { &z->failed, p },
         { &z->k, nr * p }, { &z->src, ns * p }, { &z->pulse, ns * p }, { &z->period, p },
+        { &z->pulse_first, p }, { &z->pulse_count, p }, { &z->pulse_index, p },
         { &z->T_K, p }, { &z->p_Pa, p }, { &z->x_H2O, p }, { &z->power_W_cm3, p }, { &z->freq_Hz, p },
     };
     u64 total = 0;
@@ -114,7 +117,11 @@ internal void dbd_zones_prepare_rates(DbdZones *z, KinModel *model) {
 
 // Discharge source from the operating point and the current composition
 // (G-values scale with parent mole fractions). Cheap; call every master step.
-internal void dbd_zones_prepare_source(DbdZones *z, AirSpecies *sp, AirSourceModel *source, DbdDischargeMode mode) {
+// Also schedules this step's pulses: the pulse clock is absolute and f64
+// (pulse j of a zone fires at j * period, j >= 1), the solver gets the first
+// pulse in local time and how many fall in (t0, t1].
+internal void dbd_zones_prepare_source(DbdZones *z, AirSpecies *sp, AirSourceModel *source, DbdDischargeMode mode,
+                                       f64 t0, f64 t1) {
     TIMED_FUNCTION();
     u32 p = z->padded, n = z->n_species;
     for (u32 i = 0; i < p; ++i) {
@@ -126,33 +133,58 @@ internal void dbd_zones_prepare_source(DbdZones *z, AirSpecies *sp, AirSourceMod
         if (mode == DbdDischarge_Pulsed && on) {
             air_source_delta(sp, source, y, n, z->power_W_cm3[i] / pulses_per_s, delta);
             for (u32 s = 0; s < n; ++s) { z->pulse[s * p + i] = delta[s]; z->src[s * p + i] = 0.0; }
-            z->period[i] = 1.0 / pulses_per_s;
+            f64 period = 1.0 / pulses_per_s;
+            z->period[i] = period;
+            f64 next = z->pulse_index[i] + 1.0, count = 0.0;
+            while ((next + count) * period <= t1) count += 1.0;
+            z->pulse_first[i] = next * period - t0;
+            z->pulse_count[i] = count;
         } else {
             air_source_delta(sp, source, y, n, on ? z->power_W_cm3[i] : 0.0, delta);   // per second
             for (u32 s = 0; s < n; ++s) { z->src[s * p + i] = delta[s]; z->pulse[s * p + i] = 0.0; }
             z->period[i] = 0.0;
+            z->pulse_first[i] = 0.0;
+            z->pulse_count[i] = 0.0;
         }
     }
 }
 
-internal void dbd_zones_prepare(DbdZones *z, KinModel *model, AirSpecies *sp, AirSourceModel *source,
-                                DbdDischargeMode mode) {
-    dbd_zones_prepare_rates(z, model);
-    dbd_zones_prepare_source(z, sp, source, mode);
+// After an advance: the scheduled pulses have been applied (failed lanes keep
+// their state frozen; their clock still moves so they do not replay pulses).
+internal void dbd_zones_commit_pulses(DbdZones *z) {
+    for (u32 i = 0; i < z->padded; ++i) z->pulse_index[i] += z->pulse_count[i];
 }
 
-// Advances every zone over [t0, t1] on the CPU. V = f64x4 (AVX2) or f64
-// (reference); Ops = generated straight-line kernels or the table walk.
+internal DbdLaneArrays dbd_lane_arrays(DbdZones *z) {
+    DbdLaneArrays a;
+    a.y = z->y; a.h = z->h; a.steps = z->steps; a.rejects = z->rejects; a.pulses = z->pulses; a.failed = z->failed;
+    a.k = z->k; a.src = z->src; a.pulse = z->pulse; a.period = z->period;
+    a.pulse_first = z->pulse_first; a.pulse_count = z->pulse_count;
+    a.padded = z->padded;
+    return a;
+}
+
+// Advances every zone over one master step of length `duration` on the CPU
+// (sources and pulses prepared for it). V = f64x4 (AVX2) or f64 (reference);
+// Ops = generated straight-line kernels or the table walk.
 template <class V, class Ops = KinOpsDefault>
 internal void dbd_advance_cpu(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
-                              f64 t0, f64 t1, u32 first_zone = 0, u32 end_zone = U32_MAX) {
+                              f64 duration, u32 first_zone = 0, u32 end_zone = U32_MAX) {
     const u32 w = LaneTraits<V>::width;
     u32 end = Minimum(end_zone, z->padded);
     Assert(first_zone % w == 0);
-    for (u32 i0 = first_zone; i0 < end; i0 += w) {
-        dbd_advance_group<V, Ops>(m, method, ctl, z->y, z->k, z->src, z->pulse, z->period, z->h, z->pulse_index,
-                                  z->steps, z->rejects, z->pulses, z->failed, z->y, z->padded, i0, t0, t1);
-    }
+    DbdLaneArrays a = dbd_lane_arrays(z);
+    for (u32 i0 = first_zone; i0 < end; i0 += w) dbd_advance_group<V, Ops>(m, method, ctl, a, i0, duration);
+}
+
+// Whole master step on one thread: source/pulse schedule, advance, commit.
+// (Tests and tools; the sim uses dbd_advance_threads / dbd_advance_gpu.)
+template <class V, class Ops = KinOpsDefault>
+internal void dbd_step_cpu(DbdZones *z, KinModel *model, AirSpecies *sp, AirSourceModel *source, DbdDischargeMode mode,
+                           const KinMethod *method, const KinControl *ctl, f64 t0, f64 t1) {
+    dbd_zones_prepare_source(z, sp, source, mode, t0, t1);
+    dbd_advance_cpu<V, Ops>(z, &model->mech, method, ctl, t1 - t0);
+    dbd_zones_commit_pulses(z);
 }
 
 // CPU advance spread over the platform work queue. Lane groups are
@@ -162,14 +194,14 @@ struct DbdWork {
     const KinMech *m;
     const KinMethod *method;
     const KinControl *ctl;
-    f64 t0, t1;
+    f64 duration;
     u32 first, end;
     b32 generated;
 };
 
 internal void dbd_work_run(DbdWork *w) {
-    if (w->generated) dbd_advance_cpu<f64x4, AirGenOps>(w->z, w->m, w->method, w->ctl, w->t0, w->t1, w->first, w->end);
-    else dbd_advance_cpu<f64x4>(w->z, w->m, w->method, w->ctl, w->t0, w->t1, w->first, w->end);
+    if (w->generated) dbd_advance_cpu<f64x4, AirGenOps>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
+    else dbd_advance_cpu<f64x4>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
 }
 
 internal PLATFORM_WORK_QUEUE_CALLBACK(dbd_work_advance) {
@@ -177,13 +209,13 @@ internal PLATFORM_WORK_QUEUE_CALLBACK(dbd_work_advance) {
 }
 
 internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
-                                  f64 t0, f64 t1, b32 generated, PlatformAPI *api, PlatformWorkQueue *queue,
+                                  f64 duration, b32 generated, PlatformAPI *api, PlatformWorkQueue *queue,
                                   u32 threads, Arena *frame) {
     TIMED_FUNCTION();
     const u32 w = LaneTraits<f64x4>::width;
     u32 groups = z->padded / w;
     if (!queue || threads <= 1 || groups <= 1) {
-        DbdWork all = { z, m, method, ctl, t0, t1, 0, z->padded, generated };
+        DbdWork all = { z, m, method, ctl, duration, 0, z->padded, generated };
         dbd_work_run(&all);
         return;
     }
@@ -196,7 +228,7 @@ internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod
     for (u32 g = 0; g < groups; g += per) {
         DbdWork *item = work + used++;
         item->z = z; item->m = m; item->method = method; item->ctl = ctl;
-        item->t0 = t0; item->t1 = t1;
+        item->duration = duration;
         item->first = g * w;
         item->end = Minimum(groups, g + per) * w;
         item->generated = generated;
@@ -216,7 +248,7 @@ struct DbdGpu {
 
 // Uploads the whole zone block, advances every lane on the device, downloads
 // the solver-written prefix. Returns 0 on success, else the CUDA error code.
-internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 t0, f64 t1) {
+internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 duration) {
     TIMED_FUNCTION();
     if (!g->d_block || g->capacity < z->block_count) {
         g->d_block = (f64 *)gpu->gpu_alloc(sizeof(f64) * z->block_count);   // grows the bump arena; fine for a few resizes
@@ -227,13 +259,13 @@ internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 t0, f64 t1
     if (err) return err;
 #define DEV(field) (g->d_block + (z->field - z->block))
     GpuKinLaunch L = {};
-    L.y = DEV(y); L.h = DEV(h); L.pulse_index = DEV(pulse_index);
+    L.y = DEV(y); L.h = DEV(h);
     L.steps = DEV(steps); L.rejects = DEV(rejects); L.pulses = DEV(pulses); L.failed = DEV(failed);
     L.k = DEV(k); L.src = DEV(src); L.pulse = DEV(pulse); L.period = DEV(period);
+    L.pulse_first = DEV(pulse_first); L.pulse_count = DEV(pulse_count);
 #undef DEV
     L.padded = z->padded;
-    L.t0 = t0;
-    L.t1 = t1;
+    L.duration = duration;
     err = gpu->gpu_kin_advance(&L, &g->last_kernel_ms);
     if (err) return err;
     ++g->launches;

@@ -28,10 +28,10 @@ struct KinControl;
 // Device pointers for one batched kinetics launch: the DbdZones SoA layout
 // (src/sim/dbd.cpp), one lane per zone.
 struct GpuKinLaunch {
-    f64 *y, *h, *pulse_index, *steps, *rejects, *pulses, *failed;
-    f64 *k, *src, *pulse, *period;
+    f64 *y, *h, *steps, *rejects, *pulses, *failed;            // solver writes
+    f64 *k, *src, *pulse, *period, *pulse_first, *pulse_count; // solver reads
     u32 padded;     // array stride (lanes); every lane is integrated
-    f64 t0, t1;
+    f64 duration;   // master step length; the solver runs in local time [0, duration]
 };
 
 struct GpuInfo {
