@@ -264,6 +264,8 @@ template <> struct LaneTraits<f64x4> {
 struct b32x8 { __m256 v; };
 
 SIM_FORCE_INLINE f32x8 lane_splat(f32x8 *, f64 a) { return f32x8_set1((f32)a); }
+SIM_FORCE_INLINE f32x8 lane_load_f32(const f32 *p, f32x8 *) { return f32x8_load(p); }
+SIM_FORCE_INLINE void  lane_store_f32(f32 *p, f32x8 a) { f32x8_store(p, a); }
 SIM_FORCE_INLINE f32x8 lane_load_f64(const f64 *p, f32x8 *) {
     __m128 lo = _mm256_cvtpd_ps(_mm256_load_pd(p));
     __m128 hi = _mm256_cvtpd_ps(_mm256_load_pd(p + 4));
@@ -308,6 +310,8 @@ struct b32x8 { bool e[8]; };
 #define F32X8_LOP(expr) f32x8 r; for (int i = 0; i < 8; ++i) { r.e[i] = (expr); } return r
 #define B32X8_LOP(expr) b32x8 r; for (int i = 0; i < 8; ++i) { r.e[i] = (expr); } return r
 SIM_FORCE_INLINE f32x8 lane_splat(f32x8 *, f64 a) { F32X8_LOP((f32)a); }
+SIM_FORCE_INLINE f32x8 lane_load_f32(const f32 *p, f32x8 *) { return f32x8_load(p); }
+SIM_FORCE_INLINE void  lane_store_f32(f32 *p, f32x8 a) { f32x8_store(p, a); }
 SIM_FORCE_INLINE f32x8 lane_load_f64(const f64 *p, f32x8 *) { F32X8_LOP((f32)p[i]); }
 SIM_FORCE_INLINE void lane_store_f64(f64 *p, f32x8 a) { for (int i = 0; i < 8; ++i) p[i] = (f64)a.e[i]; }
 SIM_FORCE_INLINE void lane_accumulate_f64(f64 *p, f32x8 a) { for (int i = 0; i < 8; ++i) p[i] += (f64)a.e[i]; }

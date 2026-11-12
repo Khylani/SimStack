@@ -96,6 +96,8 @@ template <> struct LaneTraits<f32> {
 };
 
 SIM_HD f32  lane_splat(f32 *, f64 a) { return (f32)a; }
+SIM_HD f32  lane_load_f32(const f32 *p, f32 *) { return *p; }
+SIM_HD void lane_store_f32(f32 *p, f32 a) { *p = a; }
 SIM_HD f32  lane_load_f64(const f64 *p, f32 *) { return (f32)*p; }
 SIM_HD void lane_store_f64(f64 *p, f32 a) { *p = (f64)a; }
 SIM_HD void lane_accumulate_f64(f64 *p, f32 a) { *p += (f64)a; }
