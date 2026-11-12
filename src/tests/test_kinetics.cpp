@@ -272,6 +272,69 @@ internal void test_generated_matches_table(KinModel *model, AirSpecies *sp, AirS
     }
 }
 
+// f32 lanes (delta formulation): f32x8 == f32 scalar bit for bit; accuracy of
+// the products and atom conservation against the f64 path over a long run.
+internal void test_f32(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
+    Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
+    KinMethod method = kin_method(KinMethod_Rodas3);
+    KinControl ctl = dbd_default_control();
+    u32 watch[] = { sp->O3, sp->NO, sp->NO2, sp->N2O5, sp->HNO2, sp->HNO3, sp->H2O2, sp->N2O };
+    for (u32 mode = 0; mode < 2; ++mode) {
+        DbdZones a, b, c;
+        setup_zones(&a, &arena, model, sp, src, 16, (DbdDischargeMode)mode);
+        setup_zones(&b, &arena, model, sp, src, 16, (DbdDischargeMode)mode);
+        setup_zones(&c, &arena, model, sp, src, 16, (DbdDischargeMode)mode);
+        f64 before[16][KIN_ELEMENTS];
+        for (u32 i = 0; i < 16; ++i) {
+            f64 y[KIN_MAX_SPECIES];
+            for (u32 s = 0; s < a.n_species; ++s) y[s] = a.y[s * a.padded + i];
+            kin_count_elements(model, y, before[i]);
+        }
+        u32 ms = mode == 0 ? 100 : 1000;
+        f64 t32 = 0.0, t64 = 0.0;
+        for (u32 step = 0; step < ms; ++step) {
+            f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+            f64 s0 = now_s();
+            dbd_step_cpu<f32x8, AirGenOps, true>(&a, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+            f64 s1 = now_s();
+            dbd_step_cpu<f64x4, AirGenOps>(&c, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+            f64 s2 = now_s();
+            if (step < 5) dbd_step_cpu<f32, AirGenOps, true>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+            if (step == 4) {
+                b32 same = memcmp(a.y, b.y, sizeof(f64) * (u64)a.n_species * a.padded) == 0;
+                printf("[f32] %s: f32x8 vs f32 scalar after 5 ms %s\n", mode == 0 ? "pulsed  " : "averaged", same ? "bit-identical" : "DIFFERENT");
+                CHECK(same, "f32x8 and f32 differ (mode %u)", mode);
+            }
+            t32 += s1 - s0; t64 += s2 - s1;
+        }
+        f64 worst = 0.0, drift = 0.0;
+        u32 worst_s = 0;
+        for (u32 i = 0; i < 16; ++i) {
+            for (u32 w = 0; w < ArrayCount(watch); ++w) {
+                if (dbd_ppm(&c, watch[w], i) < 1e-3) continue;
+                f64 e = rel_err(a.y[watch[w] * a.padded + i], c.y[watch[w] * c.padded + i]);
+                if (e > worst) { worst = e; worst_s = watch[w]; }
+            }
+            f64 y[KIN_MAX_SPECIES], after[KIN_ELEMENTS];
+            for (u32 s = 0; s < a.n_species; ++s) y[s] = a.y[s * a.padded + i];
+            kin_count_elements(model, y, after);
+            for (u32 e = 0; e < KIN_ELEMENTS; ++e) if (before[i][e] > 0.0) drift = fmax(drift, rel_err(before[i][e], after[e]));
+        }
+        f64 steps32 = 0, steps64 = 0;
+        for (u32 i = 0; i < 16; ++i) { steps32 += a.steps[i]; steps64 += c.steps[i]; }
+        printf("[f32] %s 16 zones x %u ms: worst product error vs f64 %.1e (%s), atom drift %.1e (f64: ~1e-13), "
+               "steps %.0f vs %.0f, wall %.1f ms vs %.1f ms (%.2fx)\n",
+               mode == 0 ? "pulsed  " : "averaged", ms, worst, model->species_name[worst_s], drift, steps32, steps64,
+               t32 * 1e3, t64 * 1e3, t64 / t32);
+        CHECK(worst < 1e-2, "f32 product error %.3e", worst);
+        // f32 floor: each master step rounds the increments to f32 (~6e-8 of the
+        // increment), so drift grows ~linearly in time: bound it per simulated second.
+        f64 drift_per_s = drift / (ms * 1e-3);
+        CHECK(drift_per_s < 1e-7, "f32 atom drift %.3e per s", drift_per_s);
+        for (u32 i = 0; i < 16; ++i) CHECK(a.failed[i] == 0.0, "f32 zone %u failed", i);
+    }
+}
+
 // Atoms of N, O, H are conserved by chemistry and by the discharge source.
 internal void test_conservation(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
@@ -427,7 +490,7 @@ internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     KinMethod method = kin_method(KinMethod_Rodas3);
     KinControl ctl = dbd_default_control();
     for (u32 mode = 0; mode < 2; ++mode) {
-        for (u32 variant = 0; variant < 3; ++variant) {
+        for (u32 variant = 0; variant < 4; ++variant) {
             arena.used = 0;
             DbdZones z;
             setup_zones(&z, &arena, model, sp, src, 64, (DbdDischargeMode)mode);
@@ -437,13 +500,14 @@ internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
                 f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
                 if (variant == 0) dbd_step_cpu<f64>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
                 else if (variant == 1) dbd_step_cpu<f64x4>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
-                else dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+                else if (variant == 2) dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+                else dbd_step_cpu<f32x8, AirGenOps, true>(&z, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
             }
             f64 wall = now_s() - t_start;
             f64 steps = 0.0;
             for (u32 i = 0; i < z.count; ++i) steps += z.steps[i];
             printf("[bench] %s %-11s 64 zones x %u ms: %.1f ms wall, %.2f zone-ms per wall-ms, %.1f us per zone-step\n",
-                   mode == 0 ? "pulsed  " : "averaged", variant == 0 ? "f64 table" : variant == 1 ? "f64x4 table" : "f64x4 gen", ms, wall * 1e3,
+                   mode == 0 ? "pulsed  " : "averaged", variant == 0 ? "f64 table" : variant == 1 ? "f64x4 table" : variant == 2 ? "f64x4 gen" : "f32x8 gen", ms, wall * 1e3,
                    64.0 * ms / (wall * 1e3), wall * 1e6 / steps);
         }
     }
@@ -471,6 +535,7 @@ int main(int argc, char **argv) {
     test_order();
     test_simd_matches_scalar(model, &sp, &src);
     test_generated_matches_table(model, &sp, &src);
+    test_f32(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
@@ -525,6 +590,24 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
                (unsigned long long)hash_fnv1a_64(a.y, bytes), worst);
         CHECK(same, "gpu and cpu paths differ (mode %u)", mode);
     }
+    for (u32 mode = 0; mode < 2; ++mode) {
+        DbdZones a, b;
+        DbdGpu g = {};
+        setup_zones(&a, &arena, model, sp, src, 16, (DbdDischargeMode)mode);
+        setup_zones(&b, &arena, model, sp, src, 16, (DbdDischargeMode)mode);
+        for (u32 step = 0; step < 5; ++step) {
+            f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+            dbd_zones_prepare_source(&a, sp, src, (DbdDischargeMode)mode, t0, t1);
+            err = dbd_advance_gpu(&a, &gpu, &g, t1 - t0, DbdPrecision_F32);
+            dbd_zones_commit_pulses(&a);
+            CHECK(err == 0, "gpu f32 advance: %s", gpu.gpu_error_string(err));
+            dbd_step_cpu<f32x8, AirGenOps, true>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+        }
+        b32 same = memcmp(a.y, b.y, sizeof(f64) * (u64)a.n_species * a.padded) == 0;
+        printf("[gpu] %s, 16 zones x 5 ms, f32 lanes: CUDA vs AVX2 %s\n", mode == 0 ? "pulsed  " : "averaged",
+               same ? "bit-identical" : "DIFFERENT");
+        CHECK(same, "gpu and cpu f32 paths differ (mode %u)", mode);
+    }
     if (!bench) return;
 
     // Throughput: averaged mode, 10 ms per run; one launch per 1 ms master step.
@@ -538,7 +621,12 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
             arena.used = 0;
             setup_zones(&a, &arena, model, sp, src, n, (DbdDischargeMode)mode);
             setup_zones(&b, &arena, model, sp, src, n, (DbdDischargeMode)mode);
-            f64 gpu_s = 0.0, cpu_s = 0.0, kernel_ms = 0.0;
+            f64 gpu_s = 0.0, cpu_s = 0.0, gpu32_s = 0.0, cpu32_s = 0.0;
+            DbdZones c, d;
+            DbdGpu g32 = {};
+            setup_zones(&c, &arena, model, sp, src, n, (DbdDischargeMode)mode);
+            setup_zones(&d, &arena, model, sp, src, n, (DbdDischargeMode)mode);
+            b32 run_cpu = n <= 4096;
             for (u32 step = 0; step < ms; ++step) {
                 f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
                 f64 s0 = now_s();
@@ -546,17 +634,19 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
                 dbd_advance_gpu(&a, &gpu, &g, t1 - t0);
                 dbd_zones_commit_pulses(&a);
                 f64 s1 = now_s();
-                if (n <= 4096) dbd_step_cpu<f64x4, AirGenOps>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+                if (run_cpu) dbd_step_cpu<f64x4, AirGenOps>(&b, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
                 f64 s2 = now_s();
-                gpu_s += s1 - s0; cpu_s += s2 - s1; kernel_ms += g.last_kernel_ms;
+                dbd_zones_prepare_source(&c, sp, src, (DbdDischargeMode)mode, t0, t1);
+                dbd_advance_gpu(&c, &gpu, &g32, t1 - t0, DbdPrecision_F32);
+                dbd_zones_commit_pulses(&c);
+                f64 s3 = now_s();
+                if (run_cpu) dbd_step_cpu<f32x8, AirGenOps, true>(&d, model, sp, src, (DbdDischargeMode)mode, &method, &ctl, t0, t1);
+                f64 s4 = now_s();
+                gpu_s += s1 - s0; cpu_s += s2 - s1; gpu32_s += s3 - s2; cpu32_s += s4 - s3;
             }
-            if (n <= 4096) {
-                printf("[gpu bench] %s %5u zones x %2u ms: CUDA %8.1f ms (kernel %8.1f)  AVX2 1 thread %8.1f ms  ratio %.2fx\n",
-                       mode == 0 ? "pulsed  " : "averaged", n, ms, gpu_s * 1e3, kernel_ms, cpu_s * 1e3, cpu_s / gpu_s);
-            } else {
-                printf("[gpu bench] %s %5u zones x %2u ms: CUDA %8.1f ms (kernel %8.1f)  AVX2 skipped\n",
-                       mode == 0 ? "pulsed  " : "averaged", n, ms, gpu_s * 1e3, kernel_ms);
-            }
+            printf("[gpu bench] %s %5u zones x %2u ms:  f64: CUDA %7.1f ms  AVX2x1 %7.1f ms  |  f32: CUDA %7.1f ms  AVX2x1 %7.1f ms\n",
+                   mode == 0 ? "pulsed  " : "averaged", n, ms, gpu_s * 1e3, run_cpu ? cpu_s * 1e3 : 0.0, gpu32_s * 1e3,
+                   run_cpu ? cpu32_s * 1e3 : 0.0);
         }
     }
 }

@@ -33,6 +33,7 @@ struct PlatformArgs {
     b32 gpu;
     u32 gpu_mem_mb;
     b32 averaged;
+    u32 precision;        // 0 f32, 1 f64 (SimConfig::precision)
     const char *csv_path;
     u32 seed;
     u32 window_width;
@@ -44,15 +45,17 @@ struct PlatformArgs {
 
 internal void platform_print_usage(const char *exe) {
     printf("usage: %s [--scene particles|dbd|sweep] [--headless N] [--zones N] [--threads N] [--gpu]\n"
-           "          [--gpu-mem MB] [--averaged] [--csv file] [--particles N] [--seed N] [--size WxH]\n"
+           "          [--gpu-mem MB] [--averaged] [--precision f32|f64] [--csv file] [--particles N] [--seed N] [--size WxH]\n"
            "          [--quiet] [--frames N] [--screenshot file.ppm]\n"
            "  --scene S      particles (M1 demo, default), dbd (plug-flow DBD reactor), sweep (power x humidity grid)\n"
            "  --headless N   run N frames without a window at a fixed 1/60 s frame dt, print timings\n"
-           "  --zones N      dbd: axial zones (default 16); sweep: grid points (rounded down to a square, default 256)\n"
+           "  --zones N      dbd: axial zones (default 64); sweep: grid points (rounded down to a square, default 256)\n"
            "  --threads N    worker threads including the main thread (default 8, one per P-core)\n"
            "  --gpu          load build/simstack_gpu.so and run the chemistry on CUDA\n"
            "  --gpu-mem MB   device arena size (default 512)\n"
            "  --averaged     continuous discharge source instead of one pulse per half-cycle\n"
+           "  --precision P  chemistry lanes: f32 (default: 8 zones per AVX2 register, CUDA FP32 units)\n"
+           "                 or f64 (reference: exact atom bookkeeping for long runs)\n"
            "  --csv F        dbd: outlet time series (rewritten every simulated second); sweep: final grid\n"
            "  --frames N     windowed: quit after N frames\n"
            "  --screenshot F windowed: write the last frame as a binary PPM to F\n"
@@ -92,6 +95,11 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             args.gpu = 1;
         } else if (strcmp(a, "--gpu-mem") == 0 && next) {
             args.gpu_mem_mb = (u32)atoi(next); ++i;
+        } else if (strcmp(a, "--precision") == 0 && next) {
+            if (strcmp(next, "f32") == 0) args.precision = 0;
+            else if (strcmp(next, "f64") == 0) args.precision = 1;
+            else { printf("unknown precision %s (f32 | f64)\n", next); exit(1); }
+            ++i;
         } else if (strcmp(a, "--averaged") == 0) {
             args.averaged = 1;
         } else if (strcmp(a, "--csv") == 0 && next) {
@@ -116,7 +124,7 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
         }
     }
     if (args.particle_count == 0) args.particle_count = 8;
-    if (args.zone_count == 0) args.zone_count = args.scene == SimScene_Sweep ? 256 : 16;
+    if (args.zone_count == 0) args.zone_count = args.scene == SimScene_Sweep ? 256 : 64;
     if (args.threads == 0) args.threads = 1;
     if (args.threads > 64) args.threads = 64;
     if (args.gpu_mem_mb == 0) args.gpu_mem_mb = 512;

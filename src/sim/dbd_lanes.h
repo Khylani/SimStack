@@ -22,14 +22,23 @@ struct DbdLaneArrays {
 // time [0, duration]. Storage is f64 whatever the lane precision: V = f32 /
 // f32x8 converts on load and store. Counters are per call and added to the
 // f64 totals, so f32 lanes never hold large integers.
-template <class V, class Ops = KinOpsDefault>
+//
+// Delta (f32 lanes): integrate the increment over the step-start state and add
+// it to the f64 storage, so storage never round-trips through f32.
+template <class V, class Ops = KinOpsDefault, bool Delta = false>
 SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const KinControl *ctl,
                               DbdLaneArrays a, u32 i0, f64 duration) {
     V y[Ops::species], k[Ops::reactions], src[Ops::species], pulse[Ops::species];
+    V base[Delta ? Ops::species : 1];
     const u32 n = Ops::n(m);
     const u32 p = a.padded;
     for (u32 s = 0; s < n; ++s) {
-        y[s] = lane_load_f64(a.y + s * p + i0, (V *)0);
+        if (Delta) {
+            base[s] = lane_load_f64(a.y + s * p + i0, (V *)0);
+            y[s] = lane_splat((V *)0, 0.0);
+        } else {
+            y[s] = lane_load_f64(a.y + s * p + i0, (V *)0);
+        }
         src[s] = lane_load_f64(a.src + s * p + i0, (V *)0);
         pulse[s] = lane_load_f64(a.pulse + s * p + i0, (V *)0);
     }
@@ -45,9 +54,21 @@ SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const K
     st.pulses = zero;
     st.failed = lane_load_f64(a.failed + i0, (V *)0);
 
-    kin_advance<V, Ops>(m, method, ctl, k, src, pulse, per, first, count, y, lane_splat((V *)0, duration), h, st);
+    kin_advance<V, Ops, Delta>(m, method, ctl, k, src, pulse, per, first, count, y, lane_splat((V *)0, duration), h, st,
+                               Delta ? base : (const V *)0);
 
-    for (u32 s = 0; s < n; ++s) lane_store_f64(a.y + s * p + i0, y[s]);
+    for (u32 s = 0; s < n; ++s) {
+        if (Delta) {
+            f64 *dst = a.y + s * p + i0;
+            lane_accumulate_f64(dst, y[s]);
+            // base was the f32 rounding of the f64 state, so base + y >= 0 can still
+            // leave the f64 sum a few ulp below zero.
+            if (ctl->clamp_negative)
+                for (u32 j = 0; j < (u32)LaneTraits<V>::width; ++j) dst[j] = dst[j] > 0.0 ? dst[j] : 0.0;
+        } else {
+            lane_store_f64(a.y + s * p + i0, y[s]);
+        }
+    }
     lane_store_f64(a.h + i0, h);
     lane_store_f64(a.failed + i0, st.failed);
     lane_accumulate_f64(a.steps + i0, st.steps);

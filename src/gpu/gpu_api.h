@@ -31,6 +31,7 @@ struct GpuKinLaunch {
     f64 *y, *h, *steps, *rejects, *pulses, *failed;            // solver writes
     f64 *k, *src, *pulse, *period, *pulse_first, *pulse_count; // solver reads
     u32 padded;     // array stride (lanes); every lane is integrated
+    u32 precision;  // 0: f64 lanes (reference), 1: f32 lanes, delta formulation (see dbd_lanes.h)
     f64 duration;   // master step length; the solver runs in local time [0, duration]
 };
 

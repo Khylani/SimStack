@@ -83,6 +83,7 @@ struct SimConfig {
     u32 zone_count;       // dbd / sweep scenes
     u32 backend;          // SimBackend
     b32 averaged;         // dbd / sweep: continuous source instead of discharge pulses
+    u32 precision;        // dbd / sweep: 0 = f32 lanes (fast, default), 1 = f64 lanes (reference)
     const char *csv_path; // dbd / sweep: write results here (0: none)
 };
 

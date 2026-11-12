@@ -79,6 +79,41 @@ SIM_HD void lane_accumulate_f64(f64 *p, f64 a) { *p += a; }
 SIM_HD f64  lane_get(f64 a, u32) { return a; }
 SIM_HD void lane_set(f64 *a, u32, f64 x) { *a = x; }
 
+// ---------------------------------------------------------------------------
+// f32 scalar lanes: CPU reference for f32x8 and one CUDA thread per lane.
+
+#if defined(__CUDACC__)
+#define LANE_FMAF(a, b, c) fmaf((a), (b), (c))
+#define LANE_SQRTF(a) sqrtf(a)
+#else
+#define LANE_FMAF(a, b, c) __builtin_fmaf((a), (b), (c))
+#define LANE_SQRTF(a) __builtin_sqrtf(a)
+#endif
+
+template <> struct LaneTraits<f32> {
+    typedef bool Mask;
+    enum { width = 1 };
+};
+
+SIM_HD f32  lane_splat(f32 *, f64 a) { return (f32)a; }
+SIM_HD f32  lane_load_f64(const f64 *p, f32 *) { return (f32)*p; }
+SIM_HD void lane_store_f64(f64 *p, f32 a) { *p = (f64)a; }
+SIM_HD void lane_accumulate_f64(f64 *p, f32 a) { *p += (f64)a; }
+SIM_HD f32  lane_fmadd(f32 a, f32 b, f32 c) { return LANE_FMAF(a, b, c); }
+SIM_HD f32  lane_fnmadd(f32 a, f32 b, f32 c) { return LANE_FMAF(-a, b, c); }
+SIM_HD f32  lane_min(f32 a, f32 b) { return a < b ? a : b; }
+SIM_HD f32  lane_max(f32 a, f32 b) { return a > b ? a : b; }
+SIM_HD f32  lane_abs(f32 a) { return a < 0.0f ? -a : a; }
+SIM_HD f32  lane_sqrt(f32 a) { return LANE_SQRTF(a); }
+SIM_HD bool lane_lt(f32 a, f32 b) { return a < b; }
+SIM_HD bool lane_le(f32 a, f32 b) { return a <= b; }
+SIM_HD bool lane_gt(f32 a, f32 b) { return a > b; }
+SIM_HD bool lane_ge(f32 a, f32 b) { return a >= b; }
+SIM_HD bool lane_eq(f32 a, f32 b) { return a == b; }
+SIM_HD f32  lane_select(bool m, f32 a, f32 b) { return m ? a : b; }
+SIM_HD bool lane_is_finite(f32 a) { f32 d = a - a; return d == d; }
+SIM_HD f32  lane_get(f32 a, u32) { return a; }
+
 // x^(1/3) for x in [1e-4, 1e4], from arithmetic only (no libm), identical on
 // every path. Used by step-size control, where the argument is clamped first.
 // x^(1/4) * x^(1/16) * x^(1/64) = x^(21/64) is within 5 % of the cube root

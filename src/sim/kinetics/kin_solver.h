@@ -180,9 +180,14 @@ SIM_HD V kin_step_factor(V err, u32 order) {
 
 // Integrates every lane from t to t_end (per lane). On return t == t_end for
 // every lane that did not fail; h holds the step size to continue with.
-template <class V, class Ops = KinOpsDefault>
+// Delta = true: y holds an increment over `base` (the state at the start of
+// the master step) and every rate is evaluated at base + y. Used by f32 lanes:
+// increments to large bath species (N2, O2 ~ 1e19 cm^-3) are far below their
+// f32 ulp but are exact relative to the increment, so the host's f64 state
+// (base + y) keeps every molecule. Delta = false is the plain formulation.
+template <class V, class Ops = KinOpsDefault, bool Delta = false>
 SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinControl *ctl, const V *k,
-                          const V *src, V *y, V &t, V t_end, V &h, KinLaneStats<V> &stats) {
+                          const V *src, V *y, V &t, V t_end, V &h, KinLaneStats<V> &stats, const V *base = 0) {
     typedef typename LaneTraits<V>::Mask M;
     const u32 n = Ops::n(m);
     const V zero = lane_splat((V *)0, 0.0), one = lane_splat((V *)0, 1.0);
@@ -193,6 +198,7 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
     V lu[Ops::nnz];
     V kstage[KIN_MAX_STAGES][Ops::species];
     V fcn[Ops::species], ytmp[Ops::species];
+    V yeval[Delta ? Ops::species : 1];   // base + increment, Delta only
 
     M failed = lane_gt(stats.failed, zero);
     M active = lane_and(lane_lt(t, t_end), lane_not(failed));
@@ -214,27 +220,38 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
         V hs = lane_select(last, remaining, lane_min(h_wanted, h_cap));
         hs = lane_select(active, hs, one);                     // keep idle lanes finite
 
-        Ops::fun(m, k, src, y, fcn);
-        Ops::neg_jac(m, k, y, lu);
+        if (Delta) {
+            for (u32 s = 0; s < n; ++s) yeval[s] = base[s] + y[s];
+            Ops::fun(m, k, src, yeval, fcn);
+            Ops::neg_jac(m, k, yeval, lu);
+        } else {
+            Ops::fun(m, k, src, y, fcn);
+            Ops::neg_jac(m, k, y, lu);
+        }
         V ghinv = one / (hs * lane_splat((V *)0, method->gamma0));
         Ops::factor(m, ghinv, lu);
         V hinv = one / hs;
 
         for (u32 st = 0; st < method->stages; ++st) {
-            u32 base = st * (st - 1) / 2;   // packed (st, j) offset; unused when st == 0
+            u32 packed = st * (st - 1) / 2;   // packed (st, j) offset; unused when st == 0
             if (st > 0 && method->new_f[st]) {
                 for (u32 s = 0; s < n; ++s) ytmp[s] = y[s];
                 for (u32 j = 0; j < st; ++j) {
-                    f64 a = method->a[base + j];
+                    f64 a = method->a[packed + j];
                     if (a == 0.0) continue;
                     V av = lane_splat((V *)0, a);
                     for (u32 s = 0; s < n; ++s) ytmp[s] = lane_fmadd(av, kstage[j][s], ytmp[s]);
                 }
-                Ops::fun(m, k, src, ytmp, fcn);
+                if (Delta) {
+                    for (u32 s = 0; s < n; ++s) yeval[s] = base[s] + ytmp[s];
+                    Ops::fun(m, k, src, yeval, fcn);
+                } else {
+                    Ops::fun(m, k, src, ytmp, fcn);
+                }
             }
             for (u32 s = 0; s < n; ++s) kstage[st][s] = fcn[s];
             for (u32 j = 0; j < st; ++j) {
-                f64 c = method->c[base + j];
+                f64 c = method->c[packed + j];
                 if (c == 0.0) continue;
                 V hc = lane_splat((V *)0, c) * hinv;
                 for (u32 s = 0; s < n; ++s) kstage[st][s] = lane_fmadd(hc, kstage[j][s], kstage[st][s]);
@@ -250,7 +267,9 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
                 if (method->m[st] != 0.0) ynew = lane_fmadd(lane_splat((V *)0, method->m[st]), kstage[st][s], ynew);
                 if (method->e[st] != 0.0) yerr = lane_fmadd(lane_splat((V *)0, method->e[st]), kstage[st][s], yerr);
             }
-            V scale = lane_fmadd(rtol, lane_max(lane_abs(y[s]), lane_abs(ynew)), atol);
+            V scale;
+            if (Delta) scale = lane_fmadd(rtol, lane_max(lane_abs(base[s] + y[s]), lane_abs(base[s] + ynew)), atol);
+            else       scale = lane_fmadd(rtol, lane_max(lane_abs(y[s]), lane_abs(ynew)), atol);
             V q = yerr / scale;
             err = lane_fmadd(q, q, err);
             ytmp[s] = ynew;
@@ -270,7 +289,7 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
 
         for (u32 s = 0; s < n; ++s) {
             V ynew = ytmp[s];
-            if (ctl->clamp_negative) ynew = lane_max(ynew, zero);
+            if (ctl->clamp_negative) ynew = Delta ? lane_max(ynew, -base[s]) : lane_max(ynew, zero);
             y[s] = lane_select(accept, ynew, y[s]);
         }
         t = lane_select(accept, lane_select(last, t_end, t + hs), t);
@@ -299,10 +318,10 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
 // Integration stops exactly on each pulse, applies it, restarts with h_start.
 // A pulse whose time rounds past `duration` is applied at `duration`, so the
 // count is always honoured.
-template <class V, class Ops = KinOpsDefault>
+template <class V, class Ops = KinOpsDefault, bool Delta = false>
 SIM_HD void kin_advance(const KinMech *m, const KinMethod *method, const KinControl *ctl, const V *k,
                         const V *src, const V *pulse, V period, V first_pulse, V pulse_count, V *y, V duration,
-                        V &h, KinLaneStats<V> &stats) {
+                        V &h, KinLaneStats<V> &stats, const V *base = 0) {
     typedef typename LaneTraits<V>::Mask M;
     const u32 n = Ops::n(m);
     const V zero = lane_splat((V *)0, 0.0), one = lane_splat((V *)0, 1.0);
@@ -311,7 +330,7 @@ SIM_HD void kin_advance(const KinMech *m, const KinMethod *method, const KinCont
         M pending = lane_lt(applied, pulse_count);
         V next_pulse = lane_fmadd(applied, period, first_pulse);
         V seg_end = lane_select(pending, lane_min(next_pulse, duration), duration);
-        kin_integrate<V, Ops>(m, method, ctl, k, src, y, t, seg_end, h, stats);
+        kin_integrate<V, Ops, Delta>(m, method, ctl, k, src, y, t, seg_end, h, stats, base);
 
         M alive = lane_not(lane_gt(stats.failed, zero));
         M hit = lane_and(lane_and(pending, alive), lane_ge(t, seg_end));

@@ -61,7 +61,7 @@ __global__ void step_points_kernel(f32 *x, f32 *y, f32 *z, f32 *vx, f32 *vy, f32
 }
 
 // One thread per lane (zone): the same dbd_advance_group the CPU runs, with V = f64.
-template <class Ops>
+template <class V, class Ops, bool Delta>
 __global__ void __launch_bounds__(64) kin_advance_kernel(GpuKinLaunch L) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= L.padded) return;
@@ -70,7 +70,7 @@ __global__ void __launch_bounds__(64) kin_advance_kernel(GpuKinLaunch L) {
     a.k = L.k; a.src = L.src; a.pulse = L.pulse; a.period = L.period;
     a.pulse_first = L.pulse_first; a.pulse_count = L.pulse_count;
     a.padded = L.padded;
-    dbd_advance_group<f64, Ops>(&c_mech, &c_method, &c_control, a, i, L.duration);
+    dbd_advance_group<V, Ops, Delta>(&c_mech, &c_method, &c_control, a, i, L.duration);
 }
 
 // ----------------------------------------------------------------------------
@@ -155,8 +155,13 @@ GPU_API GPU_KIN_ADVANCE(gpu_kin_advance) {
     u32 block = g_kin_block;
     u32 grid = (launch->padded + block - 1) / block;
     cudaEventRecord(g_kin_start);
-    if (g_kin_generated) kin_advance_kernel<AirGenOps><<<grid, block>>>(*launch);
-    else kin_advance_kernel<KinOpsGpu><<<grid, block>>>(*launch);
+    if (launch->precision == 1) {
+        if (g_kin_generated) kin_advance_kernel<f32, AirGenOps, true><<<grid, block>>>(*launch);
+        else kin_advance_kernel<f32, KinOpsGpu, true><<<grid, block>>>(*launch);
+    } else {
+        if (g_kin_generated) kin_advance_kernel<f64, AirGenOps, false><<<grid, block>>>(*launch);
+        else kin_advance_kernel<f64, KinOpsGpu, false><<<grid, block>>>(*launch);
+    }
     cudaEventRecord(g_kin_stop);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (s32)err;

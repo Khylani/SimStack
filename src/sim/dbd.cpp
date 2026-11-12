@@ -167,25 +167,33 @@ internal DbdLaneArrays dbd_lane_arrays(DbdZones *z) {
 // Advances every zone over one master step of length `duration` on the CPU
 // (sources and pulses prepared for it). V = f64x4 (AVX2) or f64 (reference);
 // Ops = generated straight-line kernels or the table walk.
-template <class V, class Ops = KinOpsDefault>
+template <class V, class Ops = KinOpsDefault, bool Delta = false>
 internal void dbd_advance_cpu(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
                               f64 duration, u32 first_zone = 0, u32 end_zone = U32_MAX) {
     const u32 w = LaneTraits<V>::width;
     u32 end = Minimum(end_zone, z->padded);
     Assert(first_zone % w == 0);
     DbdLaneArrays a = dbd_lane_arrays(z);
-    for (u32 i0 = first_zone; i0 < end; i0 += w) dbd_advance_group<V, Ops>(m, method, ctl, a, i0, duration);
+    for (u32 i0 = first_zone; i0 < end; i0 += w) dbd_advance_group<V, Ops, Delta>(m, method, ctl, a, i0, duration);
 }
 
 // Whole master step on one thread: source/pulse schedule, advance, commit.
 // (Tests and tools; the sim uses dbd_advance_threads / dbd_advance_gpu.)
-template <class V, class Ops = KinOpsDefault>
+template <class V, class Ops = KinOpsDefault, bool Delta = false>
 internal void dbd_step_cpu(DbdZones *z, KinModel *model, AirSpecies *sp, AirSourceModel *source, DbdDischargeMode mode,
                            const KinMethod *method, const KinControl *ctl, f64 t0, f64 t1) {
     dbd_zones_prepare_source(z, sp, source, mode, t0, t1);
-    dbd_advance_cpu<V, Ops>(z, &model->mech, method, ctl, t1 - t0);
+    dbd_advance_cpu<V, Ops, Delta>(z, &model->mech, method, ctl, t1 - t0);
     dbd_zones_commit_pulses(z);
 }
+
+// Lane precision of the solver. Storage is always f64.
+//   f64  f64x4 lanes (4 zones per AVX2 register), plain formulation: reference
+//   f32  f32x8 lanes (8 zones per register), delta formulation over the f64 state
+enum DbdPrecision {
+    DbdPrecision_F64,
+    DbdPrecision_F32,
+};
 
 // CPU advance spread over the platform work queue. Lane groups are
 // independent, so the result does not depend on the thread count.
@@ -197,11 +205,17 @@ struct DbdWork {
     f64 duration;
     u32 first, end;
     b32 generated;
+    u32 precision;   // DbdPrecision
 };
 
 internal void dbd_work_run(DbdWork *w) {
-    if (w->generated) dbd_advance_cpu<f64x4, AirGenOps>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
-    else dbd_advance_cpu<f64x4>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
+    if (w->precision == DbdPrecision_F32) {
+        if (w->generated) dbd_advance_cpu<f32x8, AirGenOps, true>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
+        else dbd_advance_cpu<f32x8, KinOpsDefault, true>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
+    } else {
+        if (w->generated) dbd_advance_cpu<f64x4, AirGenOps>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
+        else dbd_advance_cpu<f64x4>(w->z, w->m, w->method, w->ctl, w->duration, w->first, w->end);
+    }
 }
 
 internal PLATFORM_WORK_QUEUE_CALLBACK(dbd_work_advance) {
@@ -209,13 +223,13 @@ internal PLATFORM_WORK_QUEUE_CALLBACK(dbd_work_advance) {
 }
 
 internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
-                                  f64 duration, b32 generated, PlatformAPI *api, PlatformWorkQueue *queue,
-                                  u32 threads, Arena *frame) {
+                                  f64 duration, b32 generated, u32 precision, PlatformAPI *api,
+                                  PlatformWorkQueue *queue, u32 threads, Arena *frame) {
     TIMED_FUNCTION();
-    const u32 w = LaneTraits<f64x4>::width;
+    const u32 w = precision == DbdPrecision_F32 ? (u32)LaneTraits<f32x8>::width : (u32)LaneTraits<f64x4>::width;
     u32 groups = z->padded / w;
     if (!queue || threads <= 1 || groups <= 1) {
-        DbdWork all = { z, m, method, ctl, duration, 0, z->padded, generated };
+        DbdWork all = { z, m, method, ctl, duration, 0, z->padded, generated, precision };
         dbd_work_run(&all);
         return;
     }
@@ -232,6 +246,7 @@ internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod
         item->first = g * w;
         item->end = Minimum(groups, g + per) * w;
         item->generated = generated;
+        item->precision = precision;
         api->add_work_entry(queue, dbd_work_advance, item);
     }
     api->complete_all_work(queue);
@@ -248,7 +263,7 @@ struct DbdGpu {
 
 // Uploads the whole zone block, advances every lane on the device, downloads
 // the solver-written prefix. Returns 0 on success, else the CUDA error code.
-internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 duration) {
+internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 duration, u32 precision = DbdPrecision_F64) {
     TIMED_FUNCTION();
     if (!g->d_block || g->capacity < z->block_count) {
         g->d_block = (f64 *)gpu->gpu_alloc(sizeof(f64) * z->block_count);   // grows the bump arena; fine for a few resizes
@@ -265,6 +280,7 @@ internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 duration) 
     L.pulse_first = DEV(pulse_first); L.pulse_count = DEV(pulse_count);
 #undef DEV
     L.padded = z->padded;
+    L.precision = precision;
     L.duration = duration;
     err = gpu->gpu_kin_advance(&L, &g->last_kernel_ms);
     if (err) return err;

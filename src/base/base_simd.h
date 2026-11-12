@@ -254,4 +254,92 @@ template <> struct LaneTraits<f64x4> {
     enum { width = 4 };
 };
 
+// ----------------------------------------------------------------------------
+// f32x8 as a lane type (eight f32 lanes), with b32x8 masks: the same lane_*
+// vocabulary, so the kinetics templates also instantiate at f32x8. Storage
+// stays f64: lane_load_f64 / lane_store_f64 convert.
+
+#if SIM_SIMD
+
+struct b32x8 { __m256 v; };
+
+SIM_FORCE_INLINE f32x8 lane_splat(f32x8 *, f64 a) { return f32x8_set1((f32)a); }
+SIM_FORCE_INLINE f32x8 lane_load_f64(const f64 *p, f32x8 *) {
+    __m128 lo = _mm256_cvtpd_ps(_mm256_load_pd(p));
+    __m128 hi = _mm256_cvtpd_ps(_mm256_load_pd(p + 4));
+    f32x8 r; r.v = _mm256_set_m128(hi, lo); return r;
+}
+SIM_FORCE_INLINE void lane_store_f64(f64 *p, f32x8 a) {
+    _mm256_store_pd(p, _mm256_cvtps_pd(_mm256_castps256_ps128(a.v)));
+    _mm256_store_pd(p + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(a.v, 1)));
+}
+SIM_FORCE_INLINE void lane_accumulate_f64(f64 *p, f32x8 a) {
+    _mm256_store_pd(p, _mm256_add_pd(_mm256_load_pd(p), _mm256_cvtps_pd(_mm256_castps256_ps128(a.v))));
+    _mm256_store_pd(p + 4, _mm256_add_pd(_mm256_load_pd(p + 4), _mm256_cvtps_pd(_mm256_extractf128_ps(a.v, 1))));
+}
+SIM_FORCE_INLINE f32x8 lane_fmadd(f32x8 a, f32x8 b, f32x8 c) { return fmadd(a, b, c); }
+SIM_FORCE_INLINE f32x8 lane_fnmadd(f32x8 a, f32x8 b, f32x8 c) { return fnmadd(a, b, c); }
+SIM_FORCE_INLINE f32x8 lane_min(f32x8 a, f32x8 b) { return f32x8_min(a, b); }
+SIM_FORCE_INLINE f32x8 lane_max(f32x8 a, f32x8 b) { return f32x8_max(a, b); }
+SIM_FORCE_INLINE f32x8 lane_abs(f32x8 a) {
+    __m256 neg = _mm256_cmp_ps(a.v, _mm256_setzero_ps(), _CMP_LT_OQ);
+    f32x8 r; r.v = _mm256_blendv_ps(a.v, _mm256_xor_ps(a.v, _mm256_set1_ps(-0.0f)), neg); return r;
+}
+SIM_FORCE_INLINE f32x8 lane_sqrt(f32x8 a) { return f32x8_sqrt(a); }
+SIM_FORCE_INLINE b32x8 lane_lt(f32x8 a, f32x8 b) { b32x8 r; r.v = _mm256_cmp_ps(a.v, b.v, _CMP_LT_OQ); return r; }
+SIM_FORCE_INLINE b32x8 lane_le(f32x8 a, f32x8 b) { b32x8 r; r.v = _mm256_cmp_ps(a.v, b.v, _CMP_LE_OQ); return r; }
+SIM_FORCE_INLINE b32x8 lane_gt(f32x8 a, f32x8 b) { b32x8 r; r.v = _mm256_cmp_ps(a.v, b.v, _CMP_GT_OQ); return r; }
+SIM_FORCE_INLINE b32x8 lane_ge(f32x8 a, f32x8 b) { b32x8 r; r.v = _mm256_cmp_ps(a.v, b.v, _CMP_GE_OQ); return r; }
+SIM_FORCE_INLINE b32x8 lane_eq(f32x8 a, f32x8 b) { b32x8 r; r.v = _mm256_cmp_ps(a.v, b.v, _CMP_EQ_OQ); return r; }
+SIM_FORCE_INLINE b32x8 lane_and(b32x8 a, b32x8 b) { b32x8 r; r.v = _mm256_and_ps(a.v, b.v); return r; }
+SIM_FORCE_INLINE b32x8 lane_or(b32x8 a, b32x8 b) { b32x8 r; r.v = _mm256_or_ps(a.v, b.v); return r; }
+SIM_FORCE_INLINE b32x8 lane_not(b32x8 a) { b32x8 r; r.v = _mm256_xor_ps(a.v, _mm256_castsi256_ps(_mm256_set1_epi32(-1))); return r; }
+SIM_FORCE_INLINE b32 lane_any(b32x8 a) { return _mm256_movemask_ps(a.v) != 0; }
+SIM_FORCE_INLINE b32 lane_all(b32x8 a) { return _mm256_movemask_ps(a.v) == 0xFF; }
+SIM_FORCE_INLINE b32x8 lane_mask_splat(b32x8 *, bool a) { b32x8 r; r.v = _mm256_castsi256_ps(_mm256_set1_epi32(a ? -1 : 0)); return r; }
+SIM_FORCE_INLINE f32x8 lane_select(b32x8 m, f32x8 a, f32x8 b) { f32x8 r; r.v = _mm256_blendv_ps(b.v, a.v, m.v); return r; }
+SIM_FORCE_INLINE b32x8 lane_select_mask(b32x8 m, b32x8 a, b32x8 b) { b32x8 r; r.v = _mm256_blendv_ps(b.v, a.v, m.v); return r; }
+SIM_FORCE_INLINE b32x8 lane_is_finite(f32x8 a) { f32x8 d = a - a; return lane_eq(d, d); }
+SIM_FORCE_INLINE f32 lane_get(f32x8 a, u32 i) { return f32x8_lane(a, i); }
+
+#else
+
+struct b32x8 { bool e[8]; };
+#define F32X8_LOP(expr) f32x8 r; for (int i = 0; i < 8; ++i) { r.e[i] = (expr); } return r
+#define B32X8_LOP(expr) b32x8 r; for (int i = 0; i < 8; ++i) { r.e[i] = (expr); } return r
+SIM_FORCE_INLINE f32x8 lane_splat(f32x8 *, f64 a) { F32X8_LOP((f32)a); }
+SIM_FORCE_INLINE f32x8 lane_load_f64(const f64 *p, f32x8 *) { F32X8_LOP((f32)p[i]); }
+SIM_FORCE_INLINE void lane_store_f64(f64 *p, f32x8 a) { for (int i = 0; i < 8; ++i) p[i] = (f64)a.e[i]; }
+SIM_FORCE_INLINE void lane_accumulate_f64(f64 *p, f32x8 a) { for (int i = 0; i < 8; ++i) p[i] += (f64)a.e[i]; }
+SIM_FORCE_INLINE f32x8 lane_fmadd(f32x8 a, f32x8 b, f32x8 c) { F32X8_LOP(lane_fmadd(a.e[i], b.e[i], c.e[i])); }
+SIM_FORCE_INLINE f32x8 lane_fnmadd(f32x8 a, f32x8 b, f32x8 c) { F32X8_LOP(lane_fnmadd(a.e[i], b.e[i], c.e[i])); }
+SIM_FORCE_INLINE f32x8 lane_min(f32x8 a, f32x8 b) { F32X8_LOP(lane_min(a.e[i], b.e[i])); }
+SIM_FORCE_INLINE f32x8 lane_max(f32x8 a, f32x8 b) { F32X8_LOP(lane_max(a.e[i], b.e[i])); }
+SIM_FORCE_INLINE f32x8 lane_abs(f32x8 a) { F32X8_LOP(lane_abs(a.e[i])); }
+SIM_FORCE_INLINE f32x8 lane_sqrt(f32x8 a) { F32X8_LOP(lane_sqrt(a.e[i])); }
+SIM_FORCE_INLINE b32x8 lane_lt(f32x8 a, f32x8 b) { B32X8_LOP(a.e[i] < b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_le(f32x8 a, f32x8 b) { B32X8_LOP(a.e[i] <= b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_gt(f32x8 a, f32x8 b) { B32X8_LOP(a.e[i] > b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_ge(f32x8 a, f32x8 b) { B32X8_LOP(a.e[i] >= b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_eq(f32x8 a, f32x8 b) { B32X8_LOP(a.e[i] == b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_and(b32x8 a, b32x8 b) { B32X8_LOP(a.e[i] && b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_or(b32x8 a, b32x8 b) { B32X8_LOP(a.e[i] || b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_not(b32x8 a) { B32X8_LOP(!a.e[i]); }
+SIM_FORCE_INLINE b32 lane_any(b32x8 a) { for (int i = 0; i < 8; ++i) if (a.e[i]) return 1; return 0; }
+SIM_FORCE_INLINE b32 lane_all(b32x8 a) { for (int i = 0; i < 8; ++i) if (!a.e[i]) return 0; return 1; }
+SIM_FORCE_INLINE b32x8 lane_mask_splat(b32x8 *, bool a) { B32X8_LOP(a); }
+SIM_FORCE_INLINE f32x8 lane_select(b32x8 m, f32x8 a, f32x8 b) { F32X8_LOP(m.e[i] ? a.e[i] : b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_select_mask(b32x8 m, b32x8 a, b32x8 b) { B32X8_LOP(m.e[i] ? a.e[i] : b.e[i]); }
+SIM_FORCE_INLINE b32x8 lane_is_finite(f32x8 a) { B32X8_LOP(lane_is_finite(a.e[i])); }
+SIM_FORCE_INLINE f32 lane_get(f32x8 a, u32 i) { return a.e[i]; }
+#undef F32X8_LOP
+#undef B32X8_LOP
+
+#endif // SIM_SIMD
+
+template <> struct LaneTraits<f32x8> {
+    typedef b32x8 Mask;
+    enum { width = 8 };
+};
+
 #endif // BASE_SIMD_H

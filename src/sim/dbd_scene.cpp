@@ -45,6 +45,7 @@ struct DbdScene {
     DbdZones zones;
     DbdGpu gpu;
     b32 generated;             // straight-line kernels match this mechanism
+    u32 precision;             // DbdPrecision
     b32 use_gpu;
     b32 gpu_ready;             // mechanism/method/control uploaded
 
@@ -74,6 +75,7 @@ internal void dbd_scene_set_reactor_point(DbdZones *z, u32 i) {
 internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b32 sweep) {
     air_mech_build(&scene->model, &scene->sp);
     scene->generated = dbd_generated_matches(&scene->model);
+    scene->precision = config->precision == 1 ? DbdPrecision_F64 : DbdPrecision_F32;
     scene->source = air_source_defaults();
     scene->method_id = KinMethod_Rodas3;
     scene->method = kin_method(scene->method_id);
@@ -191,7 +193,7 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
     }
     b32 done_on_gpu = 0;
     if (scene->use_gpu && memory->gpu.available) {
-        err = dbd_advance_gpu(z, &memory->gpu, &scene->gpu, dt);
+        err = dbd_advance_gpu(z, &memory->gpu, &scene->gpu, dt, scene->precision);
         if (err) {
             memory->platform.log("[dbd] gpu advance failed: %s; falling back to the CPU\n", memory->gpu.gpu_error_string(err));
             scene->use_gpu = 0;
@@ -200,7 +202,7 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
         }
     }
     if (!done_on_gpu) {
-        dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, dt, scene->generated,
+        dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, dt, scene->generated, scene->precision,
                             &memory->platform, memory->work_queue, memory->worker_count, frame);
     }
     dbd_zones_commit_pulses(z);
@@ -272,9 +274,10 @@ internal void dbd_scene_summary(DbdScene *scene, char *out, u32 size, u32 thread
     for (u32 i = 0; i < z->count; ++i) { steps += z->steps[i]; failed += z->failed[i]; }
     f64 ms = scene->t * 1000.0;
     snprintf(out, size,
-             "%s %u zones %s %s | t %.3f s | %s O3 %.1f ppm NO %.2f NO2 %.2f N2O5 %.2f HNO2 %.3f HNO3 %.3f ppm | "
+             "%s %u zones %s %s %s | t %.3f s | %s O3 %.1f ppm NO %.2f NO2 %.2f N2O5 %.2f HNO2 %.3f HNO3 %.3f ppm | "
              "%.0f steps/zone/ms, %.2f ms wall/step, %u failed",
              scene->chained ? "reactor" : "sweep", z->count, scene->mode == DbdDischarge_Pulsed ? "pulsed" : "averaged",
+             scene->precision == DbdPrecision_F32 ? "f32" : "f64",
              scene->use_gpu ? "gpu" : (threads > 1 ? "cpu-mt" : "cpu"), scene->t,
              scene->chained ? "outlet" : "corner",
              dbd_ppm(z, scene->sp.O3, at), dbd_ppm(z, scene->sp.NO, at), dbd_ppm(z, scene->sp.NO2, at),
