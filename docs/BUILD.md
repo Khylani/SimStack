@@ -53,7 +53,8 @@ Tests (exit code = failed checks):
 Run:
 
 ```sh
-./build/simstack --scene dbd              # 16-zone DBD plug-flow reactor, species profiles (see docs/M2_KINETICS.md)
+./build/simstack --scene dbd              # real-time UI, 64-zone DBD plug-flow reactor (see docs/M2_KINETICS.md)
+./build/simstack --scene sweep --gpu      # real-time UI, 32 x 32 operating-point sweep on CUDA
 ./build/simstack --scene dbd --headless 300 --csv runs/reactor.csv   # 5 s of chemistry, outlet time series
 ./build/simstack --scene sweep --zones 1024 --averaged --headless 121 --csv runs/sweep.csv [--gpu]
 ./build/simstack                          # windowed, 65536 particles (M1 demo scene)
@@ -67,7 +68,12 @@ Chemistry options: `--threads N` (work-queue threads including the main
 thread, default 8, workers pinned one per P-core), `--gpu` (load
 `build/simstack_gpu.so`, run zones on CUDA), `--gpu-mem MB` (device arena,
 default 512), `--averaged` (continuous discharge source instead of one pulse
-per half-cycle), `--zones N`.
+per half-cycle), `--zones N`, `--precision f32|f64` (chemistry lane precision,
+default f32), `--chem-dt N` (chemistry advance every N ms; reactor default 1, sweep 20).
+
+The window is a docked Dear ImGui UI (controls, plots, performance) around the
+3D view; drag in the 3D view to orbit, wheel to zoom. Windowed chemistry runs as
+a background job overlapping render + swap, paced to the display rate.
 
 Keys in the window: `Space`/`P` pause, `R` reset the scene, `F1` toggle camera
 auto-orbit, arrow keys orbit, `Esc` quit. The window title shows ms/frame; the
@@ -102,11 +108,18 @@ particle positions and step counter carry over; the title bar shows
 
 For the dbd/sweep scenes the hash covers every zone's species densities.
 Reference: `--scene dbd --headless 30` gives 500 master steps and hash
-`3d961503dd103e85` for clang and gcc, debug (including ASan) and release,
-`--simd=0`, any `--threads`, and `--gpu`.
+`3741c9877f88ad5d` (f32 lanes, default) or `a2be2f374ec0cfb4` (`--precision f64`)
+for clang and gcc, any `--threads`, and `--gpu`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.
+A gcc debug+ASan build compiles the generated kinetics kernels and the UI
+libraries slowly (minutes); release builds of the sim module take ~2 s.
+
+Every build also runs the kinetics code generator (`build/kin_codegen` writes
+`build/gen/air_mech_gen.h`, only when it changes) and compiles Dear ImGui +
+ImPlot once into `build/ui_third_party_<mode>_*.o` (~40 s the first time,
+cached afterwards).
 
 The state hash is an FNV-1a over the particle positions after the last frame.
 It must be identical across runs, across `--simd=0` / `--simd=1`, across
@@ -170,18 +183,21 @@ src/
   platform/linux_simstack.cpp   Xlib/GLX exe: window, input, timing, file IO, mmap, dlopen hot reload, headless
   platform/linux_work_queue.cpp work queue + P-core pinned workers (Handmade Hero style)
   platform/linux_gpu.cpp        dlopen of simstack_gpu.so into GpuAPI
-  platform/win32_simstack.cpp   Win32/WGL exe, same interface (untested; no work queue / GPU yet)
+  platform/win32_simstack.cpp   Win32/WGL exe, same interface (untested; no work queue / GPU / UI yet)
   platform/platform_common.cpp  args, memory sizes, profiler printing (included by both)
   platform/render_gl.cpp        GL loader + coloured SoA point batches + PPM screenshot (included by both)
   sim/simstack.cpp          sim module root: scenes, fixed-step loop, camera, exports
   sim/particles.cpp         M1 SoA particle system stepped with f32x8
-  sim/kinetics/             batched Rosenbrock solver, mechanism builder, humid-air mechanism
+  sim/kinetics/             batched Rosenbrock solver (f64/f32 lanes), mechanism builder, humid-air mechanism
   sim/dbd_lanes.h           per-lane-group DBD advance shared by CPU and CUDA
   sim/dbd.cpp               DBD zones: SoA block, discharge source, CPU (threads) / GPU advance, plug flow
-  sim/dbd_scene.cpp         reactor and sweep scenes, CSV, render batches
+  sim/dbd_scene.cpp         reactor and sweep scenes, operating point, CSV, 3D view
+  ui/                       Dear ImGui config, UI heap + render-command emission, panels
+  tools/kin_codegen.cpp     metaprogram: straight-line kinetics kernels -> build/gen/
+third_party/                Dear ImGui (docking) + ImPlot, pinned (THIRD_PARTY.md)
   gpu/gpu_api.h             C ABI + GpuAPI table of the optional CUDA module
   gpu/kernels.cu            nvcc TU: GPU bump arena, kinetics kernel, point kernel
   tests/test_kinetics.cpp   solver/mechanism tests and benchmarks
 docs/BUILD.md               this file
-docs/M2_KINETICS.md         the DBD chemistry solver: design, verification, measurements
+docs/M2_KINETICS.md         the DBD chemistry solver and UI: design, verification, measurements
 ```
