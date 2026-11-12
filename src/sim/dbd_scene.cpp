@@ -44,6 +44,7 @@ struct DbdScene {
 
     DbdZones zones;
     DbdGpu gpu;
+    b32 generated;             // straight-line kernels match this mechanism
     b32 use_gpu;
     b32 gpu_ready;             // mechanism/method/control uploaded
 
@@ -72,6 +73,7 @@ internal void dbd_scene_set_reactor_point(DbdZones *z, u32 i) {
 
 internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b32 sweep) {
     air_mech_build(&scene->model, &scene->sp);
+    scene->generated = dbd_generated_matches(&scene->model);
     scene->source = air_source_defaults();
     scene->method_id = KinMethod_Rodas3;
     scene->method = kin_method(scene->method_id);
@@ -192,11 +194,11 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
         if (err) {
             memory->platform.log("[dbd] gpu advance failed: %s; falling back to the CPU\n", memory->gpu.gpu_error_string(err));
             scene->use_gpu = 0;
-            dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, t0, t1, &memory->platform,
+            dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, t0, t1, scene->generated, &memory->platform,
                                 memory->work_queue, memory->worker_count, frame);
         }
     } else {
-        dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, t0, t1, &memory->platform,
+        dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, t0, t1, scene->generated, &memory->platform,
                             memory->work_queue, memory->worker_count, frame);
     }
     if (scene->chained) dbd_flow_exchange(z, &scene->sp, scene->residence_s, dt);

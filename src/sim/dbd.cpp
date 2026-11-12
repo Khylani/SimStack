@@ -20,6 +20,12 @@
 #include "kinetics/kin_build.cpp"
 #include "dbd_lanes.h"
 #include "kinetics/air_mech.cpp"
+#include "air_mech_gen.h"   // build/gen: straight-line kernels for air_mech (src/tools/kin_codegen.cpp)
+
+// 1 if the generated kernels were made from exactly this mechanism.
+internal b32 dbd_generated_matches(KinModel *model) {
+    return hash_fnv1a_64(&model->mech, sizeof(KinMech)) == AirGenOps::signature;
+}
 
 enum DbdDischargeMode {
     DbdDischarge_Pulsed,
@@ -135,16 +141,17 @@ internal void dbd_zones_prepare(DbdZones *z, KinModel *model, AirSpecies *sp, Ai
     dbd_zones_prepare_source(z, sp, source, mode);
 }
 
-// Advances every zone over [t0, t1] on the CPU. V = f64x4 (AVX2) or f64 (reference).
-template <class V>
+// Advances every zone over [t0, t1] on the CPU. V = f64x4 (AVX2) or f64
+// (reference); Ops = generated straight-line kernels or the table walk.
+template <class V, class Ops = KinOpsDefault>
 internal void dbd_advance_cpu(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
                               f64 t0, f64 t1, u32 first_zone = 0, u32 end_zone = U32_MAX) {
     const u32 w = LaneTraits<V>::width;
     u32 end = Minimum(end_zone, z->padded);
     Assert(first_zone % w == 0);
     for (u32 i0 = first_zone; i0 < end; i0 += w) {
-        dbd_advance_group<V>(m, method, ctl, z->y, z->k, z->src, z->pulse, z->period, z->h, z->pulse_index,
-                             z->steps, z->rejects, z->pulses, z->failed, z->y, z->padded, i0, t0, t1);
+        dbd_advance_group<V, Ops>(m, method, ctl, z->y, z->k, z->src, z->pulse, z->period, z->h, z->pulse_index,
+                                  z->steps, z->rejects, z->pulses, z->failed, z->y, z->padded, i0, t0, t1);
     }
 }
 
@@ -157,20 +164,27 @@ struct DbdWork {
     const KinControl *ctl;
     f64 t0, t1;
     u32 first, end;
+    b32 generated;
 };
 
+internal void dbd_work_run(DbdWork *w) {
+    if (w->generated) dbd_advance_cpu<f64x4, AirGenOps>(w->z, w->m, w->method, w->ctl, w->t0, w->t1, w->first, w->end);
+    else dbd_advance_cpu<f64x4>(w->z, w->m, w->method, w->ctl, w->t0, w->t1, w->first, w->end);
+}
+
 internal PLATFORM_WORK_QUEUE_CALLBACK(dbd_work_advance) {
-    DbdWork *w = (DbdWork *)data;
-    dbd_advance_cpu<f64x4>(w->z, w->m, w->method, w->ctl, w->t0, w->t1, w->first, w->end);
+    dbd_work_run((DbdWork *)data);
 }
 
 internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
-                                  f64 t0, f64 t1, PlatformAPI *api, PlatformWorkQueue *queue, u32 threads, Arena *frame) {
+                                  f64 t0, f64 t1, b32 generated, PlatformAPI *api, PlatformWorkQueue *queue,
+                                  u32 threads, Arena *frame) {
     TIMED_FUNCTION();
     const u32 w = LaneTraits<f64x4>::width;
     u32 groups = z->padded / w;
     if (!queue || threads <= 1 || groups <= 1) {
-        dbd_advance_cpu<f64x4>(z, m, method, ctl, t0, t1);
+        DbdWork all = { z, m, method, ctl, t0, t1, 0, z->padded, generated };
+        dbd_work_run(&all);
         return;
     }
     // ~4 chunks per thread so uneven lane costs (stiffer zones) balance out.
@@ -185,6 +199,7 @@ internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod
         item->t0 = t0; item->t1 = t1;
         item->first = g * w;
         item->end = Minimum(groups, g + per) * w;
+        item->generated = generated;
         api->add_work_entry(queue, dbd_work_advance, item);
     }
     api->complete_all_work(queue);

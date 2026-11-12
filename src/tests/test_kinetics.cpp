@@ -251,6 +251,31 @@ internal void test_simd_matches_scalar(KinModel *model, AirSpecies *sp, AirSourc
     }
 }
 
+// Generated straight-line kernels must match the table walk bit for bit.
+internal void test_generated_matches_table(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
+    CHECK(dbd_generated_matches(model), "generated kernels are stale (signature mismatch): rebuild");
+    Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
+    KinMethod method = kin_method(KinMethod_Rodas3);
+    KinControl ctl = dbd_default_control();
+    for (u32 mode = 0; mode < 2; ++mode) {
+        DbdZones a, b;
+        setup_zones(&a, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
+        setup_zones(&b, &arena, model, sp, src, 12, (DbdDischargeMode)mode);
+        for (u32 step = 0; step < 5; ++step) {
+            f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+            dbd_zones_prepare(&a, model, sp, src, (DbdDischargeMode)mode);
+            dbd_zones_prepare(&b, model, sp, src, (DbdDischargeMode)mode);
+            dbd_advance_cpu<f64x4, AirGenOps>(&a, &model->mech, &method, &ctl, t0, t1);
+            dbd_advance_cpu<f64x4>(&b, &model->mech, &method, &ctl, t0, t1);
+        }
+        u64 bytes = sizeof(f64) * (u64)a.n_species * a.padded;
+        b32 same = memcmp(a.y, b.y, bytes) == 0 && memcmp(a.steps, b.steps, sizeof(f64) * a.padded) == 0;
+        printf("[codegen] %s: generated vs table kernels %s\n", mode == 0 ? "pulsed  " : "averaged",
+               same ? "bit-identical" : "DIFFERENT");
+        CHECK(same, "generated and table kernels differ (mode %u)", mode);
+    }
+}
+
 // Atoms of N, O, H are conserved by chemistry and by the discharge source.
 internal void test_conservation(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
@@ -331,9 +356,21 @@ internal void bench_kernels(KinModel *model, AirSpecies *sp) {
     f64x4 acc = lane_splat((f64x4 *)0, 0.5);
     for (u32 i = 0; i < reps; ++i) { acc = acc + lane_cbrt_clamped(acc); }
     u64 c5 = read_cpu_timer();
-    printf("[kernels] f64x4 TSC cycles per call: fun %.0f  jac %.0f  decomp %.0f  solve %.0f  cbrt %.0f  (sink %g)\n",
+    printf("[kernels] f64x4 table  TSC cycles per call: fun %.0f  jac %.0f  decomp %.0f  solve %.0f  cbrt %.0f  (sink %g)\n",
            (f64)(c1 - c0) / reps, (f64)(c2 - c1) / reps, (f64)(c3 - c2) / reps, (f64)(c4 - c3) / reps,
            (f64)(c5 - c4) / reps, lane_get(x[0], 0) + lane_get(acc, 1) + lane_get(lu[5], 2));
+    u64 g0 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { AirGenOps::fun(m, k, src, y, f); y[0] = y[0] + f[1] * lane_splat((f64x4 *)0, 1e-300); }
+    u64 g1 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { AirGenOps::neg_jac(m, k, y, lu); y[0] = y[0] + lu[3] * lane_splat((f64x4 *)0, 1e-300); }
+    u64 g2 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { AirGenOps::factor(m, lane_splat((f64x4 *)0, 1e6 + i), lu); }
+    u64 g3 = read_cpu_timer();
+    for (u32 i = 0; i < reps; ++i) { AirGenOps::solve(m, lu, x); }
+    u64 g4 = read_cpu_timer();
+    printf("[kernels] f64x4 gen    TSC cycles per call: fun %.0f  jac %.0f  decomp %.0f  solve %.0f  (sink %g)\n",
+           (f64)(g1 - g0) / reps, (f64)(g2 - g1) / reps, (f64)(g3 - g2) / reps, (f64)(g4 - g3) / reps,
+           lane_get(x[0], 0) + lane_get(lu[5], 2));
 }
 
 // Accuracy vs cost: 8 synchronized humid-air zones, 20 ms pulsed, against a
@@ -395,7 +432,7 @@ internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     KinMethod method = kin_method(KinMethod_Rodas3);
     KinControl ctl = dbd_default_control();
     for (u32 mode = 0; mode < 2; ++mode) {
-        for (u32 simd = 0; simd < 2; ++simd) {
+        for (u32 variant = 0; variant < 3; ++variant) {
             arena.used = 0;
             DbdZones z;
             setup_zones(&z, &arena, model, sp, src, 64, (DbdDischargeMode)mode);
@@ -403,14 +440,16 @@ internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
             u32 ms = 20;
             for (u32 step = 0; step < ms; ++step) {
                 dbd_zones_prepare(&z, model, sp, src, (DbdDischargeMode)mode);
-                if (simd) dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
-                else dbd_advance_cpu<f64>(&z, &model->mech, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
+                f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+                if (variant == 0) dbd_advance_cpu<f64>(&z, &model->mech, &method, &ctl, t0, t1);
+                else if (variant == 1) dbd_advance_cpu<f64x4>(&z, &model->mech, &method, &ctl, t0, t1);
+                else dbd_advance_cpu<f64x4, AirGenOps>(&z, &model->mech, &method, &ctl, t0, t1);
             }
             f64 wall = now_s() - t_start;
             f64 steps = 0.0;
             for (u32 i = 0; i < z.count; ++i) steps += z.steps[i];
-            printf("[bench] %s %-6s 64 zones x %u ms: %.1f ms wall, %.2f zone-ms per wall-ms, %.1f us per zone-step\n",
-                   mode == 0 ? "pulsed  " : "averaged", simd ? "f64x4" : "f64", ms, wall * 1e3,
+            printf("[bench] %s %-11s 64 zones x %u ms: %.1f ms wall, %.2f zone-ms per wall-ms, %.1f us per zone-step\n",
+                   mode == 0 ? "pulsed  " : "averaged", variant == 0 ? "f64 table" : variant == 1 ? "f64x4 table" : "f64x4 gen", ms, wall * 1e3,
                    64.0 * ms / (wall * 1e3), wall * 1e6 / steps);
         }
     }
@@ -437,6 +476,7 @@ int main(int argc, char **argv) {
     test_robertson();
     test_order();
     test_simd_matches_scalar(model, &sp, &src);
+    test_generated_matches_table(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
@@ -512,7 +552,7 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
                 f64 s0 = now_s();
                 dbd_advance_gpu(&a, &gpu, &g, t0, t1);
                 f64 s1 = now_s();
-                if (n <= 4096) dbd_advance_cpu<f64x4>(&b, &model->mech, &method, &ctl, t0, t1);
+                if (n <= 4096) dbd_advance_cpu<f64x4, AirGenOps>(&b, &model->mech, &method, &ctl, t0, t1);
                 f64 s2 = now_s();
                 gpu_s += s1 - s0; cpu_s += s2 - s1; kernel_ms += g.last_kernel_ms;
             }

@@ -14,6 +14,7 @@
 #include <string.h>
 #include "gpu_api.h"
 #include "../sim/dbd_lanes.h"
+#include "air_mech_gen.h"
 
 struct GpuArena {
     u8 *base;
@@ -24,12 +25,13 @@ struct GpuArena {
 static GpuArena g_gpu_arena;
 static cudaEvent_t g_kin_start, g_kin_stop;
 static u32 g_kin_block = 64;
+static b32 g_kin_generated;   // the uploaded mechanism matches AirGenOps
 
 // Per-thread capacities for the GPU instantiation. Every lane's Jacobian/LU,
 // stage vectors and rate constants live in local memory, about
 // 8 * (nnz + 9 * species + reactions) bytes per lane. The humid-air
 // mechanism is 17 species / 40 reactions / 213 non-zeros (~4 KB per lane).
-struct KinCapGpu { enum { species = 24, reactions = 48, nnz = 256 }; };
+typedef KinTableOps<24, 48, 256> KinOpsGpu;
 
 // Mechanism tables: read in the same order by every thread (uniform), so
 // constant-memory broadcasts. Staging them in shared memory instead was
@@ -59,11 +61,12 @@ __global__ void step_points_kernel(f32 *x, f32 *y, f32 *z, f32 *vx, f32 *vy, f32
 }
 
 // One thread per lane (zone): the same dbd_advance_group the CPU runs, with V = f64.
+template <class Ops>
 __global__ void __launch_bounds__(64) kin_advance_kernel(GpuKinLaunch L) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= L.padded) return;
-    dbd_advance_group<f64, KinCapGpu>(&c_mech, &c_method, &c_control, L.y, L.k, L.src, L.pulse, L.period, L.h,
-                                      L.pulse_index, L.steps, L.rejects, L.pulses, L.failed, L.y, L.padded, i, L.t0, L.t1);
+    dbd_advance_group<f64, Ops>(&c_mech, &c_method, &c_control, L.y, L.k, L.src, L.pulse, L.period, L.h,
+                                L.pulse_index, L.steps, L.rejects, L.pulses, L.failed, L.y, L.padded, i, L.t0, L.t1);
 }
 
 // ----------------------------------------------------------------------------
@@ -136,7 +139,8 @@ GPU_API GPU_SYNC(gpu_sync) {
 }
 
 GPU_API GPU_KIN_SET_MECH(gpu_kin_set_mech) {
-    if (!kin_capacity_ok<KinCapGpu>(mech)) return (s32)cudaErrorInvalidValue;   // raise KinCapGpu and rebuild
+    if (!kin_capacity_ok<KinOpsGpu>(mech)) return (s32)cudaErrorInvalidValue;   // raise KinOpsGpu and rebuild
+    g_kin_generated = hash_fnv1a_64(mech, sizeof(KinMech)) == AirGenOps::signature;
     cudaError_t err = cudaMemcpyToSymbol(c_mech, mech, sizeof(KinMech));
     if (err == cudaSuccess) err = cudaMemcpyToSymbol(c_method, method, sizeof(KinMethod));
     if (err == cudaSuccess) err = cudaMemcpyToSymbol(c_control, control, sizeof(KinControl));
@@ -147,7 +151,8 @@ GPU_API GPU_KIN_ADVANCE(gpu_kin_advance) {
     u32 block = g_kin_block;
     u32 grid = (launch->padded + block - 1) / block;
     cudaEventRecord(g_kin_start);
-    kin_advance_kernel<<<grid, block>>>(*launch);
+    if (g_kin_generated) kin_advance_kernel<AirGenOps><<<grid, block>>>(*launch);
+    else kin_advance_kernel<KinOpsGpu><<<grid, block>>>(*launch);
     cudaEventRecord(g_kin_stop);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (s32)err;

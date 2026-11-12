@@ -22,17 +22,6 @@
 #include "../../base/base_lane.h"
 #include "kin_mech.h"
 
-// Per-lane working-set capacities. The defaults fit any mechanism KinMech
-// can hold; the GPU kernel instantiates a smaller set sized for the
-// mechanisms it runs, because every lane's arrays live in (scarce) local
-// memory there. kin_capacity_ok() checks a mechanism against a set.
-struct KinCapDefault { enum { species = KIN_MAX_SPECIES, reactions = KIN_MAX_REACTIONS, nnz = KIN_MAX_NNZ }; };
-
-template <class Cap>
-inline b32 kin_capacity_ok(const KinMech *m) {
-    return m->species_count <= (u32)Cap::species && m->reaction_count <= (u32)Cap::reactions && m->nnz <= (u32)Cap::nnz;
-}
-
 #define KIN_FAC_MIN   0.2     // step-size change limits per step (KPP defaults)
 #define KIN_FAC_MAX   6.0
 #define KIN_FAC_SAFE  0.9
@@ -149,6 +138,33 @@ SIM_HD void kin_solve(const KinMech *m, const V *a, V *x) {
     }
 }
 
+// Kernel policy for the integrator ("Ops"): where fun / -J / LU / solve come
+// from, and the per-lane working-set capacities. Two kinds:
+//
+//   KinTableOps<...>  walks KinMech's index tables: any mechanism, data-driven
+//   generated ops     straight-line code for one fixed mechanism, emitted by
+//                     src/tools/kin_codegen.cpp (build/gen/*_gen.h). Same
+//                     operations in the same order as the table walk, so the
+//                     results are bit-identical, without the index loads.
+//
+// Capacities size the per-lane arrays; on the GPU those live in scarce local
+// memory, so they should match the mechanism. kin_capacity_ok() checks.
+template <u32 S, u32 R, u32 N>
+struct KinTableOps {
+    enum { species = S, reactions = R, nnz = N };
+    static SIM_HD u32 n(const KinMech *m) { return m->species_count; }
+    template <class V> static SIM_HD void fun(const KinMech *m, const V *k, const V *src, const V *y, V *f) { kin_fun(m, k, src, y, f); }
+    template <class V> static SIM_HD void neg_jac(const KinMech *m, const V *k, const V *y, V *a) { kin_neg_jac(m, k, y, a); }
+    template <class V> static SIM_HD void factor(const KinMech *m, V ghinv, V *a) { kin_factor(m, ghinv, a); }
+    template <class V> static SIM_HD void solve(const KinMech *m, const V *a, V *x) { kin_solve(m, a, x); }
+};
+typedef KinTableOps<KIN_MAX_SPECIES, KIN_MAX_REACTIONS, KIN_MAX_NNZ> KinOpsDefault;
+
+template <class Ops>
+inline b32 kin_capacity_ok(const KinMech *m) {
+    return m->species_count <= (u32)Ops::species && m->reaction_count <= (u32)Ops::reactions && m->nnz <= (u32)Ops::nnz;
+}
+
 // (1/err)^(1/order) * safety, clamped to [FAC_MIN, FAC_MAX]. No libm.
 template <class V>
 SIM_HD V kin_step_factor(V err, u32 order) {
@@ -164,19 +180,19 @@ SIM_HD V kin_step_factor(V err, u32 order) {
 
 // Integrates every lane from t to t_end (per lane). On return t == t_end for
 // every lane that did not fail; h holds the step size to continue with.
-template <class V, class Cap = KinCapDefault>
+template <class V, class Ops = KinOpsDefault>
 SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinControl *ctl, const V *k,
                           const V *src, V *y, V &t, V t_end, V &h, KinLaneStats<V> &stats) {
     typedef typename LaneTraits<V>::Mask M;
-    const u32 n = m->species_count;
+    const u32 n = Ops::n(m);
     const V zero = lane_splat((V *)0, 0.0), one = lane_splat((V *)0, 1.0);
     const V h_min = lane_splat((V *)0, ctl->h_min);
     const V rtol = lane_splat((V *)0, ctl->rtol), atol = lane_splat((V *)0, ctl->atol);
     const V inv_n = lane_splat((V *)0, 1.0 / (f64)n);
 
-    V lu[Cap::nnz];
-    V kstage[KIN_MAX_STAGES][Cap::species];
-    V fcn[Cap::species], ytmp[Cap::species];
+    V lu[Ops::nnz];
+    V kstage[KIN_MAX_STAGES][Ops::species];
+    V fcn[Ops::species], ytmp[Ops::species];
 
     M failed = lane_gt(stats.failed, zero);
     M active = lane_and(lane_lt(t, t_end), lane_not(failed));
@@ -198,10 +214,10 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
         V hs = lane_select(last, remaining, lane_min(h_wanted, h_cap));
         hs = lane_select(active, hs, one);                     // keep idle lanes finite
 
-        kin_fun(m, k, src, y, fcn);
-        kin_neg_jac(m, k, y, lu);
+        Ops::fun(m, k, src, y, fcn);
+        Ops::neg_jac(m, k, y, lu);
         V ghinv = one / (hs * lane_splat((V *)0, method->gamma0));
-        kin_factor(m, ghinv, lu);
+        Ops::factor(m, ghinv, lu);
         V hinv = one / hs;
 
         for (u32 st = 0; st < method->stages; ++st) {
@@ -214,7 +230,7 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
                     V av = lane_splat((V *)0, a);
                     for (u32 s = 0; s < n; ++s) ytmp[s] = lane_fmadd(av, kstage[j][s], ytmp[s]);
                 }
-                kin_fun(m, k, src, ytmp, fcn);
+                Ops::fun(m, k, src, ytmp, fcn);
             }
             for (u32 s = 0; s < n; ++s) kstage[st][s] = fcn[s];
             for (u32 j = 0; j < st; ++j) {
@@ -223,7 +239,7 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
                 V hc = lane_splat((V *)0, c) * hinv;
                 for (u32 s = 0; s < n; ++s) kstage[st][s] = lane_fmadd(hc, kstage[j][s], kstage[st][s]);
             }
-            kin_solve(m, lu, kstage[st]);
+            Ops::solve(m, lu, kstage[st]);
         }
 
         // y_new into ytmp, error norm into err
@@ -279,12 +295,12 @@ SIM_HD void kin_integrate(const KinMech *m, const KinMethod *method, const KinCo
 // Advances [t0, t1] with optional discharge pulses: an instantaneous source
 // `pulse` added at t = (pulse_index + 1) * period (period <= 0: no pulses).
 // Integration stops exactly on each pulse, applies it, restarts with h_start.
-template <class V, class Cap = KinCapDefault>
+template <class V, class Ops = KinOpsDefault>
 SIM_HD void kin_advance(const KinMech *m, const KinMethod *method, const KinControl *ctl, const V *k,
                         const V *src, const V *pulse, V period, V *y, V t0, V t1, V &h, V &pulse_index,
                         KinLaneStats<V> &stats) {
     typedef typename LaneTraits<V>::Mask M;
-    const u32 n = m->species_count;
+    const u32 n = Ops::n(m);
     const V zero = lane_splat((V *)0, 0.0), one = lane_splat((V *)0, 1.0);
     const V never = lane_splat((V *)0, 1e300);
     M pulsed = lane_gt(period, zero);
@@ -292,7 +308,7 @@ SIM_HD void kin_advance(const KinMech *m, const KinMethod *method, const KinCont
     for (;;) {
         V next_pulse = lane_select(pulsed, (pulse_index + one) * period, never);
         V seg_end = lane_min(next_pulse, t1);
-        kin_integrate<V, Cap>(m, method, ctl, k, src, y, t, seg_end, h, stats);
+        kin_integrate<V, Ops>(m, method, ctl, k, src, y, t, seg_end, h, stats);
 
         M alive = lane_not(lane_gt(stats.failed, zero));
         M hit = lane_and(lane_and(pulsed, alive), lane_and(lane_le(next_pulse, t), lane_le(next_pulse, t1)));

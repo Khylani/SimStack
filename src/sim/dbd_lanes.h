@@ -9,18 +9,19 @@
 #include "kinetics/kin_solver.h"
 
 // One group of LaneTraits<V>::width zones starting at lane i0.
-template <class V, class Cap = KinCapDefault>
+template <class V, class Ops = KinOpsDefault>
 SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const KinControl *ctl,
                               const f64 *y_soa, const f64 *k_soa, const f64 *src_soa, const f64 *pulse_soa,
                               const f64 *period, f64 *h_soa, f64 *pulse_index, f64 *steps, f64 *rejects,
                               f64 *pulses, f64 *failed, f64 *y_out, u32 padded, u32 i0, f64 t0, f64 t1) {
-    V y[Cap::species], k[Cap::reactions], src[Cap::species], pulse[Cap::species];
-    for (u32 s = 0; s < m->species_count; ++s) {
+    V y[Ops::species], k[Ops::reactions], src[Ops::species], pulse[Ops::species];
+    const u32 n = Ops::n(m);
+    for (u32 s = 0; s < n; ++s) {
         y[s] = lane_load(y_soa + s * padded + i0, (V *)0);
         src[s] = lane_load(src_soa + s * padded + i0, (V *)0);
         pulse[s] = lane_load(pulse_soa + s * padded + i0, (V *)0);
     }
-    for (u32 r = 0; r < m->reaction_count; ++r) k[r] = lane_load(k_soa + r * padded + i0, (V *)0);
+    for (u32 r = 0; r < (u32)Ops::reactions && r < m->reaction_count; ++r) k[r] = lane_load(k_soa + r * padded + i0, (V *)0);
     V h = lane_load(h_soa + i0, (V *)0);
     V pidx = lane_load(pulse_index + i0, (V *)0);
     V per = lane_load(period + i0, (V *)0);
@@ -30,9 +31,9 @@ SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const K
     st.pulses = lane_load(pulses + i0, (V *)0);
     st.failed = lane_load(failed + i0, (V *)0);
 
-    kin_advance<V, Cap>(m, method, ctl, k, src, pulse, per, y, lane_splat((V *)0, t0), lane_splat((V *)0, t1), h, pidx, st);
+    kin_advance<V, Ops>(m, method, ctl, k, src, pulse, per, y, lane_splat((V *)0, t0), lane_splat((V *)0, t1), h, pidx, st);
 
-    for (u32 s = 0; s < m->species_count; ++s) lane_store(y_out + s * padded + i0, y[s]);
+    for (u32 s = 0; s < n; ++s) lane_store(y_out + s * padded + i0, y[s]);
     lane_store(h_soa + i0, h);
     lane_store(pulse_index + i0, pidx);
     lane_store(steps + i0, st.steps);

@@ -37,7 +37,7 @@ ARCH_FLAGS="-mavx2 -mfma -mbmi2 -mf16c -ffp-contract=off"
 # No C++ runtime is linked: no exceptions, RTTI, new/delete or STL anywhere.
 COMMON="-std=c++20 -fno-exceptions -fno-rtti -fno-strict-aliasing -fvisibility=hidden -nostdlib++ \
         -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-missing-field-initializers \
-        -Wno-unused-variable -Wno-missing-braces -Wno-format-truncation -Isrc -DSIM_SIMD=$SIMD $ARCH_FLAGS"
+        -Wno-unused-variable -Wno-missing-braces -Wno-format-truncation -Isrc -Ibuild/gen -DSIM_SIMD=$SIMD $ARCH_FLAGS"
 
 case "$MODE" in
     debug)   CFG="-O0 -g -DSIM_INTERNAL=1 -DSIM_SLOW=1" ;;
@@ -46,8 +46,17 @@ case "$MODE" in
 esac
 if [ "$ASAN" = 1 ]; then CFG="$CFG -fsanitize=address,undefined -fno-omit-frame-pointer"; fi
 
-mkdir -p build
+mkdir -p build/gen
 echo "[build] $MODE  cxx=$CXX  simd=$SIMD  asan=$ASAN"
+
+# --- metaprogramming: straight-line kinetics kernels from the mechanism ---------
+# kin_codegen is rebuilt only when its inputs change; it rewrites
+# build/gen/air_mech_gen.h only when the output differs.
+CODEGEN_SRC="src/tools/kin_codegen.cpp src/sim/kinetics/kin_build.cpp src/sim/kinetics/air_mech.cpp src/sim/kinetics/kin_mech.h src/sim/kinetics/kin_solver.h src/base/base_types.h src/base/base_lane.h"
+if [ ! -x build/kin_codegen ] || [ -n "$(find $CODEGEN_SRC -newer build/kin_codegen 2>/dev/null)" ]; then
+    $CXX -std=c++20 -O1 -fno-exceptions -fno-rtti -Isrc -DSIM_SLOW=1 src/tools/kin_codegen.cpp -o build/kin_codegen -lm
+fi
+build/kin_codegen build/gen/air_mech_gen.h
 
 # --- sim module -----------------------------------------------------------------
 touch build/lock.tmp
@@ -73,7 +82,7 @@ if [ "$CUDA" = 1 ]; then
     # -fmad=false: no implicit FMA contraction, so the kinetics kernel is
     # bit-identical to the CPU path (explicit fma() calls are still fused).
     START=$(date +%s%N)
-    $NVCC -arch=sm_86 -O3 -fmad=false -lineinfo -Xptxas -warn-spills --shared -Xcompiler -fPIC -Isrc \
+    $NVCC -arch=sm_86 -O3 -fmad=false -lineinfo -Xptxas -warn-spills --shared -Xcompiler -fPIC -Isrc -Ibuild/gen \
           src/gpu/kernels.cu -o build/simstack_gpu.so.tmp
     mv -f build/simstack_gpu.so.tmp build/simstack_gpu.so
     echo "[build] simstack_gpu.so  $(( ($(date +%s%N) - START) / 1000000 )) ms"
