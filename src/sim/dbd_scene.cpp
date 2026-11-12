@@ -30,6 +30,10 @@ global const DbdPlotSpecies dbd_plot_species[DBD_PLOT_SPECIES] = {
     { "N2O",  { 0.55f, 0.55f, 0.70f, 1.0f } },
 };
 
+struct DbdOperating {
+    f64 T_K, p_Pa, x_H2O, power_W_cm3, freq_Hz;
+};
+
 struct DbdScene {
     KinModel model;
     AirSpecies sp;
@@ -57,19 +61,50 @@ struct DbdScene {
     u32 plot_index[DBD_PLOT_SPECIES];
     f32 *plot_x[DBD_PLOT_SPECIES], *plot_y[DBD_PLOT_SPECIES], *plot_z[DBD_PLOT_SPECIES];
 
-    // reactor outlet time series: [row][1 + DBD_PLOT_SPECIES] (t, ppm...)
+    DbdOperating op;           // operating point the UI edits (sweep: power/humidity are the grid axes)
+
+    // outlet time series, ring of DBD_SERIES_CAPACITY rows [t, ppm...]: oldest at series_head
+    // when full. Reactor: outlet zone. Sweep: highest-power, wettest corner.
     f64 *series;
-    u32 series_count;
+    u32 series_count, series_head;
+    u32 series_every;          // master steps per sample
     f64 next_csv_t;
     const char *csv_path;      // points into the platform's argv (stable)
 };
 
-internal void dbd_scene_set_reactor_point(DbdZones *z, u32 i) {
-    z->T_K[i] = 310.0;          // gas warms a little in the discharge gap
-    z->p_Pa[i] = 101325.0;
-    z->x_H2O[i] = 0.02;         // ~65 % RH at 25 C
-    z->power_W_cm3[i] = 0.1;    // 0.2 J/cm^3 = 200 J/L specific energy over a 2 s residence
-    z->freq_Hz[i] = 10000.0;
+internal DbdOperating dbd_operating_defaults() {
+    DbdOperating op;
+    op.T_K = 310.0;             // gas warms a little in the discharge gap
+    op.p_Pa = 101325.0;
+    op.x_H2O = 0.02;            // ~65 % RH at 25 C
+    op.power_W_cm3 = 0.1;       // 0.2 J/cm^3 = 200 J/L specific energy over a 2 s residence
+    op.freq_Hz = 10000.0;
+    return op;
+}
+
+// Writes the operating point into every zone (sweep keeps its power x
+// humidity grid) and recomputes rate constants. Composition is untouched, so
+// the chemistry responds live.
+internal void dbd_scene_apply_operating(DbdScene *scene) {
+    DbdZones *z = &scene->zones;
+    DbdOperating *op = &scene->op;
+    for (u32 i = 0; i < z->count; ++i) {
+        z->T_K[i] = op->T_K;
+        z->p_Pa[i] = op->p_Pa;
+        z->freq_Hz[i] = op->freq_Hz;
+        if (scene->chained) {
+            z->x_H2O[i] = op->x_H2O;
+            z->power_W_cm3[i] = op->power_W_cm3;
+        } else {
+            u32 ix = i % scene->sweep_nx, iy = i / scene->sweep_nx;
+            f64 fx = scene->sweep_nx > 1 ? (f64)ix / (f64)(scene->sweep_nx - 1) : 0.0;
+            f64 fy = scene->sweep_ny > 1 ? (f64)iy / (f64)(scene->sweep_ny - 1) : 0.0;
+            z->power_W_cm3[i] = 0.01 * pow(50.0, fx);   // 0.01 .. 0.5 W/cm^3, log spaced
+            z->x_H2O[i] = 0.04 * fy;                    // dry .. ~saturated at 30 C
+        }
+    }
+    dbd_zones_fill_padding(z);
+    dbd_zones_prepare_rates(z, &scene->model);
 }
 
 internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b32 sweep) {
@@ -98,19 +133,9 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
     }
     dbd_zones_alloc(&scene->zones, arena, &scene->model, count);
     DbdZones *z = &scene->zones;
-    for (u32 i = 0; i < count; ++i) {
-        dbd_scene_set_reactor_point(z, i);
-        if (sweep) {
-            u32 ix = i % scene->sweep_nx, iy = i / scene->sweep_nx;
-            f64 fx = scene->sweep_nx > 1 ? (f64)ix / (f64)(scene->sweep_nx - 1) : 0.0;
-            f64 fy = scene->sweep_ny > 1 ? (f64)iy / (f64)(scene->sweep_ny - 1) : 0.0;
-            z->power_W_cm3[i] = 0.01 * pow(50.0, fx);   // 0.01 .. 0.5 W/cm^3, log spaced
-            z->x_H2O[i] = 0.04 * fy;                    // dry .. ~saturated at 30 C
-        }
-    }
-    dbd_zones_fill_padding(z);
+    scene->op = dbd_operating_defaults();
+    dbd_scene_apply_operating(scene);
     dbd_zones_reset(z, &scene->sp);
-    dbd_zones_prepare_rates(z, &scene->model);
 
     for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) {
         s32 s = kin_find_species(&scene->model, dbd_plot_species[p].name);
@@ -120,7 +145,8 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
         scene->plot_y[p] = SoaPush(arena, f32, count);
         scene->plot_z[p] = SoaPush(arena, f32, count);
     }
-    if (!sweep) scene->series = push_array(arena, f64, (u64)DBD_SERIES_CAPACITY * (1 + DBD_PLOT_SPECIES));
+    scene->series = push_array(arena, f64, (u64)DBD_SERIES_CAPACITY * (1 + DBD_PLOT_SPECIES));
+    scene->series_every = 10;
     scene->next_csv_t = 1.0;
 }
 
@@ -146,7 +172,8 @@ internal void dbd_scene_write_csv(DbdScene *scene, PlatformAPI *api, Arena *scra
         for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) CSV(",%s", dbd_plot_species[p].name);
         CSV("\n");
         for (u32 r = 0; r < scene->series_count && len < cap - 512; ++r) {
-            f64 *row = scene->series + (u64)r * (1 + DBD_PLOT_SPECIES);
+            u32 slot = (scene->series_head + r) % DBD_SERIES_CAPACITY;   // oldest first
+            f64 *row = scene->series + (u64)slot * (1 + DBD_PLOT_SPECIES);
             CSV("%.4f", row[0]);
             for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) CSV(",%.6e", row[1 + p]);
             CSV("\n");
@@ -214,13 +241,20 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
     scene->last_step_wall_ms = (f64)(w1 - w0) * 1e-6;
     scene->wall_ms_total += scene->last_step_wall_ms;
 
-    if (scene->chained) {
-        // outlet sample every 10 ms of chemistry time
-        if (scene->master_steps % 10 == 0 && scene->series_count < DBD_SERIES_CAPACITY) {
-            f64 *row = scene->series + (u64)scene->series_count++ * (1 + DBD_PLOT_SPECIES);
-            row[0] = scene->t;
-            for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) row[1 + p] = dbd_ppm(z, scene->plot_index[p], z->count - 1);
+    // outlet (reactor) / corner (sweep) sample into the ring
+    if (scene->master_steps % scene->series_every == 0) {
+        u32 slot;
+        if (scene->series_count < DBD_SERIES_CAPACITY) {
+            slot = (scene->series_head + scene->series_count++) % DBD_SERIES_CAPACITY;
+        } else {
+            slot = scene->series_head;
+            scene->series_head = (scene->series_head + 1) % DBD_SERIES_CAPACITY;
         }
+        f64 *row = scene->series + (u64)slot * (1 + DBD_PLOT_SPECIES);
+        row[0] = scene->t;
+        for (u32 p = 0; p < DBD_PLOT_SPECIES; ++p) row[1 + p] = dbd_ppm(z, scene->plot_index[p], z->count - 1);
+    }
+    if (scene->chained) {
         if (scene->t >= scene->next_csv_t - 1e-9) {
             dbd_scene_write_csv(scene, &memory->platform, frame);
             scene->next_csv_t += 1.0;

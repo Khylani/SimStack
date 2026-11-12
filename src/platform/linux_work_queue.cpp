@@ -78,25 +78,28 @@ internal void *linux_worker_thread(void *param) {
     return 0;
 }
 
-// thread_count includes the producer, so thread_count - 1 workers are started,
-// pinned to CPUs 2, 4, ..., 14 (one per physical P-core, leaving core 0 to the
-// main thread). Pinning is skipped if the machine has fewer CPUs.
-internal void linux_make_work_queue(PlatformWorkQueue *queue, u32 thread_count) {
+// Starts `workers` threads for the queue; worker i is pinned to logical CPU
+// first_cpu + i * cpu_stride (skipped when that is not a P-core thread, i.e.
+// >= 16, or the machine is smaller). The high-priority queue uses CPUs
+// 2, 4, ..., 14 (one per physical P-core, core 0 left to the main thread);
+// the background queue's single thread sits on CPU 1, core 0's sibling.
+internal void linux_make_work_queue(PlatformWorkQueue *queue, u32 workers, s32 first_cpu, s32 cpu_stride) {
     memset(queue, 0, sizeof(*queue));
     sem_init(&queue->semaphore, 0, 0);
-    if (thread_count == 0) thread_count = 1;
-    queue->thread_count = thread_count;
+    queue->thread_count = workers + 1;
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    static LinuxWorkerStart starts[64];
-    for (u32 i = 0; i + 1 < thread_count && i < ArrayCount(starts); ++i) {
-        starts[i].queue = queue;
-        s32 cpu = (s32)(2 * (i + 1));
-        starts[i].cpu = (cpus >= 16 && cpu < 16) ? cpu : -1;
+    static LinuxWorkerStart starts[96];
+    static u32 used;
+    for (u32 i = 0; i < workers && used < ArrayCount(starts); ++i) {
+        LinuxWorkerStart *start = starts + used++;
+        start->queue = queue;
+        s32 cpu = first_cpu + (s32)i * cpu_stride;
+        start->cpu = (cpus >= 16 && cpu < 16) ? cpu : -1;
         pthread_t thread;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, Megabytes(1));
-        pthread_create(&thread, &attr, linux_worker_thread, &starts[i]);
+        pthread_attr_setstacksize(&attr, Megabytes(4));
+        pthread_create(&thread, &attr, linux_worker_thread, start);
         pthread_detach(thread);
         pthread_attr_destroy(&attr);
     }

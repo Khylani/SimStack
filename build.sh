@@ -37,7 +37,8 @@ ARCH_FLAGS="-mavx2 -mfma -mbmi2 -mf16c -ffp-contract=off"
 # No C++ runtime is linked: no exceptions, RTTI, new/delete or STL anywhere.
 COMMON="-std=c++20 -fno-exceptions -fno-rtti -fno-strict-aliasing -fvisibility=hidden -nostdlib++ \
         -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-missing-field-initializers \
-        -Wno-unused-variable -Wno-missing-braces -Wno-format-truncation -Isrc -Ibuild/gen -DSIM_SIMD=$SIMD $ARCH_FLAGS"
+        -Wno-unused-variable -Wno-missing-braces -Wno-format-truncation -Isrc -Ibuild/gen -DSIM_SIMD=$SIMD $ARCH_FLAGS \
+        -fno-threadsafe-statics -Ithird_party/imgui -Ithird_party/implot -DIMGUI_USER_CONFIG=\"ui/imconfig_simstack.h\""
 
 case "$MODE" in
     debug)   CFG="-O0 -g -DSIM_INTERNAL=1 -DSIM_SLOW=1" ;;
@@ -58,11 +59,20 @@ if [ ! -x build/kin_codegen ] || [ -n "$(find $CODEGEN_SRC -newer build/kin_code
 fi
 build/kin_codegen build/gen/air_mech_gen.h
 
+# --- Dear ImGui + ImPlot: one object, rebuilt only when it changes ---------------
+UI_OBJ=build/ui_third_party_${MODE}_simd${SIMD}_asan${ASAN}_$(basename $CXX).o
+if [ ! -f "$UI_OBJ" ] || [ -n "$(find third_party src/ui/ui_third_party.cpp src/ui/imconfig_simstack.h -newer "$UI_OBJ" 2>/dev/null)" ]; then
+    START=$(date +%s%N)
+    UI_OPT="-O2"; [ "$ASAN" = 1 ] && UI_OPT="-O1 -fsanitize=address,undefined -fno-omit-frame-pointer"
+    $CXX $COMMON $UI_OPT -w -fPIC -c src/ui/ui_third_party.cpp -o "$UI_OBJ"
+    echo "[build] $(basename $UI_OBJ)  $(( ($(date +%s%N) - START) / 1000000 )) ms"
+fi
+
 # --- sim module -----------------------------------------------------------------
 touch build/lock.tmp
 trap 'rm -f build/lock.tmp' EXIT
 START=$(date +%s%N)
-$CXX $COMMON $CFG -shared -fPIC src/sim/simstack.cpp -o build/simstack_sim.so.tmp -lm
+$CXX $COMMON $CFG -shared -fPIC -Wl,--no-undefined src/sim/simstack.cpp "$UI_OBJ" -o build/simstack_sim.so.tmp -lm -lc
 mv -f build/simstack_sim.so.tmp build/simstack_sim.so
 rm -f build/lock.tmp
 echo "[build] simstack_sim.so  $(( ($(date +%s%N) - START) / 1000000 )) ms"

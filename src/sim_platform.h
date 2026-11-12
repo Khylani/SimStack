@@ -96,11 +96,15 @@ struct SimMemory {
     void *frame_base;
     u64 scratch_size;     // begin_temp/end_temp scopes only
     void *scratch_base;
+    u64 ui_size;          // UI: fonts + the size-class heap Dear ImGui/ImPlot allocate from
+    void *ui_base;        // (reset wholesale on hot reload; nothing is malloc'd at runtime)
 
     SimConfig config;
     PlatformAPI platform;
-    PlatformWorkQueue *work_queue;   // threads = worker_count (including the caller)
+    PlatformWorkQueue *work_queue;   // high priority, P-cores: threads = worker_count (including the caller)
     u32 worker_count;
+    PlatformWorkQueue *background_queue;   // one thread: long jobs that overlap the platform's render/swap.
+                                           // The platform completes it before any hot reload.
     GpuAPI gpu;                      // gpu.available == 0 without --gpu or without the module
     DebugTable *debug;    // platform-owned profiler table (may be 0 when SIM_INTERNAL=0)
 };
@@ -129,16 +133,39 @@ enum SimKey {
     SimKey_Right,
     SimKey_Up,
     SimKey_Down,
+    // editing / UI keys
+    SimKey_Tab,
+    SimKey_Enter,
+    SimKey_Backspace,
+    SimKey_Delete,
+    SimKey_Home,
+    SimKey_End,
+    SimKey_PageUp,
+    SimKey_PageDown,
+    SimKey_Ctrl,
+    SimKey_Shift,
+    SimKey_Alt,
+    SimKey_A,
+    SimKey_C,
+    SimKey_V,
+    SimKey_X,
+    SimKey_Y,
+    SimKey_Z,
+    SimKey_F2,
     SimKey_Count,
 };
 
 struct SimInput {
     f32 dt_frame;             // wall-clock seconds since the last update (clamped by platform)
+    f32 last_work_ms;         // previous frame's CPU work (update + render submit), excluding the swap/vsync wait
     u32 window_width;
     u32 window_height;
 
     f32 mouse_x, mouse_y;     // pixels, origin top-left
+    f32 mouse_wheel;          // notches this frame, + = away from the user
+    b32 mouse_inside;
     SimButtonState mouse_buttons[3];
+    char text[64];            // UTF-8 typed this frame (NUL-terminated)
     SimButtonState keys[SimKey_Count];
 
     b32 headless;             // no renderer: platform drives with a fixed dt
@@ -158,11 +185,45 @@ struct RenderPointBatch {
 
 #define RENDER_MAX_BATCHES 32
 
+// UI: indexed triangles in window pixels (origin top-left), one texture per
+// command, clipped by a scissor rect. The vertex layout matches ImDrawVert.
+struct RenderUiVertex {
+    f32 x, y, u, v;
+    u32 rgba;
+};
+
+struct RenderUiCmd {
+    u32 idx_offset, elem_count;   // into ui_idx
+    u32 vtx_offset;               // added to every index of this command
+    u32 texture;                  // RenderTexOp id
+    f32 clip_x0, clip_y0, clip_x1, clip_y1;
+};
+
+enum RenderTexOpKind {
+    RenderTexOp_Upload,           // create or replace the whole texture (RGBA8)
+    RenderTexOp_Destroy,
+};
+
+struct RenderTexOp {
+    u32 kind, id, width, height;
+    const u8 *rgba;               // valid until the end of the frame
+};
+
+#define RENDER_MAX_TEX_OPS 16
+
 struct RenderCommands {
     v4 clear_color;
     m4 view_proj;
+    f32 scene_x, scene_y, scene_w, scene_h;   // 3D view rect in window pixels (w == 0: whole window)
     u32 batch_count;
     RenderPointBatch batches[RENDER_MAX_BATCHES];
+
+    u32 tex_op_count;
+    RenderTexOp tex_ops[RENDER_MAX_TEX_OPS];
+    u32 ui_vtx_count, ui_idx_count, ui_cmd_count;
+    const RenderUiVertex *ui_vtx;   // in the sim's frame arena
+    const u32 *ui_idx;
+    const RenderUiCmd *ui_cmds;
 };
 
 struct SimStats {
@@ -196,7 +257,14 @@ typedef SIM_UPDATE(sim_update_fn);
 #define SIM_ON_RELOAD(name) void name(SimMemory *memory)
 typedef SIM_ON_RELOAD(sim_on_reload_fn);
 
+// Called on the old module just before the platform unloads it for a hot
+// reload: the last chance to run code that lives in it (e.g. tear down
+// third-party contexts holding function pointers into it). Optional export.
+#define SIM_BEFORE_UNLOAD(name) void name(SimMemory *memory)
+typedef SIM_BEFORE_UNLOAD(sim_before_unload_fn);
+
 #define SIM_UPDATE_EXPORT_NAME "sim_update"
 #define SIM_ON_RELOAD_EXPORT_NAME "sim_on_reload"
+#define SIM_BEFORE_UNLOAD_EXPORT_NAME "sim_before_unload"
 
 #endif // SIM_PLATFORM_H

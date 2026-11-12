@@ -56,6 +56,11 @@ typedef GPU_ALLOC(gpu_alloc_fn);
 #define GPU_ARENA_USED(name) u64 name(void)
 typedef GPU_ARENA_USED(gpu_arena_used_fn);
 
+// Rolls the device arena back to empty (the sim calls it when it resets its
+// scene; every device pointer it held becomes invalid).
+#define GPU_ARENA_RESET(name) void name(void)
+typedef GPU_ARENA_RESET(gpu_arena_reset_fn);
+
 #define GPU_COPY_TO_DEVICE(name) s32 name(void *dst_device, const void *src_host, u64 size)
 typedef GPU_COPY_TO_DEVICE(gpu_copy_to_device_fn);
 
@@ -80,7 +85,7 @@ typedef GPU_KIN_SET_MECH(gpu_kin_set_mech_fn);
 typedef GPU_KIN_ADVANCE(gpu_kin_advance_fn);
 
 #define GPU_EXPORT_NAMES(X) \
-    X(gpu_init) X(gpu_error_string) X(gpu_alloc) X(gpu_arena_used) X(gpu_copy_to_device) X(gpu_copy_to_host) \
+    X(gpu_init) X(gpu_error_string) X(gpu_alloc) X(gpu_arena_used) X(gpu_arena_reset) X(gpu_copy_to_device) X(gpu_copy_to_host) \
     X(gpu_sync) X(gpu_step_points) X(gpu_kin_set_mech) X(gpu_kin_advance)
 
 // The table the platform fills from dlsym and hands to the sim.

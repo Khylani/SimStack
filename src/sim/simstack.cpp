@@ -5,12 +5,19 @@
 // every update) so a hot reload preserves all state in SimMemory. Threads and
 // the GPU come from the platform through SimMemory (work_queue, gpu).
 
+// Third-party headers first: base_types.h defines function-like macros
+// (Swap, Clamp, Minimum, ...) and `internal` that collide with their identifiers.
+#include "imgui.h"
+#include "imgui_internal.h"
+#include "implot.h"
+
 #define DEBUG_RECORD_BASE DEBUG_RECORDS_PER_TU
 #include "../sim_platform.h"
 
 #include "particles.cpp"
 #include "dbd.cpp"
 #include "dbd_scene.cpp"
+#include "../ui/ui_simstack.cpp"
 
 #define SIM_DT_FIXED (1.0 / 1000.0)     // 1 ms master step (f64; cast to f32 for the kernels)
 #define SIM_MAX_STEPS_PER_FRAME 64      // spiral-of-death guard
@@ -50,12 +57,25 @@ struct SimState {
     Particles particles;
     DbdScene *dbd;     // dbd / sweep scenes (in the permanent arena)
     Camera camera;
+    UiState ui;        // windowed runs only; its heap lives in SimMemory::ui_base
+    SimStats last_stats;
+
+    // Windowed chemistry runs as one background job per frame, overlapping the
+    // platform's render and swap; joined at the top of the next update.
+    struct {
+        SimMemory *memory;
+        f64 budget_ms;
+        b32 in_flight;
+        u32 steps;
+        f32 ms;
+    } chem_job;
 };
 
 // Resetting rolls the permanent arena back to just past the SimState header
 // and rebuilds the scene from the config.
 internal void sim_reset_scene(SimState *state, SimMemory *memory) {
     state->permanent.used = 0;
+    if (memory->gpu.available) memory->gpu.gpu_arena_reset();   // every device buffer belonged to the old scene
     state->step_count = 0;
     state->sim_time = 0.0;
     state->accumulator = 0.0;
@@ -110,7 +130,9 @@ internal void sim_fill_render(SimState *state, SimInput *input, RenderCommands *
     Camera *cam = &state->camera;
     f32 cp = cosf(cam->pitch), sp = sinf(cam->pitch);
     v3 eye = V3(cam->distance * cp * sinf(cam->yaw), cam->distance * sp, cam->distance * cp * cosf(cam->yaw));
-    f32 aspect = input->window_height ? (f32)input->window_width / (f32)input->window_height : 1.0f;
+    f32 vw = render->scene_w > 0 ? render->scene_w : (f32)input->window_width;
+    f32 vh = render->scene_h > 0 ? render->scene_h : (f32)input->window_height;
+    f32 aspect = vh > 0 ? vw / vh : 1.0f;
     m4 proj = m4_perspective(radians(50.0f), aspect, 0.05f, 100.0f);
     m4 view = m4_look_at(eye, V3(0.0f), V3(0.0f, 1.0f, 0.0f));
 
@@ -139,9 +161,64 @@ SIM_API SIM_ON_RELOAD(sim_on_reload) {
         state->reload_count += 1;
         // Re-derive anything that points into this module's image.
         if (state->dbd) dbd_scene_on_reload(state->dbd);
+        ui_on_reload(&state->ui);
+#if SIM_INTERNAL
+        // Profiler records keep pointers to their name / __FILE__ literals, which
+        // lived in the old module. Forget them; the next hit re-registers.
+        if (memory->debug) {
+            for (u32 i = DEBUG_RECORDS_PER_TU; i < 2 * DEBUG_RECORDS_PER_TU && i < DEBUG_MAX_RECORDS; ++i) {
+                DebugRecord *r = memory->debug->records + i;
+                r->name = 0;
+                r->file = 0;
+                r->last_hits = 0;
+                r->last_cycles = 0;
+            }
+        }
+#endif
         memory->platform.log("[sim] reloaded (count %u), step %llu preserved\n",
                              state->reload_count, (unsigned long long)state->step_count);
     }
+}
+
+SIM_API SIM_BEFORE_UNLOAD(sim_before_unload) {
+    if (memory->is_initialized) {
+        SimState *state = (SimState *)memory->permanent_base;
+        ui_before_unload(&state->ui);
+    }
+}
+
+#include "../ui/ui_panels.cpp"
+
+// Consumes the accumulator in master steps. budget_ms > 0 (windowed): stop
+// when the next step would overrun the wall budget and drop the remaining
+// accumulated time, so a slow solver slows simulated time, not the frame
+// rate. budget_ms == 0 (headless): the accumulator alone decides, so runs are
+// deterministic.
+internal u32 sim_run_chemistry(SimState *state, SimMemory *memory, f64 budget_ms) {
+    u32 steps = 0;
+    u64 start_ns = memory->platform.now_ns();
+    f64 per_step_ms = state->dbd->last_step_wall_ms;
+    while (state->accumulator >= state->dt_fixed && !state->dbd->finished) {
+        f64 spent_ms = (f64)(memory->platform.now_ns() - start_ns) * 1e-6;
+        if (budget_ms > 0.0 && steps > 0 && spent_ms + per_step_ms > budget_ms) {
+            state->accumulator = 0.0;
+            break;
+        }
+        dbd_scene_step(state->dbd, memory, &state->frame, state->dt_fixed);
+        per_step_ms = state->dbd->last_step_wall_ms;
+        state->accumulator -= state->dt_fixed;
+        state->step_count += 1;
+        state->sim_time += state->dt_fixed;
+        ++steps;
+    }
+    if (state->dbd->finished) state->accumulator = 0.0;
+    state->ui.chem_ms_frame = (f32)((f64)(memory->platform.now_ns() - start_ns) * 1e-6);
+    return steps;
+}
+
+internal PLATFORM_WORK_QUEUE_CALLBACK(sim_chemistry_job) {
+    SimState *state = (SimState *)data;
+    state->chem_job.steps = sim_run_chemistry(state, state->chem_job.memory, state->chem_job.budget_ms);
 }
 
 SIM_API SIM_UPDATE(sim_update) {
@@ -154,38 +231,52 @@ SIM_API SIM_UPDATE(sim_update) {
         sim_initialize(memory);
     }
     SimState *state = (SimState *)memory->permanent_base;
+    f32 join_ms = 0.0f;
+    if (state->chem_job.in_flight) {
+        u64 j0 = memory->platform.now_ns();
+        memory->platform.complete_all_work(memory->background_queue);
+        join_ms = (f32)((f64)(memory->platform.now_ns() - j0) * 1e-6);
+        state->chem_job.in_flight = 0;
+    }
+    state->ui.join_ms = join_ms;
     arena_clear(&state->frame);
 
-    sim_handle_input(state, input);
-    if (was_pressed(input->keys[SimKey_R])) {
-        sim_reset_scene(state, memory);
+    // Windowed: the UI runs first so its edits apply to this frame's steps.
+    b32 ui_on = !input->headless && input->window_width > 0;
+    b32 ui_keyboard = 0;
+    *render = RenderCommands{};
+    if (ui_on) {
+        ui_frame_begin(state, memory, input, render, &state->last_stats);
+        ui_keyboard = ImGui::GetIO().WantCaptureKeyboard;
+    }
+    if (!ui_keyboard) {
+        sim_handle_input(state, input);
+        if (was_pressed(input->keys[SimKey_R])) sim_reset_scene(state, memory);
     }
 
     // Fixed timestep: accumulate wall time, step deterministically.
     u32 steps = 0;
-    if (!state->paused) {
-        state->accumulator += (f64)input->dt_frame;
-        f64 max_accum = state->dt_fixed * SIM_MAX_STEPS_PER_FRAME;
+    b32 async_chem = ui_on && state->dbd && memory->background_queue;
+    b32 kick_chem = 0;
+    b32 step_once = ui_on && state->ui.step_once;
+    state->ui.step_once = 0;
+    if (!state->paused || step_once) {
+        f64 speed = (ui_on && state->dbd) ? (f64)state->ui.speed : 1.0;
+        if (ui_on && state->dbd && state->ui.max_speed) speed = 1e9;
+        state->accumulator += (f64)input->dt_frame * speed;
+        u32 max_steps = (ui_on && state->dbd) ? 1000000 : SIM_MAX_STEPS_PER_FRAME;   // windowed chemistry: wall budget instead
+        f64 max_accum = state->dt_fixed * max_steps;
         if (state->accumulator > max_accum) {
             state->accumulator = max_accum;
         }
+        if (step_once) state->accumulator = state->dt_fixed;
         TIMED_BLOCK("fixed_steps");
         if (state->dbd) {
-            // Chemistry master steps. Headless: deterministic (the accumulator
-            // alone decides). Windowed: also stop when the frame's wall budget
-            // is spent, so a slow solver slows sim time instead of the frame rate.
-            u64 start_ns = memory->platform.now_ns();
-            while (state->accumulator >= state->dt_fixed) {
-                if (!input->headless && steps > 0 &&
-                    (f64)(memory->platform.now_ns() - start_ns) * 1e-6 > SIM_CHEM_FRAME_BUDGET_MS) {
-                    state->accumulator = 0.0;
-                    break;
-                }
-                dbd_scene_step(state->dbd, memory, &state->frame, state->dt_fixed);
-                state->accumulator -= state->dt_fixed;
-                state->step_count += 1;
-                state->sim_time += state->dt_fixed;
-                ++steps;
+            if (async_chem) {
+                state->chem_job.budget_ms = ui_chemistry_budget(&state->ui, input);
+                kick_chem = 1;   // after the render data is filled, below
+            } else {
+                steps = sim_run_chemistry(state, memory, input->headless ? 0.0 : SIM_CHEM_FRAME_BUDGET_MS);
             }
         } else {
             ParticleParams params;
@@ -213,6 +304,8 @@ SIM_API SIM_UPDATE(sim_update) {
     }
 
     sim_fill_render(state, input, render);
+    if (ui_on) ui_frame_end(state, input, render);
+    if (async_chem) steps = state->chem_job.steps;   // last job's count, for the stats below
 
     stats->step_count = state->step_count;
     stats->steps_this_frame = steps;
@@ -234,4 +327,13 @@ SIM_API SIM_UPDATE(sim_update) {
     stats->scratch_size = memory->scratch_size;
     stats->paused = state->paused;
     stats->reload_count = state->reload_count;
+    state->last_stats = *stats;
+
+    // Everything the platform reads (render data, stats) is filled; the job only
+    // touches chemistry state and pushes temporaries above them in the frame arena.
+    if (kick_chem) {
+        state->chem_job.memory = memory;
+        state->chem_job.in_flight = 1;
+        memory->platform.add_work_entry(memory->background_queue, sim_chemistry_job, state);
+    }
 }

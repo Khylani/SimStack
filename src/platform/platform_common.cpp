@@ -10,9 +10,10 @@
 // address in internal builds so pointers are stable across runs (useful for
 // debugging and later for replay snapshots).
 #define PLATFORM_PERMANENT_SIZE Megabytes(256)
-#define PLATFORM_FRAME_SIZE     Megabytes(64)
+#define PLATFORM_FRAME_SIZE     Megabytes(128)
 #define PLATFORM_SCRATCH_SIZE   Megabytes(64)
-#define PLATFORM_TOTAL_SIZE     (PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE + PLATFORM_SCRATCH_SIZE)
+#define PLATFORM_UI_SIZE        Megabytes(256)
+#define PLATFORM_TOTAL_SIZE     (PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE + PLATFORM_SCRATCH_SIZE + PLATFORM_UI_SIZE)
 #if SIM_INTERNAL
 #define PLATFORM_MEMORY_BASE_ADDRESS ((void *)0x200000000000ull)
 #else
@@ -155,13 +156,13 @@ internal void platform_print_debug_table(DebugTable *table, u64 frames, f64 cycl
     u32 n = 0;
     for (u32 i = 0; i < DEBUG_MAX_RECORDS; ++i) {
         DebugRecord *r = table->records + i;
-        u64 cycles = use_totals ? r->total_cycles : r->cycles;
+        u64 cycles = use_totals ? r->total_cycles : r->window_cycles;
         if (r->name && cycles) {
             // insertion sort by cycles, descending
             u32 j = n++;
             while (j > 0) {
                 DebugRecord *prev = table->records + order[j - 1];
-                u64 prev_cycles = use_totals ? prev->total_cycles : prev->cycles;
+                u64 prev_cycles = use_totals ? prev->total_cycles : prev->window_cycles;
                 if (prev_cycles >= cycles) break;
                 order[j] = order[j - 1];
                 --j;
@@ -172,8 +173,8 @@ internal void platform_print_debug_table(DebugTable *table, u64 frames, f64 cycl
     printf("  %-28s %10s %12s %10s\n", "timed block", "hits/frame", "cycles/frame", "ms/frame");
     for (u32 k = 0; k < n; ++k) {
         DebugRecord *r = table->records + order[k];
-        u64 cycles = use_totals ? r->total_cycles : r->cycles;
-        u64 hits = use_totals ? r->total_hits : r->hit_count;
+        u64 cycles = use_totals ? r->total_cycles : r->window_cycles;
+        u64 hits = use_totals ? r->total_hits : r->window_hits;
         f64 cpf = (f64)cycles / (f64)frames;
         printf("  %-28s %10.2f %12.0f %10.3f   (%s:%u)\n", r->name, (f64)hits / (f64)frames, cpf,
                cycles_per_ms > 0 ? cpf / cycles_per_ms : 0.0, r->file, r->line);

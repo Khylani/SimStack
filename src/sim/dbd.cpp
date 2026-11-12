@@ -266,7 +266,7 @@ struct DbdGpu {
 internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 duration, u32 precision = DbdPrecision_F64) {
     TIMED_FUNCTION();
     if (!g->d_block || g->capacity < z->block_count) {
-        g->d_block = (f64 *)gpu->gpu_alloc(sizeof(f64) * z->block_count);   // grows the bump arena; fine for a few resizes
+        g->d_block = (f64 *)gpu->gpu_alloc(sizeof(f64) * z->block_count);   // device arena; reset with the scene
         g->capacity = g->d_block ? z->block_count : 0;
         if (!g->d_block) return 2;   // cudaErrorMemoryAllocation
     }

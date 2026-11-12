@@ -123,6 +123,11 @@ GPU_API GPU_ARENA_USED(gpu_arena_used) {
     return g_gpu_arena.used;
 }
 
+GPU_API GPU_ARENA_RESET(gpu_arena_reset) {
+    cudaDeviceSynchronize();
+    g_gpu_arena.used = 0;
+}
+
 GPU_API GPU_COPY_TO_DEVICE(gpu_copy_to_device) {
     return (s32)cudaMemcpy(dst_device, src_host, size, cudaMemcpyHostToDevice);
 }
