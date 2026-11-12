@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Simstack unity build (Linux, clang or gcc).
 #
-#   ./build.sh [debug|release|ship] [--simd=0] [--asan] [--sim-only] [--cuda]
+#   ./build.sh [debug|release|ship] [--simd=0] [--asan] [--sim-only] [--cuda] [--tests]
 #
 # Produces build/simstack (platform exe) and build/simstack_sim.so (hot-reloadable
 # sim module). Two compiler invocations. build/lock.tmp exists while the sim
@@ -14,6 +14,7 @@ SIMD=1
 ASAN=0
 SIM_ONLY=0
 CUDA=0
+TESTS=0
 for arg in "$@"; do
     case "$arg" in
         debug|release|ship) MODE=$arg ;;
@@ -22,6 +23,7 @@ for arg in "$@"; do
         --asan) ASAN=1 ;;
         --sim-only) SIM_ONLY=1 ;;
         --cuda) CUDA=1 ;;
+        --tests) TESTS=1 ;;
         *) echo "unknown argument: $arg"; exit 1 ;;
     esac
 done
@@ -70,6 +72,13 @@ if [ "$CUDA" = 1 ]; then
     echo "[build] nvcc=$NVCC"
     $NVCC -arch=sm_86 -O3 -lineinfo --shared -Xcompiler -fPIC -Isrc src/gpu/kernels.cu -o build/simstack_gpu.so
     echo "[build] simstack_gpu.so"
+fi
+
+# --- tests (kinetics solver; no window, no sim module) --------------------------
+if [ "$TESTS" = 1 ]; then
+    START=$(date +%s%N)
+    $CXX $COMMON $CFG src/tests/test_kinetics.cpp -o build/simstack_tests -lm -ldl
+    echo "[build] simstack_tests   $(( ($(date +%s%N) - START) / 1000000 )) ms"
 fi
 
 # --- platform exe -----------------------------------------------------------------

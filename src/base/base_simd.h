@@ -138,4 +138,116 @@ SIM_FORCE_INLINE f32x8 &operator*=(f32x8 &a, f32x8 b) { a = a * b; return a; }
 SIM_FORCE_INLINE f32x8 f32x8_clamp(f32x8 x, f32x8 lo, f32x8 hi) { return f32x8_min(f32x8_max(x, lo), hi); }
 SIM_FORCE_INLINE f32x8 f32x8_lerp(f32x8 a, f32x8 t, f32x8 b) { return fmadd(t, b - a, a); }
 
+
+// ----------------------------------------------------------------------------
+// f64x4: four f64 lanes (AVX2) for the stiff kinetics solver, plus its mask
+// type b64x4. Exposes the lane_* vocabulary of base_lane.h so templates
+// written for V = f64 also compile for V = f64x4 with identical arithmetic.
+
+#include "base_lane.h"
+
+#if SIM_SIMD
+
+struct f64x4 { __m256d v; };
+struct b64x4 { __m256d v; };   // all-ones / all-zeros per lane
+
+SIM_FORCE_INLINE f64x4 lane_splat(f64x4 *, f64 a) { f64x4 r; r.v = _mm256_set1_pd(a); return r; }
+SIM_FORCE_INLINE f64x4 lane_load(const f64 *p, f64x4 *) { f64x4 r; r.v = _mm256_load_pd(p); return r; }
+SIM_FORCE_INLINE void  lane_store(f64 *p, f64x4 a) { _mm256_store_pd(p, a.v); }
+
+SIM_FORCE_INLINE f64x4 operator+(f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_add_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE f64x4 operator-(f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_sub_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE f64x4 operator*(f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_mul_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE f64x4 operator/(f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_div_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE f64x4 operator-(f64x4 a) { f64x4 r; r.v = _mm256_xor_pd(a.v, _mm256_set1_pd(-0.0)); return r; }
+
+SIM_FORCE_INLINE f64x4 lane_fmadd(f64x4 a, f64x4 b, f64x4 c) { f64x4 r; r.v = _mm256_fmadd_pd(a.v, b.v, c.v); return r; }
+SIM_FORCE_INLINE f64x4 lane_fnmadd(f64x4 a, f64x4 b, f64x4 c) { f64x4 r; r.v = _mm256_fnmadd_pd(a.v, b.v, c.v); return r; }
+// _mm256_min_pd(a, b) returns b unless a < b: same as the scalar "a < b ? a : b".
+SIM_FORCE_INLINE f64x4 lane_min(f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_min_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE f64x4 lane_max(f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_max_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE f64x4 lane_abs(f64x4 a) {
+    // scalar path is "a < 0 ? -a : a", which keeps -0.0; match that rather than clearing the sign bit
+    __m256d neg = _mm256_cmp_pd(a.v, _mm256_setzero_pd(), _CMP_LT_OQ);
+    f64x4 r; r.v = _mm256_blendv_pd(a.v, _mm256_xor_pd(a.v, _mm256_set1_pd(-0.0)), neg); return r;
+}
+SIM_FORCE_INLINE f64x4 lane_sqrt(f64x4 a) { f64x4 r; r.v = _mm256_sqrt_pd(a.v); return r; }
+
+SIM_FORCE_INLINE b64x4 lane_lt(f64x4 a, f64x4 b) { b64x4 r; r.v = _mm256_cmp_pd(a.v, b.v, _CMP_LT_OQ); return r; }
+SIM_FORCE_INLINE b64x4 lane_le(f64x4 a, f64x4 b) { b64x4 r; r.v = _mm256_cmp_pd(a.v, b.v, _CMP_LE_OQ); return r; }
+SIM_FORCE_INLINE b64x4 lane_gt(f64x4 a, f64x4 b) { b64x4 r; r.v = _mm256_cmp_pd(a.v, b.v, _CMP_GT_OQ); return r; }
+SIM_FORCE_INLINE b64x4 lane_ge(f64x4 a, f64x4 b) { b64x4 r; r.v = _mm256_cmp_pd(a.v, b.v, _CMP_GE_OQ); return r; }
+SIM_FORCE_INLINE b64x4 lane_eq(f64x4 a, f64x4 b) { b64x4 r; r.v = _mm256_cmp_pd(a.v, b.v, _CMP_EQ_OQ); return r; }
+SIM_FORCE_INLINE b64x4 lane_and(b64x4 a, b64x4 b) { b64x4 r; r.v = _mm256_and_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE b64x4 lane_or(b64x4 a, b64x4 b) { b64x4 r; r.v = _mm256_or_pd(a.v, b.v); return r; }
+SIM_FORCE_INLINE b64x4 lane_not(b64x4 a) {
+    b64x4 r; r.v = _mm256_xor_pd(a.v, _mm256_castsi256_pd(_mm256_set1_epi64x(-1))); return r;
+}
+SIM_FORCE_INLINE b32 lane_any(b64x4 a) { return _mm256_movemask_pd(a.v) != 0; }
+SIM_FORCE_INLINE b32 lane_all(b64x4 a) { return _mm256_movemask_pd(a.v) == 0xF; }
+SIM_FORCE_INLINE b64x4 lane_mask_splat(b64x4 *, bool a) {
+    b64x4 r; r.v = _mm256_castsi256_pd(_mm256_set1_epi64x(a ? -1 : 0)); return r;
+}
+// m ? a : b
+SIM_FORCE_INLINE f64x4 lane_select(b64x4 m, f64x4 a, f64x4 b) { f64x4 r; r.v = _mm256_blendv_pd(b.v, a.v, m.v); return r; }
+SIM_FORCE_INLINE b64x4 lane_select_mask(b64x4 m, b64x4 a, b64x4 b) { b64x4 r; r.v = _mm256_blendv_pd(b.v, a.v, m.v); return r; }
+SIM_FORCE_INLINE b64x4 lane_is_finite(f64x4 a) { f64x4 d = a - a; return lane_eq(d, d); }
+
+SIM_FORCE_INLINE f64 lane_get(f64x4 a, u32 i) { SIM_ALIGNED(32) f64 t[4]; _mm256_store_pd(t, a.v); return t[i]; }
+SIM_FORCE_INLINE void lane_set(f64x4 *a, u32 i, f64 x) {
+    SIM_ALIGNED(32) f64 t[4]; _mm256_store_pd(t, a->v); t[i] = x; a->v = _mm256_load_pd(t);
+}
+
+#else // ---------------------------------------------------------- scalar fallback
+
+struct f64x4 { f64 e[4]; };
+struct b64x4 { bool e[4]; };
+
+#define F64X4_OP(expr) f64x4 r; for (int i = 0; i < 4; ++i) { r.e[i] = (expr); } return r
+#define B64X4_OP(expr) b64x4 r; for (int i = 0; i < 4; ++i) { r.e[i] = (expr); } return r
+
+SIM_FORCE_INLINE f64x4 lane_splat(f64x4 *, f64 a) { F64X4_OP(a); }
+SIM_FORCE_INLINE f64x4 lane_load(const f64 *p, f64x4 *) { F64X4_OP(p[i]); }
+SIM_FORCE_INLINE void  lane_store(f64 *p, f64x4 a) { for (int i = 0; i < 4; ++i) p[i] = a.e[i]; }
+
+SIM_FORCE_INLINE f64x4 operator+(f64x4 a, f64x4 b) { F64X4_OP(a.e[i] + b.e[i]); }
+SIM_FORCE_INLINE f64x4 operator-(f64x4 a, f64x4 b) { F64X4_OP(a.e[i] - b.e[i]); }
+SIM_FORCE_INLINE f64x4 operator*(f64x4 a, f64x4 b) { F64X4_OP(a.e[i] * b.e[i]); }
+SIM_FORCE_INLINE f64x4 operator/(f64x4 a, f64x4 b) { F64X4_OP(a.e[i] / b.e[i]); }
+SIM_FORCE_INLINE f64x4 operator-(f64x4 a) { F64X4_OP(-a.e[i]); }
+
+SIM_FORCE_INLINE f64x4 lane_fmadd(f64x4 a, f64x4 b, f64x4 c) { F64X4_OP(lane_fmadd(a.e[i], b.e[i], c.e[i])); }
+SIM_FORCE_INLINE f64x4 lane_fnmadd(f64x4 a, f64x4 b, f64x4 c) { F64X4_OP(lane_fnmadd(a.e[i], b.e[i], c.e[i])); }
+SIM_FORCE_INLINE f64x4 lane_min(f64x4 a, f64x4 b) { F64X4_OP(lane_min(a.e[i], b.e[i])); }
+SIM_FORCE_INLINE f64x4 lane_max(f64x4 a, f64x4 b) { F64X4_OP(lane_max(a.e[i], b.e[i])); }
+SIM_FORCE_INLINE f64x4 lane_abs(f64x4 a) { F64X4_OP(lane_abs(a.e[i])); }
+SIM_FORCE_INLINE f64x4 lane_sqrt(f64x4 a) { F64X4_OP(lane_sqrt(a.e[i])); }
+
+SIM_FORCE_INLINE b64x4 lane_lt(f64x4 a, f64x4 b) { B64X4_OP(a.e[i] < b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_le(f64x4 a, f64x4 b) { B64X4_OP(a.e[i] <= b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_gt(f64x4 a, f64x4 b) { B64X4_OP(a.e[i] > b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_ge(f64x4 a, f64x4 b) { B64X4_OP(a.e[i] >= b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_eq(f64x4 a, f64x4 b) { B64X4_OP(a.e[i] == b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_and(b64x4 a, b64x4 b) { B64X4_OP(a.e[i] && b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_or(b64x4 a, b64x4 b) { B64X4_OP(a.e[i] || b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_not(b64x4 a) { B64X4_OP(!a.e[i]); }
+SIM_FORCE_INLINE b32 lane_any(b64x4 a) { return a.e[0] || a.e[1] || a.e[2] || a.e[3]; }
+SIM_FORCE_INLINE b32 lane_all(b64x4 a) { return a.e[0] && a.e[1] && a.e[2] && a.e[3]; }
+SIM_FORCE_INLINE b64x4 lane_mask_splat(b64x4 *, bool a) { B64X4_OP(a); }
+SIM_FORCE_INLINE f64x4 lane_select(b64x4 m, f64x4 a, f64x4 b) { F64X4_OP(m.e[i] ? a.e[i] : b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_select_mask(b64x4 m, b64x4 a, b64x4 b) { B64X4_OP(m.e[i] ? a.e[i] : b.e[i]); }
+SIM_FORCE_INLINE b64x4 lane_is_finite(f64x4 a) { B64X4_OP(lane_is_finite(a.e[i])); }
+
+SIM_FORCE_INLINE f64 lane_get(f64x4 a, u32 i) { return a.e[i]; }
+SIM_FORCE_INLINE void lane_set(f64x4 *a, u32 i, f64 x) { a->e[i] = x; }
+
+#undef F64X4_OP
+#undef B64X4_OP
+#endif // SIM_SIMD
+
+template <> struct LaneTraits<f64x4> {
+    typedef b64x4 Mask;
+    enum { width = 4 };
+};
+
 #endif // BASE_SIMD_H
