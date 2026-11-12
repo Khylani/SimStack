@@ -311,7 +311,7 @@ internal void dbd_flow_exchange(DbdZones *z, AirSpecies *sp, f64 residence_s, f6
 internal KinControl dbd_default_control() {
     KinControl c = {};
     c.rtol = 1e-3;          // products stay within ~1e-5 of a 1e-9 reference (see --bench tolerance study)
-    c.atol = 1e4;           // cm^-3: ~4e-16 mole fraction, far below anything that matters
+    c.atol = 1e8;           // cm^-3 (~4 ppt): outlet products unchanged to 5 digits vs 1e4, 1.8x fewer steps (see docs)
     c.h_min = 1e-14;
     c.h_max = 0.0;
     c.h_start = 1e-9;       // after a pulse the radical decay starts on ns-us scales

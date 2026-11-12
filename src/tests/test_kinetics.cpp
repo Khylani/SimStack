@@ -440,7 +440,8 @@ internal void bench_tolerance(KinModel *model, AirSpecies *sp, AirSourceModel *s
     struct Run { KinMethodId method; f64 rtol, atol; } runs[] = {
         { KinMethod_Rodas3, 1e-9, 1e-3 },   // reference
         { KinMethod_Rodas3, 1e-5, 1e2 }, { KinMethod_Rodas3, 1e-4, 1e2 }, { KinMethod_Rodas3, 1e-3, 1e2 },
-        { KinMethod_Rodas3, 1e-3, 1e4 }, { KinMethod_Rodas3, 1e-2, 1e4 },
+        { KinMethod_Rodas3, 1e-3, 1e4 }, { KinMethod_Rodas3, 1e-3, 1e6 }, { KinMethod_Rodas3, 1e-3, 1e8 },
+        { KinMethod_Rodas3, 1e-3, 1e9 }, { KinMethod_Rodas3, 1e-2, 1e4 },
         { KinMethod_Ros3, 1e-4, 1e2 }, { KinMethod_Ros3, 1e-3, 1e4 },
         { KinMethod_Ros2, 1e-3, 1e4 },
     };
