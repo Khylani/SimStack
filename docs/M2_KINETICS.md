@@ -8,7 +8,14 @@ on CUDA (one zone per thread), and the results are bit-identical across all of t
 
 Not in this part (still M2): the ChemPlasKin/Cantera reference solver (`dbd_ref`), the
 reduction tables generated from it, and the LoKI-B++ cross-checks. Until those exist, the
-discharge is represented by G-values (radicals per 100 eV), which are tunable surrogates.
+discharge is represented by G-values per 100 eV, which are tunable surrogates:
+- 1.5 O₂ dissociations, half of them through the O + O(¹D) channel
+- 1.5 N₂(A), including cascade from the higher triplets
+- 0.4 N₂ dissociations to N + N(²D)
+- 0.3 H₂O dissociations at 2 % water
+
+The metastables' fates are quasi-steady and use literature rate constants (Herron 1999,
+Kossyi 1992, JPL 19-5). N(²D) + O₂ → NO + O is the main NO source at room temperature.
 
 ## What runs
 
@@ -29,9 +36,11 @@ at steady state (t ≥ 3 s):
 
 | O3 | NO | NO2 | N2O5 | HNO2 | HNO3 | H2O2 | N2O |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2286 ppm | 0.08 | 1.9 | 3.3 | 0.11 | 35.6 | 15 | 152 |
+| 2270 ppm | 0.11 | 5.5 | 17.4 | 0.16 | 84.7 | 9.1 | 139 |
 
-That is about 77 g O3/kWh, inside the 50–100 g/kWh range of air-fed ozonizers. The sweep
+That is about 77 g O3/kWh, inside the 50–100 g/kWh range of air-fed ozonizers. (With the
+excited-state channels below, nitrogen oxides are 2–5× higher than the ground-state-only
+mechanism gave: 2286 ppm O3, 3.3 N2O5, 35.6 HNO3.) The sweep
 reproduces the known trends: humidity roughly halves O3 at 1000 J/L and drives HNO3/H2O2 up,
 dry air makes no HNO3, and ozone is sublinear in energy. The outlet converges with zone
 count toward the plug-flow limit: O3 is 2268 / 2280 / 2286 / 2289 ppm at 16 / 32 / 64 /
@@ -82,7 +91,7 @@ is reset wholesale. The GPU device arena is reset with the scene.
 | `src/sim/kinetics/kin_mech.h` | `KinMech`: flat reaction tables + symbolic sparse LU (POD, copied to CUDA constant memory) |
 | `src/sim/kinetics/kin_solver.h` | Rosenbrock integrator templated on lane type and kernel policy (`Ops`), delta formulation, local-time pulse driver |
 | `src/sim/kinetics/kin_build.cpp` | Equation parser (`"O + O2 + M -> O3 + M"`), element-balance check, symbolic LU, rate laws |
-| `src/sim/kinetics/air_mech.cpp` | 17-species / 40-reaction humid-air afterglow mechanism (JPL/IUPAC), G-value source, feed gas |
+| `src/sim/kinetics/air_mech.cpp` | 17-species / 41-reaction humid-air afterglow mechanism (JPL/IUPAC), electron-impact source with quasi-steady N(²D) / N₂(A) / O(¹D) chemistry, feed gas |
 | `src/tools/kin_codegen.cpp` | Metaprogram: emits straight-line kernels for the mechanism into `build/gen/air_mech_gen.h` |
 | `src/sim/dbd_lanes.h` | `dbd_advance_group<V, Ops, Delta>`: loads lanes from the SoA block, advances, stores (shared CPU/CUDA) |
 | `src/sim/dbd.cpp` | `DbdZones` SoA block, rate/source/pulse scheduling, threaded CPU advance, GPU advance, plug flow |
@@ -147,8 +156,8 @@ Reference hashes for `--scene dbd --headless 30` hold for any `--threads`, for C
 
 | Lanes | Hash |
 | --- | --- |
-| f32 (default) | `ef492929d2110e75` |
-| `--precision f64` | `ef15ffac690ff7b1` |
+| f32 (default) | `3d1a11fb2aace04a` |
+| `--precision f64` | `c61a1a9cc5369ab6` |
 
 ## Performance (i9-12900KF, RTX 3060 12 GB)
 
@@ -278,14 +287,23 @@ CUDA is the better choice for large pulsed sweeps.
 
 ## Known limits of the chemistry
 
-- Neutral afterglow only: no ions, no O(¹D) / N₂(A) / N₂(v) kinetics, no surface chemistry.
-  Their net effect is folded into the G-values.
-- Fixed gas temperature per zone, so no thermal O3 destruction and no NOx-mode
-  ("discharge poisoning") switch.
+- No ions, no N₂(v) vibrational kinetics, no surface chemistry. Above about 400 K, NO from
+  N₂(v) + O → NO + N and the thermal ozone/NOx switch it drives are missing.
+- **Metastables are quasi-steady.** N(²D), N₂(A) and O(¹D) live 2–50 ns at 1 atm, so each
+  pulse distributes them over their partners in proportion to k·[partner].
+  - A run with them as explicit species gave the same outlet to 2e-4 and 1.8× the solver
+    steps.
+  - Before this, the mechanism made NO only from ground-state N, so NOx cost 450–6650 MJ/mol.
+- **N(⁴S) fate:** it ends mostly as N₂O via N + NO₂ → N₂O + O (JPL's single product
+  channel). N₂O at about 5 % of O₃ is probably high, and the branching of N + NO₂ is
+  uncertain.
+- Gas temperature is fixed per zone (no heating feedback). Thermal O₃ decomposition
+  (O₃ + M) is included.
 - Third-body efficiencies are those of air; fall-off uses the JPL form with Fc = 0.6.
 - Plug flow is a chain of stirred zones (64 CSTRs by default).
-- f32 lanes drift ~4e-8 of each element per simulated second. Use `--precision f64` for
-  multi-hour runs.
+- f32 lanes drift up to ~2e-7 of an element per simulated second (H in dry-ish air, where
+  O(¹D) + H₂O and N₂(A) + H₂O turn OH over fast relative to the H inventory; N and O stay
+  ~1e-9). Use `--precision f64` for multi-hour runs.
 
 ## Next steps
 
@@ -293,5 +311,7 @@ CUDA is the better choice for large pulsed sweeps.
    operating point live.
 2. Gas → liquid transfer from the reactor outlet: the first NFT coupling (M3).
 3. `dbd_ref` (ChemPlasKin) and `tools/reduce_dbd` tables replacing the G-values.
+4. N₂(v) with a vibrational temperature and gas heating, for the NOx mode of hot or poorly
+   cooled discharges.
 4. Warp-per-zone CUDA kernel for large sweeps.
 5. Windows: `build.bat` does not build the UI object, the codegen step or the tests yet.

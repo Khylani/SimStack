@@ -330,8 +330,11 @@ internal void test_f32(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
         CHECK(worst < 1e-2, "f32 product error %.3e", worst);
         // f32 floor: each master step rounds the increments to f32 (~6e-8 of the
         // increment), so drift grows ~linearly in time: bound it per simulated second.
+        // The worst element is H in the driest humid zone: O(1D) + H2O and N2(A) +
+        // H2O turn over OH / H fast relative to a small H inventory (N and O stay
+        // ~1e-9 /s; f64 lanes conserve to ~1e-11).
         f64 drift_per_s = drift / (ms * 1e-3);
-        CHECK(drift_per_s < 1e-7, "f32 atom drift %.3e per s", drift_per_s);
+        CHECK(drift_per_s < 3e-7, "f32 atom drift %.3e per s", drift_per_s);
         for (u32 i = 0; i < 16; ++i) CHECK(a.failed[i] == 0.0, "f32 zone %u failed", i);
     }
 }
@@ -381,9 +384,12 @@ internal void test_ozone_yield(KinModel *model, AirSpecies *sp, AirSourceModel *
         dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, src, DbdDischarge_Pulsed, &method, &ctl, step * 1e-3, (step + 1) * 1e-3);
     }
     f64 energy = 0.01 * 10e-3;   // J/cm^3
-    // Odd oxygen made: O from O2 dissociation, plus one O per N atom
-    // (N + O2 -> NO + O, N + NO -> N2 + O). Dry air, so x_O2/x_N2 are the reference values.
-    f64 o_made = (src->g_O_per_100eV + src->g_N_per_100eV) * energy * EV_PER_JOULE * 0.01;
+    // Odd oxygen made: 2 O per O2 dissociation (O(1D) is quenched to O), one O
+    // per N atom (N(2D) + O2 -> NO + O, N + NO -> N2 + O), and N2(A) quenched by
+    // O2: 2 O (k 2.5e-12), 0 (1.3e-12), 1 via N2O + O (7.8e-14), so 1.31 per
+    // N2(A). Dry air, so x_O2/x_N2 are the reference values.
+    f64 per_n2a = (2.0 * 2.5e-12 + 7.8e-14) / (2.5e-12 + 1.3e-12 + 7.8e-14);
+    f64 o_made = (2.0 * src->g_O2_diss + per_n2a * src->g_N2A + 2.0 * src->g_N2_diss) * energy * EV_PER_JOULE * 0.01;
     f64 ratio = z.y[sp->O3 * z.padded] / o_made;
     printf("[ozone] dry air, 0.1 mJ/cm^3: O3 / (O + N produced) = %.3f (%.0f pulses, %.0f steps)\n", ratio, z.pulses[0], z.steps[0]);
     CHECK(ratio > 0.8 && ratio < 1.0, "ozone yield %.3f", ratio);
@@ -806,6 +812,31 @@ internal void test_paw() {
     CHECK(k->acc.nitrite_frac_last > 0.05 && k->acc.nitrite_frac_last < 0.20, "nitrite share %.3f outside the design's 5-20 %%",
           k->acc.nitrite_frac_last);
     CHECK(k->acc.batches >= 2 && k->acc.delivered_L > 0.0, "preset made no batches");
+
+    // 6. gas from the M2 kinetics (one module's annulus): N books still close with the
+    //    insoluble NO / N2O vented, and the batch runs on the kinetics' yields
+    f64 design_batch_h = k->acc.last_batch_h;   // (the arena is reused below)
+    {
+        arena.used = 0;
+        NftParams kp = nft_preset(NftPreset_PawSkid);
+        kp.rails = 8;
+        kp.paw.gas_source = PawGas_Kinetics;
+        NftSystem *ks = push_struct(&arena, NftSystem);
+        nft_init(ks, &arena, kp);
+        PawSkid *kk = &ks->paw;
+        while (kk->state == PawState_Treat && ks->t < 4.0 * 86400.0) nft_run<f32x8>(ks, 60);
+        f64 n_in = kk->acc.nox_N_mmol;
+        f64 n_out = kk->drum.no3_mmol + kk->drum.no2_mmol + kk->bucket.no3_mmol + kk->bucket.no2_mmol + kk->acc.vented_N_mmol +
+                    kk->acc.delivered_N_mmol;
+        const PawGas &g = kk->gas;
+        printf("[paw] kinetics gas, module at %.2f W/cm3, %.0f K, %.2f s: O3 %.0f ppm (%.0f g/kWh), soluble N at %.0f MJ/mol, "
+               "N2O %.0f ppm; batch %.1f h (design estimate %.0f MJ/mol: %.1f h); N books %.1e\n",
+               g.power_W_cm3, g.T_K, g.residence_s, g.x[PawS_O3] * 1e6, g.o3_g_kWh, g.nox_MJ_mol, g.x[PawS_N2O] * 1e6,
+               kk->acc.last_batch_h, kp.paw.nox_MJ_mol, design_batch_h, (n_in - n_out) / n_in);
+        CHECK(g.valid && g.nox_MJ_mol > 5.0 && g.nox_MJ_mol < 1000.0, "kinetics NOx cost %.1f", g.nox_MJ_mol);
+        CHECK(kk->acc.batches >= 1.0, "kinetics-sourced batch did not finish");
+        CHECK(fabs(n_in - n_out) / n_in < 1e-12, "kinetics-sourced N books %.3e", (n_in - n_out) / n_in);
+    }
 }
 
 internal void test_hydraulics() {

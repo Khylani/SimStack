@@ -30,8 +30,13 @@
 global const char *const paw_pipe_names[2] = { "Sch 10 pipe, 2.8 mm gap", "Sch 5 pipe, 3.9 mm gap" };
 global const f32 paw_gap_mm[2] = { 2.8f, 3.9f };
 
+enum PawGasSource { PawGas_Design, PawGas_Kinetics, PawGas_Count };
+global const char *const paw_gas_source_names[PawGas_Count] = { "design estimate (SEI regime + MJ/mol)", "M2 air kinetics (module annulus)" };
+
 struct PawParams {
     b32 enabled;
+    u32 gas_source;             // PawGasSource
+    f32 gas_dT_K;               // annulus gas above the drum water (kinetics source)
     // modules
     u32 modules;
     u32 pipe_sch5;              // 0: Sch 10 (2.8 mm gap), 1: Sch 5 (3.9 mm)
@@ -69,6 +74,8 @@ struct PawParams {
 internal PawParams paw_default_params() {
     PawParams p = {};
     p.enabled = 0;
+    p.gas_source = PawGas_Design;
+    p.gas_dT_K = 30.0f;
     p.modules = 3;
     p.pipe_sch5 = 0;
     p.active_mm = 200.0f;
@@ -156,6 +163,91 @@ internal PawElectrical paw_electrical(const PawParams *p) {
 internal f64 paw_nox_regime(f64 sei_kJ_L) {
     f64 x = Clamp((sei_kJ_L - 0.3) / 0.7, 0.0, 1.0);
     return x * x * (3.0 - 2.0 * x);
+}
+
+// --- gas from the M2 kinetics -----------------------------------------------------------
+//
+// One module's annulus as a plug-flow reactor (= a batch reactor run for the
+// residence time) at the module's average power density, dry feed, gas
+// temperature = drum water + gas_dT_K, pulsed at 2 f. Run on demand (init,
+// preset load, "Run chemistry"), not per window: the operating point changes
+// only when the drive, flow or water temperature does.
+
+enum PawGasSpecies { PawS_O3, PawS_NO, PawS_NO2, PawS_NO3, PawS_N2O5, PawS_HNO2, PawS_HNO3, PawS_N2O, PawS_Count };
+global const char *const paw_gas_names[PawS_Count] = { "O3", "NO", "NO2", "NO3", "N2O5", "HNO2", "HNO3", "N2O" };
+global const f64 paw_gas_n_atoms[PawS_Count] = { 0, 1, 1, 1, 2, 1, 1, 2 };
+
+struct PawGas {
+    b32 valid;
+    f64 T_K, power_W_cm3, residence_s, freq_Hz;   // the operating point it was computed at
+    f64 P_avg_W, air_L_min;                       // ... and what that came from (stale when they change)
+    f64 x[PawS_Count];                            // outlet mole fractions
+    f64 nox_MJ_mol;                               // plasma energy per mol of soluble N (NO2, NO3, N2O5, HNO2, HNO3)
+    f64 o3_g_kWh;
+};
+
+struct PawChem {                                  // kinetics workspace, allocated once (nft_init)
+    KinModel *model;
+    AirSpecies sp;
+    AirSourceModel src;
+    DbdZones zones;
+    b32 generated;
+    u32 index[PawS_Count];
+};
+
+internal void paw_chem_alloc(PawChem *c, Arena *arena) {
+    c->model = push_struct(arena, KinModel);
+    air_mech_build(c->model, &c->sp);
+    c->src = air_source_defaults();
+    c->generated = dbd_generated_matches(c->model);
+    dbd_zones_alloc(&c->zones, arena, c->model, 1);
+    for (u32 i = 0; i < PawS_Count; ++i) c->index[i] = (u32)kin_find_species(c->model, paw_gas_names[i]);
+}
+
+// Moles per litre of feed air at 20 C, 1 atm (rotameters read at room conditions).
+#define PAW_AIR_MOL_PER_L (101325.0 / (8.314462618 * 293.15) * 1e-3)
+
+internal void paw_gas_compute(PawChem *c, PawGas *g, const PawParams *p, f64 water_T_C) {
+    memset(g, 0, sizeof(*g));
+    if (!c->model || !p->modules) return;
+    PawElectrical e = paw_electrical(p);
+    f64 flow_cm3_s = (f64)p->air_L_min * 1000.0 / 60.0 / p->modules;
+    g->T_K = water_T_C + 273.15 + p->gas_dT_K;
+    g->power_W_cm3 = e.P_avg_W / p->modules / e.annulus_cm3;
+    g->residence_s = e.annulus_cm3 / Maximum(flow_cm3_s, 1e-9);
+    g->freq_Hz = (f64)p->freq_kHz * 1e3;
+    g->P_avg_W = e.P_avg_W;
+    g->air_L_min = p->air_L_min;
+    DbdZones *z = &c->zones;
+    z->T_K[0] = g->T_K; z->p_Pa[0] = 101325.0; z->x_H2O[0] = 103.0 / 101325.0;   // dryer: -20 C dew point
+    z->power_W_cm3[0] = g->power_W_cm3; z->freq_Hz[0] = g->freq_Hz;
+    dbd_zones_fill_padding(z);
+    dbd_zones_reset(z, &c->sp);
+    dbd_zones_prepare_rates(z, c->model);
+    KinMethod method = kin_method(KinMethod_Rodas3);
+    KinControl ctl = dbd_default_control();
+    f64 dt = 1e-3, res = Minimum(g->residence_s, 30.0);
+    u32 steps = (u32)ceil(res / dt);
+    for (u32 i = 0; i < steps; ++i) {
+        f64 a = i * dt, b = Minimum((i + 1) * dt, res);
+        if (c->generated) dbd_step_cpu<f64x4, AirGenOps>(z, c->model, &c->sp, &c->src, DbdDischarge_Pulsed, &method, &ctl, a, b);
+        else dbd_step_cpu<f64x4>(z, c->model, &c->sp, &c->src, DbdDischarge_Pulsed, &method, &ctl, a, b);
+    }
+    f64 total = 0.0;
+    for (u32 s = 0; s < z->n_species; ++s) total += z->y[s * z->padded];
+    for (u32 i = 0; i < PawS_Count; ++i) g->x[i] = total > 0.0 ? z->y[c->index[i] * z->padded] / total : 0.0;
+    f64 mol_air_s = (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L;
+    f64 soluble = (g->x[PawS_NO2] + g->x[PawS_NO3] + 2.0 * g->x[PawS_N2O5] + g->x[PawS_HNO2] + g->x[PawS_HNO3]) * mol_air_s;
+    g->nox_MJ_mol = soluble > 0.0 ? e.P_avg_W / soluble * 1e-6 : 0.0;
+    g->o3_g_kWh = e.P_avg_W > 0.0 ? g->x[PawS_O3] * mol_air_s * 48.0 / (e.P_avg_W / 3.6e6) : 0.0;
+    g->valid = 1;
+}
+
+internal b32 paw_gas_stale(const PawGas *g, const PawParams *p) {
+    if (!g->valid) return 1;
+    PawElectrical e = paw_electrical(p);
+    return fabs(e.P_avg_W - g->P_avg_W) > 1e-9 * Maximum(e.P_avg_W, 1.0) || fabs((f64)p->air_L_min - g->air_L_min) > 1e-9 ||
+           fabs((f64)p->freq_kHz * 1e3 - g->freq_Hz) > 1e-6;
 }
 
 // --- water --------------------------------------------------------------------------
@@ -265,7 +357,8 @@ global const char *const paw_state_names[3] = { "treating", "holding (ozone deca
 
 struct PawAccounts {
     f64 plasma_J, supply_J, pump_J;
-    f64 nox_N_mmol, o3_mmol;               // made by the plasma
+    f64 nox_N_mmol, o3_mmol;               // made by the plasma (N: every oxidized N species, N2O included)
+    f64 n2o_N_mmol;                        // of which N2O (insoluble, vented; a greenhouse gas)
     f64 vented_N_mmol, vented_o3_mmol;     // through both water stages
     f64 delivered_L, delivered_N_mmol, delivered_no2_mmol;
     f64 source_L;                          // fresh source water drawn
@@ -279,6 +372,7 @@ struct PawSkid {
     f64 state_t;                           // s in the current state
     f64 batch_t, batch_J;                  // treatment time and plasma energy of the current batch
     PawElectrical el;
+    PawGas gas;                            // M2 kinetics outlet of one module (gas_source = kinetics, and for display)
     f64 capture;                           // current venturi NOx capture
     f64 plasma_on;                         // fraction of the last window with the plasma on
     PawAccounts acc;
@@ -377,31 +471,53 @@ internal void paw_window(PawSkid *k, const PawParams *p, f64 dt, f64 T_amb, f64 
                                        d->no2_mmol / d->V_L * 1e-3) * 1e3 * d->V_L;     // meq
         f64 need = d->R_meq - d->no3_mmol - d->no2_mmol - ta_target;
         f64 cap = paw_capture(p, d->pH);
-        f64 nox_rate = k->el.P_avg_W * paw_nox_regime(k->el.SEI_kJ_L) / ((f64)p->nox_MJ_mol * 1e6) * 1e3;   // mmol N / s
+        f64 nox_rate;                      // soluble N, mmol / s at full on-time
+        if (p->gas_source == PawGas_Kinetics && k->gas.valid) {
+            const f64 *x = k->gas.x;
+            nox_rate = (x[PawS_NO2] + x[PawS_NO3] + 2.0 * x[PawS_N2O5] + x[PawS_HNO2] + x[PawS_HNO3]) *
+                       (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L * 1e3;
+        } else {
+            nox_rate = k->el.P_avg_W * paw_nox_regime(k->el.SEI_kJ_L) / ((f64)p->nox_MJ_mol * 1e6) * 1e3;
+        }
         f64 acid_per_s = nox_rate * cap;   // every captured N is one strong anion (nitrate or nitrite)
         on = acid_per_s > 0.0 ? Clamp(need / (acid_per_s * dt), 0.0, 1.0) : 0.0;
         if (need <= 0.0) on = 0.0;
     }
     k->plasma_on = on;
     f64 P = k->el.P_avg_W * on;
-    f64 sei = k->el.SEI_kJ_L;
-    f64 regime = paw_nox_regime(sei);
-    f64 nox = P * regime / ((f64)p->nox_MJ_mol * 1e6) * 1e3;                     // mmol N / s
-    f64 o3_g_kWh = (f64)p->o3_g_kWh * (1.0 - regime) + (f64)p->o3_nox_g_kWh * regime;
-    f64 o3 = P * o3_g_kWh / 3.6e6 / 48.0 * 1e3;                                  // mmol / s
     k->capture = paw_capture(p, d->pH);
-    f64 n2o5 = Clamp((f64)p->n2o5_share, 0.0, 1.0);
-    f64 capN = nox * k->capture, capO3 = o3 * p->o3_capture;
-    f64 escN = nox - capN, escO3 = o3 - capO3;
-    // N2O5 is captured preferentially (hydrolyses on contact); the escaping NOx is NO2
-    f64 capN2O5 = Minimum(nox * n2o5, capN), capNO2 = capN - capN2O5;
-    paw_liquid(d, capN2O5 + 0.5 * capNO2, 0.5 * capNO2, capO3, dt);
-    f64 b2N = 0.0, b2O3 = 0.0;
+    // gas leaving the modules (mmol/s): nitrate-forming N, nitrite-forming N
+    // (from NO2 half and half, HNO2 all nitrite), insoluble N (NO alone, N2O), O3
+    f64 to_nitrate, to_nitrite, insoluble, n2o, o3;
+    if (p->gas_source == PawGas_Kinetics && k->gas.valid) {
+        f64 mol = (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L * on * 1e3;   // mmol air / s
+        const f64 *x = k->gas.x;
+        to_nitrate = (x[PawS_NO3] + 2.0 * x[PawS_N2O5] + x[PawS_HNO3] + 0.5 * x[PawS_NO2]) * mol;
+        to_nitrite = (x[PawS_HNO2] + 0.5 * x[PawS_NO2]) * mol;
+        n2o = 2.0 * x[PawS_N2O] * mol;
+        insoluble = x[PawS_NO] * mol + n2o;
+        o3 = x[PawS_O3] * mol;
+    } else {
+        f64 regime = paw_nox_regime(k->el.SEI_kJ_L);
+        f64 nox = P * regime / ((f64)p->nox_MJ_mol * 1e6) * 1e3;                     // mmol N / s
+        f64 o3_g_kWh = (f64)p->o3_g_kWh * (1.0 - regime) + (f64)p->o3_nox_g_kWh * regime;
+        o3 = P * o3_g_kWh / 3.6e6 / 48.0 * 1e3;                                      // mmol / s
+        f64 n2o5 = Clamp((f64)p->n2o5_share, 0.0, 1.0);
+        to_nitrate = nox * (n2o5 + 0.5 * (1.0 - n2o5));
+        to_nitrite = nox * 0.5 * (1.0 - n2o5);
+        insoluble = n2o = 0.0;
+    }
+    f64 soluble = to_nitrate + to_nitrite;
+    f64 capN = soluble * k->capture, capO3 = o3 * p->o3_capture;
+    f64 escN = soluble - capN, escO3 = o3 - capO3;
+    paw_liquid(d, to_nitrate * k->capture, to_nitrite * k->capture, capO3, dt);
+    f64 b2N = 0.0, b2O3 = 0.0;   // what escapes is mostly NO2: half and half in the bucket
     if (p->stage2_on && k->bucket.V_L > 0.0) { b2N = escN * p->stage2_no2; b2O3 = escO3 * p->stage2_o3; }
     paw_liquid(&k->bucket, 0.5 * b2N, 0.5 * b2N, b2O3, dt);
-    k->acc.nox_N_mmol += nox * dt;
+    k->acc.nox_N_mmol += (soluble + insoluble) * dt;
+    k->acc.n2o_N_mmol += n2o * dt;
     k->acc.o3_mmol += o3 * dt;
-    k->acc.vented_N_mmol += (escN - b2N) * dt;
+    k->acc.vented_N_mmol += (escN - b2N + insoluble) * dt;
     k->acc.vented_o3_mmol += (escO3 - b2O3) * dt;
     // carbon dioxide: the venturi bubbles strip it toward air equilibrium; the bucket sparger less so
     paw_co2_exchange(d, p->kla_co2_per_s, pco2_atm, dt);

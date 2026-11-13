@@ -131,7 +131,7 @@ internal void dbd_zones_prepare_source(DbdZones *z, AirSpecies *sp, AirSourceMod
         b32 on = z->power_W_cm3[i] > 0.0 && freq > 0.0;
         f64 pulses_per_s = 2.0 * freq;   // one micro-discharge burst per half-cycle
         if (mode == DbdDischarge_Pulsed && on) {
-            air_source_delta(sp, source, y, n, z->power_W_cm3[i] / pulses_per_s, delta);
+            air_source_delta(sp, source, y, n, z->power_W_cm3[i] / pulses_per_s, delta, z->T_K[i]);
             for (u32 s = 0; s < n; ++s) { z->pulse[s * p + i] = delta[s]; z->src[s * p + i] = 0.0; }
             f64 period = 1.0 / pulses_per_s;
             z->period[i] = period;
@@ -140,7 +140,7 @@ internal void dbd_zones_prepare_source(DbdZones *z, AirSpecies *sp, AirSourceMod
             z->pulse_first[i] = next * period - t0;
             z->pulse_count[i] = count;
         } else {
-            air_source_delta(sp, source, y, n, on ? z->power_W_cm3[i] : 0.0, delta);   // per second
+            air_source_delta(sp, source, y, n, on ? z->power_W_cm3[i] : 0.0, delta, z->T_K[i]);   // per second
             for (u32 s = 0; s < n; ++s) { z->src[s * p + i] = delta[s]; z->pulse[s * p + i] = 0.0; }
             z->period[i] = 0.0;
             z->pulse_first[i] = 0.0;

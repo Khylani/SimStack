@@ -116,11 +116,11 @@ particle positions and step counter carry over; the title bar shows
 
 For the dbd/sweep scenes the hash covers every zone's species densities.
 Reference: `--scene dbd --headless 30` gives 500 master steps and hash
-`ef492929d2110e75` (f32 lanes, default) or `ef15ffac690ff7b1` (`--precision f64`)
+`3d1a11fb2aace04a` (f32 lanes, default) or `c61a1a9cc5369ab6` (`--precision f64`)
 for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
 `--scene nft --headless 600 --speed 86400` (10 simulated days) gives
-`eb7ffcfe5642537a`, and with `--preset paw-skid` `0cf19ad38871f468`, for any `--threads`.
-`--scene dbd --preset paw-skid --headless 30` (one skid module's annulus) gives `189b147fbf6ec219`.
+`eb7ffcfe5642537a`, and with `--preset paw-skid` `2d36575ffe8488ce`, for any `--threads`.
+`--scene dbd --preset paw-skid --headless 30` (one skid module's annulus) gives `c5bcf9b89d06ee46`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.

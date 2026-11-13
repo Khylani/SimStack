@@ -274,6 +274,10 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             ui_slider_f32("burst duty", &pp->burst_duty, 0.0f, 1.0f, "%.2f");
             ui_slider_f32("Manley factor", &pp->manley_factor, 0.3f, 1.0f, "%.2f");
             ImGui::SeparatorText("Gas and capture");
+            ui_combo_u32("gas chemistry", &pp->gas_source, paw_gas_source_names, PawGas_Count);
+            if (ImGui::Button("Run chemistry (M2 kinetics)")) paw_gas_compute(&s->paw_chem, &k->gas, pp, k->drum.T_C);
+            ImGui::SameLine();
+            ui_slider_f32("gas above water K", &pp->gas_dT_K, 0.0f, 150.0f, "%.0f");
             ui_slider_f32("dry air L/min", &pp->air_L_min, 0.5f, 30.0f, "%.1f", 1);
             ui_slider_f32("NOx cost MJ/mol", &pp->nox_MJ_mol, 5.0f, 60.0f, "%.1f");
             ui_slider_f32("N2O5 share", &pp->n2o5_share, 0.0f, 1.0f, "%.2f");
@@ -299,6 +303,15 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             f64 regime = paw_nox_regime(e.SEI_kJ_L);
             ImGui::Text("SEI %.2f kJ/L: %s, NOx %.1f g/h as NO2", e.SEI_kJ_L, regime > 0.99 ? "NOx mode" : regime < 0.01 ? "ozone mode" : "mixed",
                         e.P_avg_W * regime / (pp->nox_MJ_mol * 1e6) * 3600.0 * 46.0);
+            if (k->gas.valid) {
+                const PawGas &g = k->gas;
+                b32 stale = paw_gas_stale(&g, pp);
+                ImGui::TextColored(stale ? ImVec4(1, 0.75f, 0.3f, 1) : ImVec4(0.6f, 0.9f, 0.6f, 1),
+                                   "kinetics%s: O3 %.0f ppm, NO2 %.0f, N2O5 %.0f, HNO3 %.0f, N2O %.0f ppm", stale ? " (stale)" : "",
+                                   g.x[PawS_O3] * 1e6, g.x[PawS_NO2] * 1e6, g.x[PawS_N2O5] * 1e6, g.x[PawS_HNO3] * 1e6, g.x[PawS_N2O] * 1e6);
+                ImGui::TextDisabled("  %.0f MJ/mol soluble N (design estimate %.0f), %.0f g O3/kWh at %.0f K, %.2f s", g.nox_MJ_mol,
+                                    pp->nox_MJ_mol, g.o3_g_kWh, g.T_K, g.residence_s);
+            }
             PawWater *d = &k->drum;
             f64 v = Maximum(d->V_L, 1e-9);
             ImGui::SeparatorText("Drum");

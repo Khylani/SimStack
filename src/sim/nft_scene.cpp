@@ -362,6 +362,15 @@ internal void nft_scene_summary(NftScene *sc, char *out, u32 size) {
                  k->drum.no2_mmol / Maximum(k->drum.V_L, 1e-9), k->el.P_avg_W, k->el.W_cm2, k->el.SEI_kJ_L, k->acc.batches,
                  k->acc.last_batch_h, k->acc.last_batch_kWh, 100.0 * k->acc.nitrite_frac_last, k->acc.delivered_L,
                  k->acc.delivered_N_mmol, k->acc.nox_N_mmol > 0 ? 100.0 * k->acc.vented_N_mmol / k->acc.nox_N_mmol : 0.0);
+        if (k->gas.valid) {
+            len = (u32)strlen(out);
+            snprintf(out + len, size - len,
+                     "\n[headless] paw gas (%s) | M2 kinetics, one module %.2f W/cm3 %.0f K %.2f s: O3 %.0f ppm, NO2 %.0f, N2O5 %.0f, "
+                     "HNO3 %.0f, N2O %.0f ppm | %.0f MJ/mol soluble N, %.0f g O3/kWh",
+                     paw_gas_source_names[s->params.paw.gas_source], k->gas.power_W_cm3, k->gas.T_K, k->gas.residence_s,
+                     k->gas.x[PawS_O3] * 1e6, k->gas.x[PawS_NO2] * 1e6, k->gas.x[PawS_N2O5] * 1e6, k->gas.x[PawS_HNO3] * 1e6,
+                     k->gas.x[PawS_N2O] * 1e6, k->gas.nox_MJ_mol, k->gas.o3_g_kWh);
+        }
     }
 }
 
