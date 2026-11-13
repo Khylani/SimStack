@@ -496,13 +496,11 @@ global u8 g_nft_memory[Megabytes(256)] SIM_ALIGNED(64);
 template <class V>
 internal void nft_run(NftSystem *s, u32 windows) {
     for (u32 w = 0; w < windows; ++w) {
-        nft_environment(s, s->t);
         f32 shift[NftF_Count];
-        b32 rebase = nft_inlet(s, shift);
-        f32 gain = nft_light_gain(s);
-        for (u32 g = 0; g < s->groups; ++g) nft_group_window<V>(s, g, s->ref, shift, rebase, gain);
-        nft_reservoir_window(s);
-        s->t += s->window_s;
+        b32 rebase;
+        NftEnv env = nft_window_begin(s, shift, &rebase);
+        for (u32 g = 0; g < s->groups; ++g) nft_group_window<V>(s, g, s->ref, shift, rebase, &env);
+        nft_window_end(s);
     }
 }
 
@@ -525,6 +523,8 @@ internal void test_nft() {
     for (u32 g = 0; g < a->groups; ++g) {
         same &= memcmp(a->group[g].rows, b->group[g].rows, sizeof(NftRow) * a->cells) == 0;
         same &= memcmp(a->group[g].sites, b->group[g].sites, sizeof(NftSiteRow) * a->sites) == 0;
+        same &= memcmp(a->group[g].hot, b->group[g].hot, sizeof(NftCellHot) * a->cells) == 0;
+        same &= memcmp(a->group[g].cold, b->group[g].cold, sizeof(NftCellCold) * a->cells) == 0;
     }
     printf("[nft] %u channels x %u cells (%u plants), 10 h: f32x8 vs f32 lanes %s\n", a->rails, a->cells, a->sites,
            same ? "bit-identical" : "DIFFERENT");
@@ -536,7 +536,7 @@ internal void test_nft() {
     pm.dump_days = 10.0f;
     NftSystem *m = push_struct(&arena, NftSystem);
     nft_init(m, &arena, pm);
-    f64 initial[NFT_IONS], v0 = m->res.V_L;
+    f64 initial[NFT_IONS], v0 = m->res.V_L + nft_rail_volume_L(m), hold0 = nft_rail_volume_L(m);
     for (u32 i = 0; i < NFT_IONS; ++i) initial[i] = nft_total_ion_mg(m, i);
     nft_run<f32x8>(m, 30 * 1440);
     f64 worst = 0.0;
@@ -547,18 +547,32 @@ internal void test_nft() {
         f64 e = fabs(in - out) / in;
         if (e > worst) { worst = e; worst_i = i; }
     }
-    f64 water_err = fabs((v0 - m->acc.transpired_L + m->acc.topoff_L + m->acc.dosed_L - m->acc.dumped_L) - m->res.V_L) / v0;
-    printf("[nft] 30 days, dosing + top-off + dump every 10 d: worst ion mass balance error %.1e (%s), water %.1e\n",
-           worst, nft_field_names[NFT_ION0 + worst_i], water_err);
+    NftAccounts *ac = &m->acc;
+    f64 v_now = m->res.V_L + nft_rail_volume_L(m);
+    f64 water_err = fabs((v0 - ac->transpired_L - ac->evap_channel_L - ac->evap_tank_L + ac->topoff_L + ac->dosed_L +
+                          ac->acid_L + ac->base_L - ac->dumped_L) - v_now) / v0;
+    f64 hold_err = fabs(ac->holdup_L - nft_rail_volume_L(m)) / nft_rail_volume_L(m);
+    f64 plants = (f64)m->rails * m->sites;
+    printf("[nft] 30 days, dosing + top-off + pH control + dump every 10 d: worst ion mass balance error %.1e (%s), "
+           "water %.1e, holdup books %.1e\n", worst, nft_field_names[NFT_ION0 + worst_i], water_err, hold_err);
+    printf("[nft]   water per plant per day: plants %.0f mL, film evaporation %.1f mL, tank %.1f mL; channel holdup "
+           "%.2f -> %.2f L (roots), max film %.1f mm; acid %.0f mmol, base %.0f mmol, tank pH %.2f\n",
+           ac->transpired_L / plants / 30.0 * 1e3, ac->evap_channel_L / plants / 30.0 * 1e3, ac->evap_tank_L / plants / 30.0 * 1e3,
+           hold0, ac->holdup_L, m->max_depth_m * 1e3, ac->acid_mmol, ac->base_mmol, m->pH);
     CHECK(worst < 1e-6, "nft ion mass balance %.3e", worst);
     CHECK(water_err < 1e-9, "nft water balance %.3e", water_err);
+    CHECK(hold_err < 1e-9, "nft holdup books %.3e", hold_err);
+    CHECK(fabs(m->pH - pm.ph_set) <= pm.ph_band + 0.05, "pH control: %.2f", m->pH);
+    CHECK(m->max_depth_m > 1.5 * m->group[0].lp.depth_m[0], "root mats should deepen the film: %.2f mm", m->max_depth_m * 1e3);
 
     // 3. thermal: at steady state the energy balance closes exactly -- pump heat in
     //    = channel walls + tank walls out (no chiller, radiant or ambient swing)
     arena.used = 0;
     NftParams pt = p;
     pt.auto_size = 0; pt.chiller_on = 0; pt.radiant_W_m2 = 0; pt.ambient_amp_C = 0; pt.ambient_mean_C = 27.0f;
-    pt.reservoir_L = 100.0f; pt.tank_ua_W_K = 3.0f; pt.topoff_on = 1;
+    pt.reservoir_L = 100.0f; pt.tank_ua_W_K = 3.0f;
+    // no plant water and no top-off (fresh water is a heat sink of its own); evaporation stays on
+    pt.topoff_on = 0; pt.baille_A = pt.baille_B = 0.0f; pt.tissue_water = 0.0f;
     NftSystem *t = push_struct(&arena, NftSystem);
     nft_init(t, &arena, pt);
     nft_run<f32x8>(t, 20 * 1440);
@@ -570,9 +584,10 @@ internal void test_nft() {
     }
     f64 q_tank = pt.tank_ua_W_K * (t->res.T_C - 27.0);
     f64 q_pump = nft_pump_heat_W(&t->params, &t->hyd);
-    f64 balance = (q_pump - q_walls - q_tank) / q_pump;
-    printf("[nft] steady state at 27 C ambient: tank %.4f C; pump heat %.2f W = walls %.2f W + tank %.2f W (residual %.1e)\n",
-           t->res.T_C, q_pump, q_walls, q_tank, balance);
+    f64 q_latent = nft_latent(t->res.T_C) * (t->evap_channel_L_s + t->evap_tank_L_s);
+    f64 balance = (q_pump - q_walls - q_tank - q_latent) / q_pump;
+    printf("[nft] steady state at 27 C ambient, 60 %% RH: tank %.4f C; pump heat %.2f W = walls %.2f W + tank %.2f W + "
+           "evaporation %.2f W (residual %.1e)\n", t->res.T_C, q_pump, q_walls, q_tank, q_latent, balance);
     CHECK(fabs(balance) < 2e-3, "steady-state energy balance residual %.3e", balance);
 
     // 4. chiller keeps the tank inside its band; mylar wrap needs less chiller energy than bare PVC
@@ -620,6 +635,80 @@ internal void test_nft() {
     printf("[nft] %s after %.0f days, all limits 1 (fT %.2f fN %.2f fDO %.2f): mean dry mass %.4f g vs logistic %.4f g (%.2f %%)\n",
            cil->name, days, ft, fn, fd, w, analytic, 100.0 * (w - analytic) / analytic);
     CHECK(fabs(w - analytic) / analytic < 0.01, "growth deviates from logistic: %.4f vs %.4f", w, analytic);
+
+    // 6. pH drift from uptake alone (soft tap water, controller off after make-up): all-nitrate
+    //    feeding takes up more anions than cations and raises the pH; an ammonium-rich feed lowers it
+    f64 ph_end[2], ph_start[2];
+    for (u32 v = 0; v < 2; ++v) {
+        arena.used = 0;
+        NftParams pp = p;
+        pp.tap_alk_meq = 0.0f;
+        pp.recipe[NftF_NH4 - NFT_ION0] = v == 0 ? 0.0f : 40.0f;
+        NftSystem *ph = push_struct(&arena, NftSystem);
+        nft_init(ph, &arena, pp);   // batch made up at the set point, then the controller is switched off
+        ph->params.ph_control = 0;
+        ph_start[v] = ph->pH;
+        nft_run<f32x8>(ph, 1440);
+        ph_end[v] = ph->pH;
+    }
+    printf("[nft] pH from uptake, controller off, 1 day: all nitrate %.2f -> %.2f; 40 mg/L NH4-N %.2f -> %.2f\n",
+           ph_start[0], ph_end[0], ph_start[1], ph_end[1]);
+    CHECK(ph_end[0] > ph_start[0] + 0.2 && ph_end[1] < ph_start[1] - 0.2, "pH drift direction");
+}
+
+internal void test_nft_water() {
+    // Brinkman film: Nusselt as K -> inf, Darcy in a dense mat, series / closed form agree at the switch
+    f64 gS_nu = NFT_G * 0.02 / 1.0e-6, h = 3e-3;
+    f64 nus = gS_nu * h * h * h / 3.0, darcy = gS_nu * 1e-12 * (h - 1e-6);   // dense limit: g S K (h - sqrt K)
+    f64 e_nus = nft_brinkman_q(h, 1e6, gS_nu) / nus - 1.0, e_darcy = nft_brinkman_q(h, 1e-12, gS_nu) / darcy - 1.0;
+    f64 K_sw = (h / 0.05) * (h / 0.05);
+    f64 sk = sqrt(K_sw), closed = gS_nu * K_sw * (h - sk * tanh(h / sk));
+    f64 e_sw = nft_brinkman_q(h, K_sw * (1.0 + 1e-12), gS_nu) / closed - 1.0;
+    printf("[water] Brinkman film: Nusselt limit %.1e, Darcy limit %.1e, series/closed form at the switch %.1e\n", e_nus, e_darcy, e_sw);
+    CHECK(fabs(e_nus) < 1e-9 && fabs(e_darcy) < 1e-6 && fabs(e_sw) < 1e-9, "brinkman limits");
+    // root mat: root-free cells keep the film; a dense mat's depth satisfies the flow to 1e-12
+    f64 qu = 1.5 / 60000.0 / 0.1, h0 = nft_film_depth(1.5 / 60000.0, 0.1, 0.02, 1e-6), hm, phi;
+    nft_root_film(qu, 0.02, 1e-6, h0, 0.0, 4e-4, 0.35, 0.0, &hm, &phi);
+    CHECK(hm == h0 && phi == 0.0, "root-free film");
+    f64 tr = 1.0e-3;   // 1 mm of root tissue per unit floor area (a mature arugula mat)
+    nft_root_film(qu, 0.02, 1e-6, h0, tr, 4e-4, 0.35, 0.0, &hm, &phi);
+    f64 res = nft_brinkman_q(hm, nft_root_perm(phi, 4e-4), gS_nu) / qu - 1.0;
+    // analytic Newton derivative vs a central difference
+    f64 dF, dm, dp, lx = log(hm * 1.3);
+    nft_root_residual(lx, qu, tr, 4e-4, 0.35, gS_nu, &dF);
+    f64 fd = (nft_root_residual(lx + 1e-6, qu, tr, 4e-4, 0.35, gS_nu, &dp) - nft_root_residual(lx - 1e-6, qu, tr, 4e-4, 0.35, gS_nu, &dm)) / 2e-6;
+    CHECK(fabs(dF / fd - 1.0) < 1e-6, "root film derivative %.6e vs %.6e", dF, fd);
+    printf("[water] film %.2f mm root-free; through a 1 mm-equivalent root mat (0.4 mm roots): %.2f mm, phi %.3f, "
+           "K %.2e m2, flow residual %.1e\n", h0 * 1e3, hm * 1e3, phi, nft_root_perm(phi, 4e-4), res);
+    CHECK(hm > h0 + tr && fabs(res) < 1e-10, "root mat film residual %.3e", res);
+    // vapour pressure (Magnus) vs IAPWS: 2339.2 Pa at 20 C, 3169.9 at 25 C
+    f64 es_slope_fd = (nft_es_Pa(20.001) - nft_es_Pa(19.999)) / 0.002;
+    printf("[water] e_s(20) %.1f Pa, e_s(25) %.1f Pa (IAPWS 2339.2, 3169.9), slope %.3f Pa/K (finite difference %.3f)\n",
+           nft_es_Pa(20.0), nft_es_Pa(25.0), nft_es_slope(20.0), es_slope_fd);
+    CHECK(fabs(nft_es_Pa(20.0) / 2339.2 - 1.0) < 1e-3 && fabs(nft_es_Pa(25.0) / 3169.9 - 1.0) < 1e-3, "vapour pressure");
+    CHECK(fabs(nft_es_slope(20.0) / es_slope_fd - 1.0) < 1e-6, "vapour pressure slope");
+    // acid-base constants at 25 C, infinite dilution, vs the reference values
+    NftAcidBase ab = nft_acid_base(25.0, 0.0);
+    f64 pk[5] = { -log10(ab.K1), -log10(ab.K2), -log10(ab.Kw), -log10(ab.Kn), -log10(ab.P2) };
+    f64 pk_ref[5] = { 6.352, 10.329, 13.995, 9.245, 7.198 };
+    f64 worst = 0.0;
+    for (u32 i = 0; i < 5; ++i) worst = Maximum(worst, fabs(pk[i] - pk_ref[i]));
+    printf("[water] 25 C: pK1 %.3f pK2 %.3f pKw %.3f pKa(NH4) %.3f pK2(P) %.3f, K0 %.4f mol/(L atm)\n", pk[0], pk[1], pk[2],
+           pk[3], pk[4], ab.K0);
+    CHECK(worst < 0.005 && fabs(ab.K0 / 0.03388 - 1.0) < 0.01, "acid-base constants (worst pK error %.4f)", worst);
+    // pH: pure water 7.00; rain in 420 ppm CO2 ~5.6; 1 meq/L bicarbonate under air ~8.2 (Stumm & Morgan)
+    f64 none[NftF_Count] = {};
+    f64 ph_water = nft_ph(none, 25.0, 0.0, 0.0, 6.0);
+    f64 ph_rain = nft_ph(none, 25.0, 0.0, 420e-6, 6.0);
+    f64 ph_bicarb = nft_ph(none, 25.0, 1.0, 420e-6, 6.0);
+    // the solution satisfies the alkalinity equation
+    NftWaterChem w = nft_water_chem(none, 1.0);
+    NftAcidBase ab1 = nft_acid_base(25.0, w.I);
+    f64 ta_res = nft_alk_species(&ab1, ph_bicarb, 420e-6, 0.0, 0.0) - 1e-3;
+    printf("[water] pH: pure water %.3f, rain (420 ppm CO2) %.3f, 1 meq/L bicarbonate %.3f (alkalinity residual %.1e mol/L)\n",
+           ph_water, ph_rain, ph_bicarb, ta_res);
+    CHECK(fabs(ph_water - 7.0) < 0.01 && fabs(ph_rain - 5.6) < 0.05 && ph_bicarb > 8.15 && ph_bicarb < 8.35, "pH anchors");
+    CHECK(fabs(ta_res) < 1e-13, "pH solve residual %.3e", ta_res);
 }
 
 internal void test_hydraulics() {
@@ -680,6 +769,29 @@ internal void bench_nft() {
         f64 updates = (f64)s->groups * s->cells * s->substeps * 1440.0 * (f64)NftF_Count * NFT_LANES;
         printf("[nft bench] %4u channels x %u cells, 1 day on 1 thread: %.1f ms (%.0fx real time, %.2f G lane-field updates/s)\n",
                s->rails, s->cells, wall * 1e3, 86400.0 / wall, updates / wall * 1e-9);
+        if (ci == 0) {   // where a window's time goes (same system, 1440 windows each)
+            NftFlushDenormals ftz;
+            f32 shift[NftF_Count];
+            b32 rebase;
+            NftEnv env = nft_window_begin(s, shift, &rebase);
+            f64 tt[3] = {};
+            for (u32 w = 0; w < 1440; ++w) {
+                f64 a0 = now_s();
+                for (u32 g = 0; g < s->groups; ++g) nft_group_cells(s, g, s->ref, 0);
+                f64 a1 = now_s();
+                for (u32 g = 0; g < s->groups; ++g)
+                    nft_plants<f32x8>(s->group + g, 0, s->sites, s->site_offset, s->site_stride, (f32)s->window_s, (f32)s->dt_sub, &env, s->ref);
+                f64 a2 = now_s();
+                for (u32 g = 0; g < s->groups; ++g)
+                    nft_transport<f32x8>(s->group + g, 0, s->cells, s->sites, s->site_offset, s->site_stride, s->ref, &env, s->substeps);
+                f64 a3 = now_s();
+                nft_reservoir_window(s);
+                tt[0] += a1 - a0; tt[1] += a2 - a1; tt[2] += a3 - a2;
+            }
+            printf("[nft bench]   per window: root-mat cell solve %.1f us (run every %u windows), plants %.1f us, transport %.1f us "
+                   "(%u substeps, %.2f ns per row-substep)\n", tt[0] / 1440 * 1e6, NFT_CELL_WINDOWS, tt[1] / 1440 * 1e6, tt[2] / 1440 * 1e6,
+                   s->substeps, tt[2] / 1440 / ((f64)s->groups * s->cells * s->substeps) * 1e9);
+        }
     }
 }
 
@@ -737,6 +849,7 @@ int main(int argc, char **argv) {
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
     test_hydraulics();
+    test_nft_water();
     test_nft();
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
     if (want_bench) { bench_nft(); bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }

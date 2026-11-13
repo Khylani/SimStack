@@ -10,6 +10,10 @@ enum NftCol {           // history columns (one row per simulated hour)
     NftCol_WA, NftCol_WB, NftCol_HarvestA, NftCol_HarvestB,
     NftCol_fTA, NftCol_fTB, NftCol_fNA, NftCol_fNB, NftCol_fDOA, NftCol_fDOB,
     NftCol_WaterL,
+    NftCol_pH, NftCol_Alk,                         // tank pH, total alkalinity (meq/L)
+    NftCol_TranspLd, NftCol_EvapLd,                // plant water use / evaporation (channels + tank), L/day over the hour
+    NftCol_AcidMmol, NftCol_BaseMmol,              // cumulative pH-control doses
+    NftCol_HoldupL, NftCol_FilmMaxMm,              // water held in the channels; deepest film (root mats)
     NftCol_Count,
 };
 global const char *const nft_col_names[NftCol_Count] = {
@@ -17,6 +21,8 @@ global const char *const nft_col_names[NftCol_Count] = {
     "EC_mS_cm", "NO3N_mg_L", "NH4N_mg_L", "P_mg_L", "K_mg_L", "Ca_mg_L", "Mg_mg_L", "S_mg_L", "DO_mg_L",
     "reservoir_L", "plant_dm_A_g", "plant_dm_B_g", "harvest_dm_A_g", "harvest_dm_B_g",
     "fT_A", "fT_B", "fN_A", "fN_B", "fDO_A", "fDO_B", "water_used_L",
+    "pH", "alkalinity_meq_L", "plant_water_L_day", "evaporation_L_day", "acid_mmol", "base_mmol",
+    "channel_holdup_L", "film_max_mm",
 };
 
 #define NFT_HISTORY (24 * 730)    // two years of hourly rows
@@ -27,6 +33,7 @@ struct NftScene {
     u32 hist_count, hist_head;
     f64 next_sample_t;
     f64 chiller_on_at_sample;
+    f64 transp_at_sample, evap_at_sample, t_at_sample;
     const char *csv_path;
     f64 last_window_wall_ms, wall_ms_total;
     u64 windows;
@@ -66,6 +73,19 @@ internal void nft_scene_sample(NftScene *sc) {
     row[NftCol_HarvestA] = s->acc.harvest_g[0];
     row[NftCol_HarvestB] = s->acc.harvest_g[1];
     row[NftCol_WaterL] = s->acc.topoff_L + s->acc.dosed_L;
+    row[NftCol_pH] = s->pH;
+    row[NftCol_Alk] = nft_water_chem(c, nft_R_conc(s)).TA_meq;
+    f64 dt_days = (s->t - sc->t_at_sample) / 86400.0;
+    f64 evap = s->acc.evap_channel_L + s->acc.evap_tank_L;
+    row[NftCol_TranspLd] = dt_days > 0.0 ? (s->acc.transpired_L - sc->transp_at_sample) / dt_days : 0.0;
+    row[NftCol_EvapLd] = dt_days > 0.0 ? (evap - sc->evap_at_sample) / dt_days : 0.0;
+    sc->transp_at_sample = s->acc.transpired_L;
+    sc->evap_at_sample = evap;
+    sc->t_at_sample = s->t;
+    row[NftCol_AcidMmol] = s->acc.acid_mmol;
+    row[NftCol_BaseMmol] = s->acc.base_mmol;
+    row[NftCol_HoldupL] = s->acc.holdup_L;
+    row[NftCol_FilmMaxMm] = s->max_depth_m * 1e3;
 }
 
 internal void nft_scene_init(NftScene *sc, Arena *arena, SimConfig *config, NftParams *params) {
@@ -131,6 +151,7 @@ enum NftLayer {
     NftLayer_NO3, NftLayer_K, NftLayer_Ca, NftLayer_EC,
     NftLayer_Velocity, NftLayer_Depth, NftLayer_Flow,
     NftLayer_PlantMass, NftLayer_fT, NftLayer_fN, NftLayer_fDO,
+    NftLayer_pH, NftLayer_RootFrac, NftLayer_Evap,
     NftLayer_Count,
 };
 struct NftLayerInfo { const char *name, *unit; b32 diverging; b32 plants; };
@@ -150,6 +171,9 @@ global const NftLayerInfo nft_layers[NftLayer_Count] = {
     { "Plant temperature factor fT", "",        0, 1 },
     { "Plant nutrient factor fN",    "",        0, 1 },
     { "Plant O2 factor fDO",         "",        0, 1 },
+    { "pH (local)",                  "",        0, 0 },
+    { "Root mat volume fraction",    "",        0, 0 },
+    { "Evaporative cooling",         "W/m",     0, 0 },
 };
 
 // Diverging map for signed quantities: blue (-) - near-white (0) - red (+).
@@ -159,6 +183,27 @@ internal u32 nft_diverging(f32 t) {             // t in [-1, 1]
     if (t < 0.0f) { f32 a = -t; r = 0.93f - 0.80f * a; g = 0.93f - 0.55f * a; b = 0.95f - 0.20f * a; }
     else          { f32 a = t;  r = 0.95f - 0.20f * a; g = 0.93f - 0.75f * a; b = 0.93f - 0.80f * a; }
     return 0xFF000000u | ((u32)(b * 255.0f) << 16) | ((u32)(g * 255.0f) << 8) | (u32)(r * 255.0f);
+}
+
+// Local pH. Exact (speciation solve warm-started from the tank) for views up to
+// NFT_PH_EXACT_CELLS; above that, linearized: pH_tank + dTA / beta with the
+// tank's buffer capacity beta = dTA/dpH (cheap enough for a million cells a frame).
+#define NFT_PH_EXACT_CELLS 32768
+global f64 nft_ph_beta;          // meq/L per pH unit, refreshed per frame by nft_scene_fill_render
+internal f32 nft_cell_ph_view(NftSystem *s, u32 g, u32 j, u32 l) {
+    if ((u64)s->rails * s->cells <= NFT_PH_EXACT_CELLS) return (f32)nft_cell_ph(s, g, j, l, s->pH);
+    f64 dTA = 0.0;
+    for (u32 i = 0; i < NFT_IONS; ++i) dTA += nft_charge_sign[i] * (f64)s->group[g].rows[j].f[NFT_ION0 + i][l] / nft_meq_mg[i];
+    return (f32)(s->pH + dTA / Maximum(nft_ph_beta, 1e-6));
+}
+
+internal f64 nft_tank_buffer_meq(NftSystem *s) {
+    f64 c[NftF_Count];
+    for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_reservoir_conc(s, k);
+    NftWaterChem w = nft_water_chem(c, nft_R_conc(s));
+    NftAcidBase ab = nft_acid_base(s->res.T_C, w.I);
+    f64 pc = nft_pco2_atm(&s->params);
+    return (nft_alk_species(&ab, s->pH + 0.01, pc, w.PT, w.NT) - nft_alk_species(&ab, s->pH - 0.01, pc, w.PT, w.NT)) / 0.02 * 1e3;
 }
 
 // Scalar of a layer at channel r, cell j.
@@ -178,9 +223,16 @@ internal f32 nft_layer_value(NftSystem *s, u32 layer, u32 r, u32 j) {
             for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_abs(s, g, j, k, l);
             return (f32)nft_ec_mS(c);
         }
-        case NftLayer_Velocity:     return grp->lp.velocity_m_s[l];
-        case NftLayer_Depth:        return grp->lp.depth_m[l] * 1000.0f;
+        case NftLayer_pH:           return nft_cell_ph_view(s, g, j, l);
+        case NftLayer_Velocity:     return grp->cold[j].vel[l];
+        case NftLayer_Depth:        return grp->cold[j].depth[l] * 1000.0f;
         case NftLayer_Flow:         return grp->lp.flow_L_s[l] * 60.0f;
+        case NftLayer_RootFrac:     return grp->cold[j].phi[l];
+        case NftLayer_Evap: {       // latent heat leaving the open film, per metre of channel
+            f64 Tw = nft_abs(s, g, j, NftF_T, l);
+            f64 kg_s = (f64)grp->cold[j].ev[l] / s->dt_sub * (nft_es_Pa(Tw) - s->rh * nft_es_Pa(s->T_amb));
+            return (f32)(nft_latent(Tw) * kg_s / s->cell_m);
+        }
         default:                    return 0.0f;
     }
 }
@@ -207,6 +259,7 @@ internal void nft_scene_fill_render(NftScene *sc, RenderCommands *render, u32 la
     layer %= NftLayer_Count;
     const NftLayerInfo *info = nft_layers + layer;
     f32 lo = 1e30f, hi = -1e30f;
+    if (layer == NftLayer_pH) nft_ph_beta = nft_tank_buffer_meq(s);
     if (info->plants) {
         lo = 0.0f; hi = 1.0f;
     } else {
@@ -280,10 +333,12 @@ internal void nft_scene_summary(NftScene *sc, char *out, u32 size) {
     nft_collect_harvest(s);
     snprintf(out, size,
              "nft %u ch x %u plants day %.2f | T amb %.1f res %.2f out A %.2f B %.2f C | chiller %.2f kWh | EC %.2f NO3-N %.0f K %.0f Ca %.0f DO %.1f | "
+             "pH %.2f, acid %.0f base %.0f mmol | water: plants %.1f L, evaporation %.1f L, film max %.1f mm, holdup %.1f L | "
              "plant dm A %.2f B %.2f g, harvests A %.0f (%.0f g, %.0f bolted) B %.0f (%.0f g, %.0f bolted) | %.3f ms/window",
              s->rails, s->sites, s->t / 86400.0, s->T_amb, s->res.T_C, nft_bank_cell_mean(s, 0, NftF_T, s->cells - 1),
              nft_bank_cell_mean(s, 1, NftF_T, s->cells - 1), s->acc.chiller_elec_J / 3.6e6, nft_ec_mS(c), c[NftF_NO3],
-             c[NftF_K], c[NftF_Ca], c[NftF_DO], wa, wb, s->acc.harvests[0], s->acc.harvest_g[0], s->acc.bolted[0],
+             c[NftF_K], c[NftF_Ca], c[NftF_DO], s->pH, s->acc.acid_mmol, s->acc.base_mmol, s->acc.transpired_L,
+             s->acc.evap_channel_L + s->acc.evap_tank_L, s->max_depth_m * 1e3, s->acc.holdup_L, wa, wb, s->acc.harvests[0], s->acc.harvest_g[0], s->acc.bolted[0],
              s->acc.harvests[1], s->acc.harvest_g[1], s->acc.bolted[1],
              sc->windows ? sc->wall_ms_total / (f64)sc->windows : 0.0);
 }
@@ -292,6 +347,8 @@ internal u64 nft_scene_hash(NftScene *sc) {
     NftSystem *s = &sc->sys;
     u64 h = hash_fnv1a_64(&s->res, sizeof(s->res));
     h = hash_fnv1a_64(s->ref, sizeof(s->ref), h);
+    h = hash_fnv1a_64(&s->R_meq, sizeof(s->R_meq), h);
+    h = hash_fnv1a_64(&s->acc, sizeof(s->acc), h);
     for (u32 g = 0; g < s->groups; ++g) {
         h = hash_fnv1a_64(s->group[g].rows, sizeof(NftRow) * s->cells, h);
         h = hash_fnv1a_64(s->group[g].sites, sizeof(NftSiteRow) * s->sites, h);

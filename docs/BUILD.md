@@ -118,7 +118,7 @@ Reference: `--scene dbd --headless 30` gives 500 master steps and hash
 `ef492929d2110e75` (f32 lanes, default) or `ef15ffac690ff7b1` (`--precision f64`)
 for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
 `--scene nft --headless 600 --speed 86400` (10 simulated days) gives
-`5e3d03b626c2e381` for any `--threads`.
+`f7986854cf5dab3a` for any `--threads`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.

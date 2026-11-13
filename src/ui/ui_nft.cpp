@@ -151,7 +151,7 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
                 ImGui::Text("eductor %.1f L/min motive -> %.0f L/min, tank turnover %.1f /h", h->q_eductor_motive * 60000.0,
                             h->q_eductor_total * 60000.0, h->q_eductor_total * 3600.0 * 1000.0 / Maximum((f64)s->res.V_L, 1.0));
             f64 re = h->q_mean / nft_profiles[hp->profile].width_m / h->nu;
-            ImGui::Text("film %.2f mm, %.3f m/s, Re %.0f (%s)", s->group[0].lp.depth_m[0] * 1000.0, s->group[0].lp.velocity_m_s[0],
+            ImGui::Text("root-free film %.2f mm, %.3f m/s, Re %.0f (%s)", s->group[0].lp.depth_m[0] * 1000.0, s->group[0].lp.velocity_m_s[0],
                         re, re < 400 ? "laminar" : re > 1600 ? "turbulent" : "transitional");
             ImVec4 rc = h->return_use > 0.8 ? ImVec4(1, 0.4f, 0.3f, 1) : ImVec4(0.6f, 0.65f, 0.7f, 1);
             ImGui::TextColored(rc, "return drain at %.0f %% of full-pipe capacity", 100.0 * h->return_use);
@@ -165,8 +165,59 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
         ui_slider_f32("day/night swing C", &p->ambient_amp_C, 0.0f, 15.0f, "%.1f");
         ui_slider_f32("photoperiod h", &p->photoperiod_h, 0.0f, 24.0f, "%.1f");
         ui_slider_f32("radiant on tops W/m2", &p->radiant_W_m2, 0.0f, 1000.0f, "%.0f");
+        ui_slider_f32("relative humidity", &p->rh, 0.05f, 1.0f, "%.2f");
+        ui_slider_f32("CO2 ppm", &p->co2_ppm, 200.0f, 2000.0f, "%.0f");
+        b32 evap_changed = ui_slider_f32("air film h W/m2K", &p->h_conv_W_m2K, 1.0f, 30.0f, "%.1f");
+        evap_changed |= ui_slider_f32("channel open fraction", &p->channel_open_frac, 0.0f, 1.0f, "%.2f");
+        ui_slider_f32("tank open fraction", &p->tank_open_frac, 0.0f, 1.0f, "%.2f");
+        if (evap_changed) s->cells_force = 1;
         ImGui::PopItemWidth();
-        ImGui::TextDisabled("ambient now %.1f C", s->T_amb);
+        f64 es_a = nft_es_Pa(s->T_amb);
+        ImGui::TextDisabled("ambient now %.1f C, VPD %.2f kPa, dew point %.1f C", s->T_amb, es_a * (1.0 - s->rh) * 1e-3,
+                            243.04 * log(Maximum((f64)s->rh, 1e-3) * es_a / 610.94) / (17.625 - log(Maximum((f64)s->rh, 1e-3) * es_a / 610.94)));
+        ImGui::TextDisabled("evaporation: channels %.2f L/day, tank %.2f L/day", s->evap_channel_L_s * 86400.0, s->evap_tank_L_s * 86400.0);
+    }
+
+    // water use, transpiration and root mats
+    if (ImGui::CollapsingHeader("Water & roots", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushItemWidth(-130);
+        ui_slider_f32("Baille A (radiation)", &p->baille_A, 0.0f, 1.0f, "%.2f");
+        ui_slider_f32("Baille B W/m2/kPa", &p->baille_B, 0.0f, 60.0f, "%.1f");
+        ui_slider_f32("night stomata", &p->night_stomata, 0.0f, 1.0f, "%.2f");
+        ui_slider_f32("channel pitch m", &p->channel_pitch_m, 0.05f, 1.0f, "%.2f");
+        b32 roots_changed = ui_slider_f32("root diameter mm", &p->root_diam_mm, 0.05f, 2.0f, "%.2f");
+        roots_changed |= ui_slider_f32("root fresh/dry", &p->root_fresh_dry, 0.0f, 30.0f, "%.1f");
+        roots_changed |= ui_slider_f32("packed mat fraction", &p->root_phi_max, 0.05f, 0.8f, "%.2f");
+        if (roots_changed) s->cells_force = 1;
+        ImGui::PopItemWidth();
+        f64 plants = (f64)s->rails * s->sites;
+        ImGui::Text("plants %.1f L/day (%.0f mL each), evaporation %.1f L/day", s->transp_L_s * 86400.0,
+                    s->transp_L_s * 86400.0 / plants * 1000.0, (s->evap_channel_L_s + s->evap_tank_L_s) * 86400.0);
+        ImGui::Text("channels hold %.1f L; deepest film %.1f mm (root-free %.1f mm)", s->acc.holdup_L, s->max_depth_m * 1e3,
+                    s->group[0].lp.depth_m[0] * 1e3);
+        if (s->overflow_cells)
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%u cells: root mats raise the film past 80 %% of the wall", s->overflow_cells);
+        ImGui::TextDisabled("totals: plants %.0f L, evaporation %.0f L (%.1f kWh latent)", s->acc.transpired_L,
+                            s->acc.evap_channel_L + s->acc.evap_tank_L, s->acc.evap_heat_J / 3.6e6);
+    }
+
+    // pH
+    if (ImGui::CollapsingHeader("pH", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushItemWidth(-130);
+        bool ctl = p->ph_control != 0;
+        if (ImGui::Checkbox("pH control (HNO3 / KOH, 1 M)", &ctl)) p->ph_control = ctl;
+        ui_slider_f32("pH setpoint", &p->ph_set, 4.5f, 7.5f, "%.2f");
+        ui_slider_f32("pH band +-", &p->ph_band, 0.02f, 1.0f, "%.2f");
+        ui_slider_f32("max dose mmol/h", &p->acid_mmol_per_h_max, 1.0f, 1000.0f, "%.0f", 1);
+        ui_slider_f32("tap alkalinity meq/L", &p->tap_alk_meq, 0.0f, 6.0f, "%.2f");
+        ImGui::PopItemWidth();
+        f64 c[NftF_Count];
+        for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_reservoir_conc(s, k);
+        NftWaterChem w = nft_water_chem(c, nft_R_conc(s));
+        ImGui::Text("tank pH %.2f, alkalinity %.3f meq/L, I %.3f M%s", s->pH, w.TA_meq, w.I,
+                    s->acid_running ? ", dosing acid" : s->base_running ? ", dosing base" : "");
+        ImGui::TextDisabled("acid %.0f mmol (%.2f L), base %.0f mmol; growth factor %.2f", s->acc.acid_mmol, s->acc.acid_L,
+                            s->acc.base_mmol, nft_ph_factor(s->pH));
     }
 
     // reservoir + chiller
@@ -209,8 +260,8 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             }
             ImGui::EndTable();
         }
-        ImGui::TextDisabled("water used %.0f L, stock %.1f L, transpired %.0f L", s->acc.topoff_L + s->acc.dosed_L,
-                            s->acc.dosed_L, s->acc.transpired_L);
+        ImGui::TextDisabled("water used %.0f L, stock %.1f L, plants %.0f L, evaporated %.0f L", s->acc.topoff_L + s->acc.dosed_L,
+                            s->acc.dosed_L, s->acc.transpired_L, s->acc.evap_channel_L + s->acc.evap_tank_L);
     }
 
     // harvest
@@ -293,6 +344,31 @@ internal void ui_nft_plots(SimState *state) {
             ui_nft_line(sc, "mean B", NftCol_WB, cB);
             ui_nft_line(sc, "harvest A", NftCol_HarvestA, ImVec4(0.2f, 0.5f, 0.8f, 1), ImAxis_Y2);
             ui_nft_line(sc, "harvest B", NftCol_HarvestB, ImVec4(0.8f, 0.45f, 0.2f, 1), ImAxis_Y2);
+            ImPlot::EndPlot();
+        }
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("pH")) {
+        if (ImPlot::BeginPlot("##ph", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes("day", "pH", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxis(ImAxis_Y2, "mmol / meq/L", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+            ui_nft_line(sc, "tank pH", NftCol_pH, ImVec4(1, 0.85f, 0.3f, 1));
+            ui_nft_line(sc, "acid mmol", NftCol_AcidMmol, ImVec4(1, 0.4f, 0.35f, 1), ImAxis_Y2);
+            ui_nft_line(sc, "base mmol", NftCol_BaseMmol, ImVec4(0.4f, 0.6f, 1, 1), ImAxis_Y2);
+            ImPlot::EndPlot();
+        }
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Water")) {
+        if (ImPlot::BeginPlot("##water", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes("day", "L/day", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxis(ImAxis_Y2, "L / mm", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+            ui_nft_line(sc, "plants", NftCol_TranspLd, ImVec4(0.4f, 1, 0.5f, 1));
+            ui_nft_line(sc, "evaporation", NftCol_EvapLd, ImVec4(0.4f, 0.8f, 1, 1));
+            ui_nft_line(sc, "channel holdup L", NftCol_HoldupL, ImVec4(0.8f, 0.8f, 0.8f, 1), ImAxis_Y2);
+            ui_nft_line(sc, "deepest film mm", NftCol_FilmMaxMm, ImVec4(0.9f, 0.6f, 0.3f, 1), ImAxis_Y2);
             ImPlot::EndPlot();
         }
         ImGui::EndTabItem();
@@ -386,9 +462,12 @@ internal void ui_nft_overlay(SimState *state, RenderCommands *render, ImVec2 ori
             dl->AddRectFilledMultiColor(ImVec2(p0.x + w * t0, p0.y), ImVec2(p0.x + w * t1, p0.y + h), c0, c1, c1, c0);
         }
         ImGui::Dummy(ImVec2(w, h));
-        ImGui::Text("%-9.3g", sc->view_lo);
+        // enough significant digits to tell the ends apart (a pH span can be 0.005)
+        f32 mag = Maximum(fabsf(sc->view_lo), fabsf(sc->view_hi)), span = Maximum(sc->view_hi - sc->view_lo, 1e-30f);
+        int digits = Clamp((int)ceilf(log10f(Maximum(mag, 1e-30f) / span)) + 2, 3, 7);
+        ImGui::Text("%-9.*g", digits, sc->view_lo);
         ImGui::SameLine(w * 0.5f - 10); ImGui::TextDisabled("%s", info->unit);
-        ImGui::SameLine(w - 50); ImGui::Text("%9.3g", sc->view_hi);
+        ImGui::SameLine(w - 70); ImGui::Text("%9.*g", digits, sc->view_hi);
         ImGui::TextDisabled("inlet at left, grade x10; plants rise with dry mass");
     }
     ImGui::End();
