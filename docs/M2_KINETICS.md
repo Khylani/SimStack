@@ -317,8 +317,11 @@ comparison are in `tools/ref/README.md`.
 
 ## Known limits of the chemistry
 
-- No ions, no N₂(v) vibrational kinetics, no surface chemistry. Above about 400 K, NO from
-  N₂(v) + O → NO + N and the thermal ozone/NOx switch it drives are missing.
+- No ions, no surface chemistry.
+- **N₂(v) is deliberately left out.** A state-to-state reference (`tools/ref/n2vib`: 40
+  levels, cited V-V/V-T rates, three Zeldovich models) gives T_v ≈ 730–780 K in dry air,
+  matching CARS in a 1 atm air DBD. At that temperature vibrational NO is below 0.3 % at
+  the skid's conditions.
 - **Metastables are quasi-steady.** N(²D), N₂(A) and O(¹D) live 2–50 ns at 1 atm, so each
   pulse distributes them over their partners in proportion to k·[partner].
   - A run with them as explicit species gave the same outlet to 2e-4 and 1.8× the solver
@@ -341,7 +344,7 @@ comparison are in `tools/ref/README.md`.
    operating point live.
 2. Gas → liquid transfer from the reactor outlet: the first NFT coupling (M3).
 3. `dbd_ref` (ChemPlasKin) and `tools/reduce_dbd` tables replacing the G-values.
-4. N₂(v) chemistry (N₂(v) + O → NO + N). It isn't in ChemPlasKin either, so it needs a
-   state-to-state vibrational reference (LoKI-C / LoKI-GM) to calibrate against.
+4. Sensor comparison: once the skid runs, fit the measured nitrate per kWh and the vent
+   O₃ / NO₂ against the filament energy and the reduced-field choice.
 4. Warp-per-zone CUDA kernel for large sweeps.
 5. Windows: `build.bat` does not build the UI object, the codegen step or the tests yet.

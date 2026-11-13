@@ -25,7 +25,9 @@ struct AirSpecies {
     u32 O, O3, N, NO, NO2, NO3, N2O5, N2O, HNO2, HNO3, OH, HO2, H2O2, H, N2, O2, H2O;
 };
 
-internal void air_mech_build(KinModel *model, AirSpecies *sp) {
+// Species and reactions; air_mech_build finalizes. Offline tools call this,
+// append their own (tools/ref/n2vib), then kin_mech_finalize.
+internal void air_mech_define(KinModel *model, AirSpecies *sp) {
     memset(model, 0, sizeof(*model));
     sp->O    = kin_add_species(model, "O");
     sp->O3   = kin_add_species(model, "O3");
@@ -98,6 +100,10 @@ internal void air_mech_build(KinModel *model, AirSpecies *sp) {
     // thermal ozone decomposition (matters above ~400 K)
     kin_add_reaction(model, "O3 + M -> O2 + O + M",        kin_m(7.2e-10, 0.0, 11400.0));
 
+}
+
+internal void air_mech_build(KinModel *model, AirSpecies *sp) {
+    air_mech_define(model, sp);
     kin_mech_finalize(model);
 }
 

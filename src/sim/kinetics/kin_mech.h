@@ -17,13 +17,25 @@
 
 #include "../../base/base_types.h"
 
+// Table sizes. Offline tools (tools/ref) build bigger mechanisms by defining
+// these before including; the real-time build uses the defaults.
+#ifndef KIN_MAX_SPECIES
 #define KIN_MAX_SPECIES     32
+#endif
+#ifndef KIN_MAX_REACTIONS
 #define KIN_MAX_REACTIONS   96
+#endif
 #define KIN_MAX_REACTANTS   3
 #define KIN_MAX_NET         6      // species whose count changes in one reaction
+#ifndef KIN_MAX_NNZ
 #define KIN_MAX_NNZ         512    // Jacobian + fill-in
+#endif
+#ifndef KIN_MAX_LU_DIV
 #define KIN_MAX_LU_DIV      512
+#endif
+#ifndef KIN_MAX_LU_SUB
 #define KIN_MAX_LU_SUB      4096
+#endif
 #define KIN_MAX_JAC_TERMS   (KIN_MAX_REACTIONS * KIN_MAX_REACTANTS * KIN_MAX_NET)
 #define KIN_NONE            0xFF
 
