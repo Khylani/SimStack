@@ -91,6 +91,7 @@ struct SimConfig {
     f32 channel_length_m; // nft: 0 = default
     u32 plants_per_channel; // nft: 0 = default
     u32 view_layer;       // initial 3D layer (nft: NftLayer)
+    u32 preset;           // nft / dbd: 0 default, 1 PAW skid (3x DBD, 50 gal batch, 300 gal NFT)
     const char *csv_path; // dbd / sweep: write results here (0: none)
 };
 
@@ -247,7 +248,7 @@ struct SimStats {
     b32 paused;
     u32 reload_count;         // incremented by sim_on_reload
     u32 thread_count;         // threads the sim used for its batches
-    char summary[512];        // scene-specific one-liner for headless / periodic prints
+    char summary[1024];       // scene-specific one-liner for headless / periodic prints
 };
 
 // ----------------------------------------------------------------------------

@@ -143,6 +143,16 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
     dbd_zones_alloc(&scene->zones, arena, &scene->model, count);
     DbdZones *z = &scene->zones;
     scene->op = dbd_operating_defaults();
+    if (config->preset == 1 && !sweep) {
+        // one module of the PAW skid: dry air through the 2.8 mm annulus at its power and residence
+        PawParams pp = paw_default_params();
+        PawModuleOperating mo = paw_module_operating(&pp, pp.source_T_C);
+        scene->op.T_K = mo.T_K;
+        scene->op.x_H2O = mo.x_H2O;
+        scene->op.power_W_cm3 = mo.power_W_cm3;
+        scene->op.freq_Hz = mo.freq_Hz;
+        scene->residence_s = mo.residence_s;
+    }
     dbd_scene_apply_operating(scene);
     dbd_zones_reset(z, &scene->sp);
 

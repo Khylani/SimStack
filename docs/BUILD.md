@@ -56,6 +56,7 @@ Run:
 ./build/simstack --scene dbd              # real-time UI, 64-zone DBD plug-flow reactor (see docs/M2_KINETICS.md)
 ./build/simstack --scene sweep --hybrid   # real-time UI, 32 x 32 sweep on CUDA + CPU together
 ./build/simstack --scene nft              # real-time UI, NFT channels / hydraulics / chiller / plants (docs/M3_NFT.md)
+./build/simstack --scene nft --preset paw-skid   # + the three-module DBD skid making PAW batches (docs/PAW_SKID.md)
 ./build/simstack --scene nft --channels 64 --channel-length 8 --plants 50 --headless 1440 --speed 86400 --csv runs/nft.csv
 ./build/simstack --scene dbd --headless 300 --csv runs/reactor.csv   # 5 s of chemistry, outlet time series
 ./build/simstack --scene sweep --zones 1024 --averaged --headless 121 --csv runs/sweep.csv [--gpu]
@@ -118,7 +119,8 @@ Reference: `--scene dbd --headless 30` gives 500 master steps and hash
 `ef492929d2110e75` (f32 lanes, default) or `ef15ffac690ff7b1` (`--precision f64`)
 for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
 `--scene nft --headless 600 --speed 86400` (10 simulated days) gives
-`f7986854cf5dab3a` for any `--threads`.
+`eb7ffcfe5642537a`, and with `--preset paw-skid` `0cf19ad38871f468`, for any `--threads`.
+`--scene dbd --preset paw-skid --headless 30` (one skid module's annulus) gives `189b147fbf6ec219`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.
@@ -213,4 +215,5 @@ third_party/                Dear ImGui (docking) + ImPlot, pinned (THIRD_PARTY.m
 docs/BUILD.md               this file
 docs/M2_KINETICS.md         the DBD chemistry solver and UI: design, verification, measurements
 docs/M3_NFT.md              NFT channels, PVC hydraulics, reservoir/chiller, plants: model, exactness, layout
+docs/PAW_SKID.md            the PAW skid preset: DBD electrical model, batch chemistry, coupling to the NFT reservoir
 ```

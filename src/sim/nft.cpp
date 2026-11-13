@@ -77,6 +77,7 @@ global const char *const nft_nutrient_names[NftN_Count] = { "N", "P", "K", "Ca",
 global const f32 nft_km[NFT_IONS] = { 1.0f, 0.3f, 0.2f, 1.5f, 3.0f, 1.5f, 1.0f };
 
 #include "nft_water.cpp"
+#include "paw.cpp"
 #if defined(__x86_64__)
 #include <xmmintrin.h>
 #endif
@@ -227,6 +228,7 @@ struct NftParams {
     f32 rail_length_m;          // channel length
     u32 plants_per_rail;        // plants per channel (evenly spaced: spacing = length / plants)
     b32 auto_size;              // size reservoir, flow and chiller from the structure
+    b32 reservoir_fixed;        // auto-size keeps reservoir_L (a preset's real tank)
     // hydraulics: PVC network, pump, eductor, channel profile and grade (nft_hydraulics.cpp)
     NftHydraulicParams hyd;
     f32 target_flow_L_min;      // per channel, for auto-sizing the pump and pipes
@@ -254,6 +256,8 @@ struct NftParams {
     f32 ph_set, ph_band;
     f32 acid_mmol_per_h_max;    // HNO3 (1 M stock)
     f32 tap_alk_meq;            // alkalinity of top-off / fill water
+    // plasma-activated water: batch skid that tops off the reservoir (paw.cpp)
+    PawParams paw;
     // reservoir
     f32 reservoir_L, tank_ua_W_K, tank_kla_per_s;
     b32 chiller_on;
@@ -300,6 +304,7 @@ internal NftParams nft_default_params() {
     p.ph_band = 0.2f;
     p.acid_mmol_per_h_max = 50.0f;
     p.tap_alk_meq = 1.5f;     // moderately hard tap water (75 mg/L as CaCO3)
+    p.paw = paw_default_params();
     p.reservoir_L = 200.0f;
     p.tank_ua_W_K = 3.0f;
     p.tank_kla_per_s = 0.002f;
@@ -326,6 +331,30 @@ internal NftParams nft_default_params() {
     return p;
 }
 
+// Presets: whole-system starting points (selectable at launch and in the UI).
+enum NftPreset { NftPreset_Default, NftPreset_PawSkid, NftPreset_Count };
+global const char *const nft_preset_names[NftPreset_Count] = { "Default herb room", "PAW skid: 3x DBD, 50 gal batch, 300 gal NFT" };
+global const char *const nft_preset_keys[NftPreset_Count] = { "default", "paw-skid" };
+
+// The reference build ("DBD Reactor Design Review - 50 gal PAW" / "PAW Plasma
+// Skid"): three submerged coaxial DBD modules (Sch 10, 2.8 mm gap, 200 mm
+// active) at 12.5 kV pk / 6.5 kHz from the half-bridge + 25 kV flyback, 6 L/min
+// dry air into a venturi, stage-2 bucket; daily 50 gal batches of municipal
+// ag water (pH 10, KH 1.5 meq/L) treated to pH 5.5, topping off a 300 gal NFT
+// reservoir. The NFT channel layout is the default (not in the reference).
+internal NftParams nft_preset(u32 preset) {
+    NftParams p = nft_default_params();
+    if (preset == NftPreset_PawSkid) {
+        p.paw = paw_default_params();
+        p.paw.enabled = 1;
+        p.reservoir_L = 1135.6f;              // 300 gal
+        p.reservoir_fixed = 1;
+        p.tap_alk_meq = 1.6f;                 // same municipal water if the PAW stock runs out (KH + hydroxide)
+        p.fill_T_C = p.paw.source_T_C;
+    }
+    return p;
+}
+
 // ---------------------------------------------------------------------------
 // System
 
@@ -344,6 +373,7 @@ struct NftAccounts {            // cumulative since reset
     f64 evap_channel_L, evap_tank_L, evap_heat_J;
     f64 acid_mmol, base_mmol, acid_L, base_L;   // 1 M HNO3 / 1 M KOH
     f64 holdup_L;                       // water held in the channels (follows the root mats)
+    f64 paw_L, paw_N_mg;                // top-off from the PAW skid and the nitrate-N (+ nitrite-N) it carried
     f64 dumped_L, dumped_mg[NFT_IONS];
     f64 last_dump_t;
     f64 harvest_g[2], harvests[2];     // per bank
@@ -378,6 +408,7 @@ struct NftSystem {
     u32 overflow_cells;                // cells whose film tops the channel wall (last solve)
     f32 max_depth_m;
     f64 evap_channel_L_s, evap_tank_L_s, transp_L_s;   // rates over the last window
+    PawSkid paw;                       // plasma-activated water batch skid (params.paw)
     f32 ref[NftF_Count];               // rail cells store x - ref (deltas): ref = this window's inlet
 };
 
@@ -587,7 +618,7 @@ internal f64 nft_pump_heat_W(NftParams *p, NftHydraulics *h) {
 internal void nft_auto_size(NftSystem *s, NftParams *p) {
     if (!p->auto_size) return;
     f64 plants = (f64)s->rails * (f64)s->sites;
-    p->reservoir_L = (f32)Maximum(50.0, 0.75 * plants);
+    if (!p->reservoir_fixed) p->reservoir_L = (f32)Maximum(50.0, 0.75 * plants);
     p->tank_ua_W_K = (f32)(0.5 * pow((f64)p->reservoir_L / 1000.0, 2.0 / 3.0) * 6.0 * 1.8);   // ~cube tank, U 1.8 W/m2K
     f64 q_target = (f64)p->target_flow_L_min / 60000.0 * s->rails;
     u32 size = 0;
@@ -758,6 +789,7 @@ internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
     f64 holdup = s->acc.holdup_L;
     memset(&s->acc, 0, sizeof(s->acc));   // the books start from the made-up batch
     s->acc.holdup_L = holdup;
+    paw_init(&s->paw, &params.paw);
     // the channels hold the same adjusted solution as the tank
     for (u32 k = 1; k < NftF_Count; ++k) s->ref[k] = (f32)nft_reservoir_conc(s, k);
     CopyArray(s->inlet, s->ref, NftF_Count);
@@ -1222,14 +1254,38 @@ internal void nft_reservoir_window(NftSystem *s) {
     s->evap_channel_L_s = evap_kg / dt;
     s->evap_tank_L_s = evap_tank_L / dt;
 
-    // top-off with tap water (no tracked ions; its alkalinity goes into R) back to the set volume
+    // the PAW skid runs its batch alongside (drum chemistry, plasma, stage 2)
+    paw_window(&s->paw, &p->paw, dt, s->T_amb, nft_pco2_atm(p));
+
+    // top-off back to the set volume: finished PAW first, then tap water (no
+    // tracked ions; its alkalinity goes into R). PAW brings its nitrate and
+    // nitrite (nitrified in the aerated loop within hours: booked as nitrate),
+    // its residual alkalinity / counter-ions into R, and its temperature;
+    // residual ozone is spent on contact (chelates, biofilm).
     if (p->topoff_on && r->V_L < 0.95 * p->reservoir_L) {
         f64 add = p->reservoir_L - r->V_L;
-        r->T_C = (r->T_C * r->V_L + p->fill_T_C * add) / p->reservoir_L;
-        r->mass_mg[NftF_DO] += nft_do_sat_f64(p->fill_T_C) * add;
+        f64 paw_L = Minimum(add, paw_available_L(&s->paw, &p->paw)), tap_L = add - paw_L;
+        f64 heat = r->T_C * r->V_L + p->fill_T_C * tap_L;
+        r->mass_mg[NftF_DO] += nft_do_sat_f64(p->fill_T_C) * tap_L;
+        if (paw_L > 0.0) {
+            PawWater w;
+            paw_take(&s->paw.drum, paw_L, &w);
+            heat += w.T_C * w.V_L;
+            r->mass_mg[NftF_DO] += nft_do_sat_f64(w.T_C) * w.V_L;   // venturi-aerated
+            f64 n_mg = (w.no3_mmol + w.no2_mmol) * PAW_N_MG;
+            r->mass_mg[NftF_NO3] += n_mg;
+            s->acc.dosed_mg[NftF_NO3 - NFT_ION0] += n_mg;
+            s->R_meq += w.R_meq;
+            s->acc.paw_L += paw_L;
+            s->acc.paw_N_mg += n_mg;
+            s->paw.acc.delivered_L += paw_L;
+            s->paw.acc.delivered_N_mmol += w.no3_mmol + w.no2_mmol;
+            s->paw.acc.delivered_no2_mmol += w.no2_mmol;
+        }
+        r->T_C = heat / p->reservoir_L;
         r->V_L = p->reservoir_L;
         s->acc.topoff_L += add;
-        s->R_meq += (f64)p->tap_alk_meq * add;
+        s->R_meq += (f64)p->tap_alk_meq * tap_L;
     }
     // EC dosing, rate-limited. Stock ion ratios: either the fill recipe, or
     // matched to what the plants actually take up (their tissue composition),

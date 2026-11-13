@@ -56,6 +56,20 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
     ImGui::Text("day %.2f  %02d:%02d  %s  %s/s", s->t / 86400.0, (int)hour, (int)((hour - (int)hour) * 60.0),
                 s->light > 0.5f ? "lights on" : "lights off", ui_duration(rate, buf, sizeof(buf)));
 
+    // presets: whole-system starting points
+    {
+        static s32 preset = -1;
+        if (preset < 0) preset = (s32)Minimum(memory->config.preset, (u32)NftPreset_Count - 1);
+        ImGui::SetNextItemWidth(-60);
+        ImGui::Combo("##preset", &preset, nft_preset_names, NftPreset_Count);
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+            state->nft_params = nft_preset((u32)preset);
+            sim_reset_scene(state, memory);
+            sc = state->nft; s = &sc->sys; p = &s->params;
+        }
+    }
+
     // structure
     if (ImGui::CollapsingHeader("System", ImGuiTreeNodeFlags_DefaultOpen)) {
         static s32 channels = 0, plants = 0;
@@ -238,6 +252,67 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
                     nft_peak_heat_W(s, p, nft_pump_heat_W(p, &s->hyd)));
     }
 
+    // plasma-activated water skid
+    if (ImGui::CollapsingHeader("PAW skid (DBD)", p->paw.enabled ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+        PawParams *pp = &p->paw;
+        PawSkid *k = &s->paw;
+        bool en = pp->enabled != 0;
+        if (ImGui::Checkbox("PAW batches top off the reservoir", &en)) {
+            pp->enabled = en;
+            paw_init(k, pp);
+        }
+        if (pp->enabled) {
+            ImGui::PushItemWidth(-130);
+            ImGui::SeparatorText("Modules and drive");
+            s32 mods = (s32)pp->modules;
+            if (ImGui::SliderInt("modules", &mods, 1, 6)) pp->modules = (u32)mods;
+            ui_combo_u32("pipe / gap", &pp->pipe_sch5, paw_pipe_names, 2);
+            ui_slider_f32("active length mm", &pp->active_mm, 50.0f, 250.0f, "%.0f");
+            ui_slider_f32("peak voltage kV", &pp->v_peak_kV, 8.0f, 20.0f, "%.2f");
+            ui_slider_f32("frequency kHz", &pp->freq_kHz, 1.0f, 25.0f, "%.2f");
+            ui_slider_f32("DC bus V", &pp->bus_V, 20.0f, 350.0f, "%.0f");
+            ui_slider_f32("burst duty", &pp->burst_duty, 0.0f, 1.0f, "%.2f");
+            ui_slider_f32("Manley factor", &pp->manley_factor, 0.3f, 1.0f, "%.2f");
+            ImGui::SeparatorText("Gas and capture");
+            ui_slider_f32("dry air L/min", &pp->air_L_min, 0.5f, 30.0f, "%.1f", 1);
+            ui_slider_f32("NOx cost MJ/mol", &pp->nox_MJ_mol, 5.0f, 60.0f, "%.1f");
+            ui_slider_f32("N2O5 share", &pp->n2o5_share, 0.0f, 1.0f, "%.2f");
+            ui_slider_f32("venturi capture pH<6", &pp->capture_lo, 0.2f, 1.0f, "%.2f");
+            ui_slider_f32("venturi capture pH>8", &pp->capture_hi, 0.2f, 1.0f, "%.2f");
+            bool st2 = pp->stage2_on != 0;
+            if (ImGui::Checkbox("stage-2 bucket (next batch's water)", &st2)) pp->stage2_on = st2;
+            ImGui::SeparatorText("Batch");
+            ui_slider_f32("source pH", &pp->source_pH, 6.0f, 11.0f, "%.1f");
+            ui_slider_f32("source KH meq/L", &pp->source_kh_meq, 0.0f, 5.0f, "%.2f");
+            ui_slider_f32("batch target pH", &pp->batch_pH, 3.0f, 7.0f, "%.2f");
+            ui_slider_f32("hold h", &pp->hold_h, 0.0f, 12.0f, "%.1f");
+            ImGui::PopItemWidth();
+            const PawElectrical &e = k->el;
+            ImGui::SeparatorText("Operating point");
+            ImGui::Text("C_d %.0f pF, C_g %.0f pF per module; ignition %.1f kV pk", e.Cd_F * 1e12, e.Cg_F * 1e12, e.Vign_V * 1e-3);
+            ImGui::Text("plasma %.0f W (Manley ideal %.0f W/module)", e.P_avg_W, e.P_ideal_W);
+            if (e.P_ideal_W <= 0.0) ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "below ignition: no discharge");
+            if (e.flyback_limited) ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "flyback limit (%.0f W): voltage sags", pp->flyback_W_max);
+            if (e.bus_limited) ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "half-bridge at %.0f A", pp->bus_A_max);
+            ImVec4 dens = e.W_cm2 <= 1.0 ? ImVec4(0.6f, 0.9f, 0.6f, 1) : e.W_cm2 <= 1.5 ? ImVec4(1, 0.75f, 0.3f, 1) : ImVec4(1, 0.4f, 0.3f, 1);
+            ImGui::TextColored(dens, "%.2f W/cm2 (submerged limit ~1.0), bus %.2f A", e.W_cm2, e.I_bus_A);
+            f64 regime = paw_nox_regime(e.SEI_kJ_L);
+            ImGui::Text("SEI %.2f kJ/L: %s, NOx %.1f g/h as NO2", e.SEI_kJ_L, regime > 0.99 ? "NOx mode" : regime < 0.01 ? "ozone mode" : "mixed",
+                        e.P_avg_W * regime / (pp->nox_MJ_mol * 1e6) * 3600.0 * 46.0);
+            PawWater *d = &k->drum;
+            f64 v = Maximum(d->V_L, 1e-9);
+            ImGui::SeparatorText("Drum");
+            ImGui::Text("%s, %.0f L at %.1f C, pH %.2f", paw_state_names[k->state], d->V_L, d->T_C, d->pH);
+            ImGui::Text("NO3- %.2f mM, NO2- %.3f mM, O3 %.3f mg/L, capture %.0f %%", d->no3_mmol / v, d->no2_mmol / v,
+                        d->o3_mmol * 48.0 / v, 100.0 * k->capture);
+            ImGui::TextDisabled("%.0f batches, last %.1f h / %.2f kWh plasma, nitrite %.0f %% of N", k->acc.batches,
+                                k->acc.last_batch_h, k->acc.last_batch_kWh, 100.0 * k->acc.nitrite_frac_last);
+            ImGui::TextDisabled("delivered %.0f L (%.0f mg N); vented %.1f %% of fixed N; supply %.1f kWh", k->acc.delivered_L,
+                                k->acc.delivered_N_mmol * PAW_N_MG,
+                                k->acc.nox_N_mmol > 0 ? 100.0 * k->acc.vented_N_mmol / k->acc.nox_N_mmol : 0.0, k->acc.supply_J / 3.6e6);
+        }
+    }
+
     // nutrients
     if (ImGui::CollapsingHeader("Nutrients", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushItemWidth(-130);
@@ -356,6 +431,20 @@ internal void ui_nft_plots(SimState *state) {
             ui_nft_line(sc, "tank pH", NftCol_pH, ImVec4(1, 0.85f, 0.3f, 1));
             ui_nft_line(sc, "acid mmol", NftCol_AcidMmol, ImVec4(1, 0.4f, 0.35f, 1), ImAxis_Y2);
             ui_nft_line(sc, "base mmol", NftCol_BaseMmol, ImVec4(0.4f, 0.6f, 1, 1), ImAxis_Y2);
+            ImPlot::EndPlot();
+        }
+        ImGui::EndTabItem();
+    }
+    if (state->nft->sys.params.paw.enabled && ImGui::BeginTabItem("PAW")) {
+        if (ImPlot::BeginPlot("##paw", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes("day", "pH / mM", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxis(ImAxis_Y2, "W / L", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+            ui_nft_line(sc, "drum pH", NftCol_PawPH, ImVec4(1, 0.85f, 0.3f, 1));
+            ui_nft_line(sc, "nitrate mM", NftCol_PawNO3, ImVec4(0.4f, 0.8f, 1, 1));
+            ui_nft_line(sc, "nitrite mM", NftCol_PawNO2, ImVec4(1, 0.5f, 0.4f, 1));
+            ui_nft_line(sc, "plasma W", NftCol_PawW, ImVec4(0.8f, 0.5f, 1, 1), ImAxis_Y2);
+            ui_nft_line(sc, "drum L", NftCol_PawL, ImVec4(0.7f, 0.7f, 0.7f, 1), ImAxis_Y2);
             ImPlot::EndPlot();
         }
         ImGui::EndTabItem();

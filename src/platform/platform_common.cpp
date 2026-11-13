@@ -40,6 +40,7 @@ struct PlatformArgs {
     f64 speed;            // SimConfig::speed
     f32 channel_length_m; // SimConfig (nft)
     u32 view_layer;
+    u32 preset;
     u32 plants_per_channel;
     const char *csv_path;
     u32 seed;
@@ -57,6 +58,8 @@ internal void platform_print_usage(const char *exe) {
            "  --scene S      particles (M1 demo, default), dbd (plug-flow DBD reactor), sweep (power x humidity grid),\n"
            "                 nft (NFT rails, reservoir + chiller, plants)\n"
            "  --channels N   nft: channel count (default 16); --channel-length M (default 4 m); --plants N per channel (default 26)\n"
+           "  --preset P     default | paw-skid: nft = three-module DBD skid making 50 gal PAW batches for a 300 gal\n"
+           "                 NFT reservoir; dbd = one module's annulus (dry air, its power, residence, frequency)\n"
            "  --speed X      nft: simulated seconds per wall second (default 3600; headless: per 1/60 s frame x 60)\n"
            "  --headless N   run N frames without a window at a fixed 1/60 s frame dt, print timings\n"
            "  --zones N      dbd: axial zones (default 64); sweep: grid points (rounded down to a square, default 256)\n"
@@ -120,6 +123,11 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             args.zone_count = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--channel-length") == 0 && next) {
             args.channel_length_m = (f32)atof(next); ++i;
+        } else if (strcmp(a, "--preset") == 0 && next) {
+            if (strcmp(next, "default") == 0) args.preset = 0;
+            else if (strcmp(next, "paw-skid") == 0) args.preset = 1;
+            else { printf("unknown preset %s (default | paw-skid)\n", next); exit(1); }
+            ++i;
         } else if (strcmp(a, "--layer") == 0 && next) {
             args.view_layer = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--plants") == 0 && next) {
