@@ -105,10 +105,14 @@ typedef GPU_KIN_ADVANCE_ASYNC(gpu_kin_advance_async_fn);
 #define GPU_KIN_WAIT(name) s32 name(f32 *kernel_ms, f32 *total_ms)
 typedef GPU_KIN_WAIT(gpu_kin_wait_fn);
 
+// Kernel decomposition: 0 = one thread per zone (default), 1 = one warp per zone.
+#define GPU_KIN_SET_MODE(name) s32 name(u32 mode)
+typedef GPU_KIN_SET_MODE(gpu_kin_set_mode_fn);
+
 #define GPU_EXPORT_NAMES(X) \
     X(gpu_init) X(gpu_error_string) X(gpu_alloc) X(gpu_arena_used) X(gpu_arena_reset) X(gpu_copy_to_device) X(gpu_copy_to_host) \
     X(gpu_sync) X(gpu_step_points) X(gpu_kin_set_mech) X(gpu_kin_advance) X(gpu_host_register) X(gpu_host_unregister) \
-    X(gpu_kin_advance_async) X(gpu_kin_wait)
+    X(gpu_kin_advance_async) X(gpu_kin_wait) X(gpu_kin_set_mode)
 
 // The table the platform fills from dlsym and hands to the sim.
 struct GpuAPI {

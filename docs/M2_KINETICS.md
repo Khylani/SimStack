@@ -147,8 +147,8 @@ Reference hashes for `--scene dbd --headless 30` hold for any `--threads`, for C
 
 | Lanes | Hash |
 | --- | --- |
-| f32 (default) | `3741c9877f88ad5d` |
-| `--precision f64` | `a2be2f374ec0cfb4` |
+| f32 (default) | `ef492929d2110e75` |
+| `--precision f64` | `ef15ffac690ff7b1` |
 
 ## Performance (i9-12900KF, RTX 3060 12 GB)
 
@@ -217,6 +217,46 @@ The split is timing-dependent, but the results are not.
 | reactor, 64 zones, pulsed | ~2.8–3.4 | 0.006 | ~2.8–3.1 (picks CPU-only) |
 
 Machine noise is about ±15% (other jobs were running).
+
+### Warp per zone (`gpu_kin_set_mode(1)`)
+
+A second CUDA decomposition: one warp cooperates on each zone.
+- Rates, Jacobian terms and each LU elimination's updates run across the 32 threads.
+- The triangular solves are column-oriented.
+- Scratch lives in shared memory, about 4 KB per zone.
+- Every element is produced by the same operation sequence as the CPU table walk.
+  - To make the backward solve column-orientable, **all paths now accumulate each row's
+    upper entries in descending column order**, which changed the reference hashes.
+- It is bit-identical to the CPU in f32 and f64, pulsed and averaged (tested).
+
+It is also **3–36× slower than one thread per zone** for this 17-species mechanism, and the
+reason was measured:
+- The LU has 104 strictly sequential eliminations averaging 7 updates each.
+- There are about 300 warp syncs per Rosenbrock step.
+- The table-driven kernels can't use the generated straight-line code.
+
+It stays as a verified option for larger mechanisms (e.g. reduced `dbd_ref` sets with 40–80
+species), where one thread's state no longer fits in registers. Thread per zone remains the
+default.
+
+| f32 lanes, time for the run | thread / zone | warp / zone | 1 AVX2 core |
+| --- | --- | --- | --- |
+| 64 zones × 2 ms pulsed | 16 ms | 97 ms | 9 ms |
+| 4096 zones × 2 ms pulsed | 31 ms | 1112 ms | 553 ms |
+| 16384 zones × 2 ms pulsed | 119 ms | 4321 ms | — |
+
+### A GPU race found and fixed
+
+A sweep at 169+ zones gave a different hash on CUDA than on the CPU, and so did two CUDA runs
+of the same case. The cause was in the synchronous path:
+- Uploads used a plain `cudaMemcpy` on the legacy default stream.
+- From pageable memory that call returns once the data is **staged**, before the DMA lands.
+- The kernel ran on the module's **non-blocking** stream, which doesn't order against the
+  default stream, so it could read partly-old inputs.
+
+Now every copy and kernel goes on the module's stream, and synchronous copies wait for it.
+The regression test runs 64 zones × 10 × 20 ms with an upload every step, in both precisions.
+Sweeps at 169, 256 and 4096 zones now give identical hashes on CPU, CUDA and hybrid.
 
 ### Why CUDA is not faster here, and what fp32 changed
 

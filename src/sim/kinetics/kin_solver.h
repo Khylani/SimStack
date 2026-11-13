@@ -153,6 +153,7 @@ template <u32 S, u32 R, u32 N>
 struct KinTableOps {
     enum { species = S, reactions = R, nnz = N };
     static SIM_HD u32 n(const KinMech *m) { return m->species_count; }
+    static SIM_HD bool writer() { return true; }   // cooperative (warp) policies: only one lane stores results
     template <class V> static SIM_HD void fun(const KinMech *m, const V *k, const V *src, const V *y, V *f) { kin_fun(m, k, src, y, f); }
     template <class V> static SIM_HD void neg_jac(const KinMech *m, const V *k, const V *y, V *a) { kin_neg_jac(m, k, y, a); }
     template <class V> static SIM_HD void factor(const KinMech *m, V ghinv, V *a) { kin_factor(m, ghinv, a); }
