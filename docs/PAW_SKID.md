@@ -149,8 +149,8 @@ flags it. Two ways to bring the alumina down:
 - Give the rod a cooling path, for example a hollow rod with water through it, or a
   conductive path out of the bore to a sink above the cap.
 
-**The gas chemistry at that temperature.** The M2 kinetics, with the excited-state channels,
-run one module at 1.64 W/cm³, 413 K, 1.32 s, 2.2 kJ/L:
+**The gas chemistry at that temperature (superseded below).** The first M2 run, with the
+averaged source, ran one module at 1.64 W/cm³, 413 K, 1.32 s, 2.2 kJ/L:
 - **Ozone collapses to 38 ppm** (the "ozone zero" of hot DBDs). At a cooled 321 K it would be
   2.1 %, ozonizer behaviour.
 - **NO survives instead of being oxidized:** 220 ppm NO with 170 ppm NO₂, 170 ppm HNO₃,
@@ -165,6 +165,20 @@ literature. Its yield depends on the vibrational distribution inside microsecond
 which needs a state-resolved solver: the planned ChemPlasKin / LoKI-B reference, not a tuned
 lumped model. Until then the design estimate stays the default gas source. The kinetics show
 the cool-gap and no-N₂(v) limits.
+
+**With the validated source** (LoKI-B++ G-values at 180 Td, 30 mJ/cm³ filaments, Kossyi
+N + NO₂; see `tools/ref/README.md`):
+- **SimStack kinetics:** at 413 K the skid sits right at the ozone-to-NOx switch. The
+  kinetics source gives about 1500 ppm O₃ and soluble nitrogen at **28 MJ/mol**, for a
+  **12.9 h** batch.
+- **ChemPlasKin** (full electron, ion and excited-state kinetics) at the same point: ozone
+  fully gone, 520 ppm NO with 470 ppm NO₂, **73 MJ/mol**.
+- **The two models place the switch differently.** The reduced model collapses the same
+  way at E_f ≤ 10 mJ/cm³ (74 MJ/mol) but sits half in ozone mode at 30.
+- **Best current estimate: 30–75 MJ/mol, ozone near zero.** That's 12–30 h for a pH 10, KH
+  1.5 batch at 216 W, against the design's 22 MJ/mol and 8.8 h. Neither code has N₂(v),
+  which can only make NO cheaper.
+- The default gas source stays the design estimate until a measurement anchors it.
 
 **What settles it in the first runs:**
 - Ozone and NO₂ at the drum vent (ozone means a cool gap; NO₂ with no ozone means NOx mode).

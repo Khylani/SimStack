@@ -3,7 +3,7 @@
 // Boltzmann/plasma part until the M2 reference solver (ChemPlasKin) and the
 // generated reduction tables exist.
 //
-// 17 species, 41 reactions. Rate data: JPL 19-5 / IUPAC evaluations at the
+// 17 species, 44 reactions. Rate data: JPL 19-5 / IUPAC evaluations at the
 // low-pressure-limit / fall-off forms given there, rounded to two digits.
 //
 // Three metastables carry the chemistry that ground-state radicals alone
@@ -64,7 +64,11 @@ internal void air_mech_build(KinModel *model, AirSpecies *sp) {
     // N atoms
     kin_add_reaction(model, "N + NO -> N2 + O",            kin_arr(2.1e-11, 0.0, -100.0));
     kin_add_reaction(model, "N + O2 -> NO + O",            kin_arr(1.5e-11, 0.0, 3600.0));
-    kin_add_reaction(model, "N + NO2 -> N2O + O",          kin_arr(5.8e-12, 0.0, -220.0));
+    // N + NO2: JPL total, Kossyi 1992 branching (N2O + O 0.43, 2 NO 0.33, N2 + 2 O 0.13, N2 + O2 0.10)
+    kin_add_reaction(model, "N + NO2 -> N2O + O",          kin_arr(0.434 * 5.8e-12, 0.0, -220.0));
+    kin_add_reaction(model, "N + NO2 -> NO + NO",          kin_arr(0.333 * 5.8e-12, 0.0, -220.0));
+    kin_add_reaction(model, "N + NO2 -> N2 + O + O",       kin_arr(0.132 * 5.8e-12, 0.0, -220.0));
+    kin_add_reaction(model, "N + NO2 -> N2 + O2",          kin_arr(0.101 * 5.8e-12, 0.0, -220.0));
     kin_add_reaction(model, "N + O + M -> NO + M",         kin_m(5.5e-33, 0.0, -155.0));
     kin_add_reaction(model, "N + N + M -> N2 + M",         kin_m(8.3e-34, 0.0, -500.0));
     kin_add_reaction(model, "N + OH -> NO + H",            kin_arr(4.7e-11));
@@ -118,13 +122,38 @@ internal void air_mech_build(KinModel *model, AirSpecies *sp) {
 // parent, so N, O and H atoms are conserved exactly. These are the tunables
 // a Boltzmann (LoKI-B) solution of the reduced field will replace.
 
+#include "air_source_table.h"   // LoKI-B++ G-values vs E/N (tools/ref/loki_gvalues.py)
+
 struct AirSourceModel {
     f64 g_O2_diss;        // O2 dissociations per 100 eV at x_O2 = 0.21
     f64 f_O1D;            // share of them in the O + O(1D) channel
     f64 g_N2A;            // N2(A) per 100 eV at x_N2 = 0.78 (incl. cascade)
     f64 g_N2_diss;        // N2 dissociations per 100 eV at x_N2 = 0.78 (-> N + N(2D))
     f64 g_OH_per_100eV;   // H2O dissociations at x_H2O = 0.02
+    // Boltzmann source: when on, the first four come from the LoKI-B++ table at
+    // the micro-discharges' reduced field instead of the hand-set values above
+    b32 boltzmann;
+    f64 reduced_field_Td;
+    // Micro-discharge (filament) energy density: each gas parcel is hit by a
+    // filament depositing filament_J_cm3, at rate power / filament_J_cm3.
+    // 0 = the averaged picture: one pulse per half-cycle with power / (2 f).
+    f64 filament_J_cm3;
 };
+
+// Linear interpolation in the LoKI-B++ table (clamped at its ends).
+internal void air_source_table_lookup(f64 en_Td, f64 *g_o2, f64 *f_o1d, f64 *g_n2a, f64 *g_n2d, f64 *eta_vib) {
+    u32 n = AIR_SOURCE_TABLE_ROWS;
+    f64 x = Clamp(en_Td, air_source_table[0][0], air_source_table[n - 1][0]);
+    u32 i = 0;
+    while (i + 2 < n && air_source_table[i + 1][0] < x) ++i;
+    const f64 *a = air_source_table[i], *b = air_source_table[i + 1];
+    f64 t = (x - a[0]) / (b[0] - a[0]);
+    *g_o2 = a[1] + t * (b[1] - a[1]);
+    *f_o1d = a[2] + t * (b[2] - a[2]);
+    *g_n2a = a[3] + t * (b[3] - a[3]);
+    *g_n2d = a[4] + t * (b[4] - a[4]);
+    if (eta_vib) *eta_vib = a[5] + t * (b[5] - a[5]);
+}
 
 internal AirSourceModel air_source_defaults() {
     AirSourceModel s;
@@ -133,6 +162,9 @@ internal AirSourceModel air_source_defaults() {
     s.g_N2A = 1.5;
     s.g_N2_diss = 0.4;
     s.g_OH_per_100eV = 0.3;
+    s.boltzmann = 0;
+    s.reduced_field_Td = 180.0;   // air DBD micro-discharges: 150-250 Td
+    s.filament_J_cm3 = 0.0;
     return s;
 }
 
@@ -171,11 +203,14 @@ internal void air_source_delta(AirSpecies *sp, AirSourceModel *src, const f64 *y
     for (u32 s = 0; s < n; ++s) total += y[s];
     if (total <= 0.0 || energy_J_cm3 <= 0.0) return;
     f64 hundreds_eV = energy_J_cm3 * EV_PER_JOULE * 0.01;
-    f64 dO2 = src->g_O2_diss  * (y[sp->O2]  / total / 0.21) * hundreds_eV;
-    f64 dA  = src->g_N2A      * (y[sp->N2]  / total / 0.78) * hundreds_eV;
-    f64 dN2 = src->g_N2_diss  * (y[sp->N2]  / total / 0.78) * hundreds_eV;
+    f64 g_o2 = src->g_O2_diss, f_o1d = src->f_O1D, g_n2a = src->g_N2A, g_n2d = src->g_N2_diss;
+    if (src->boltzmann) air_source_table_lookup(src->reduced_field_Td, &g_o2, &f_o1d, &g_n2a, &g_n2d, 0);
+    // (the table is for dry air 79/21: scale by the parents' mole fractions as below)
+    f64 dO2 = g_o2  * (y[sp->O2]  / total / 0.21) * hundreds_eV;
+    f64 dA  = g_n2a * (y[sp->N2]  / total / 0.78) * hundreds_eV;
+    f64 dN2 = g_n2d * (y[sp->N2]  / total / 0.78) * hundreds_eV;
     f64 dOH = src->g_OH_per_100eV * (y[sp->H2O] / total / 0.02) * hundreds_eV;
-    f64 d1D = src->f_O1D * dO2;
+    f64 d1D = f_o1d * dO2;
     // ground-state products and the parents consumed
     delta[sp->O2] -= dO2;   delta[sp->O] += 2.0 * dO2 - d1D;
     delta[sp->N2] -= dA + dN2;
@@ -192,17 +227,17 @@ internal void air_source_delta(AirSpecies *sp, AirSourceModel *src, const f64 *y
         { 7.0e-12, sp->O },           // -> NO + N(2D)
         { 7.0e-11, sp->NO },          // -> N2 + NO (quench)
         { 1.0e-12, sp->NO2 },         // -> N2 + NO + O
-        { 8.0e-11, sp->N2O },         // -> N2 + N2 + O
+        { 8.0e-11, sp->N2O },         // -> N2 + N + NO (Kossyi 1992)
         { 5.0e-14, sp->H2O },         // -> N2 + H + OH
         { 3.0e-16, sp->N2 },          // -> N2 + N2 (quench)
     };
     air_branch(a_ch, ArrayCount(a_ch), y, dA, f);
     delta[sp->N2] += dA * (f[0] + f[1] + f[4] + f[5] + f[6] + f[7] + f[8]);
-    delta[sp->O2] -= dA * (f[0] + f[2]);   delta[sp->O] += dA * (2.0 * f[0] + f[2] + f[5] + f[6]);
+    delta[sp->O2] -= dA * (f[0] + f[2]);   delta[sp->O] += dA * (2.0 * f[0] + f[2] + f[5]);
     delta[sp->N2O] += dA * (f[2] - f[6]);
-    delta[sp->O] -= dA * f[3];   delta[sp->NO] += dA * (f[3] + f[5]);   f64 n2d = dN2 + dA * f[3];
+    delta[sp->O] -= dA * f[3];   delta[sp->NO] += dA * (f[3] + f[5] + f[6]);   f64 n2d = dN2 + dA * f[3];
     delta[sp->NO2] -= dA * f[5];
-    delta[sp->N2] += dA * f[6];   // N2(A) + N2O -> 2 N2 + O: the second N2 comes from N2O
+    delta[sp->N] += dA * f[6];    // N2(A) + N2O -> N2 + N + NO
     delta[sp->H2O] -= dA * f[7];   delta[sp->H] += dA * f[7];   delta[sp->OH] += dA * f[7];
     // N(2D) (Herron 1999)
     const AirChannel n_ch[] = {

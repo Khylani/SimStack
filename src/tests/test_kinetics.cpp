@@ -662,6 +662,47 @@ internal void test_nft() {
     CHECK(ph_end[0] > ph_start[0] + 0.2 && ph_end[1] < ph_start[1] - 0.2, "pH drift direction");
 }
 
+// Reduced air source vs the reference solvers (tools/ref/README.md). The
+// ChemPlasKin numbers are full electron + ion + excited-state kinetics (CppBOLOS
+// on-the-fly EEDF, 710-reaction air mechanism + N2O5), dry air, 180 Td, 330 K,
+// 2.16 J/cm^3 over 1.32 s; recorded here so a mechanism change that drifts
+// away from them fails.
+internal void test_reference_source(KinModel *model, AirSpecies *sp) {
+    // the LoKI-B++ table interpolates exactly at its nodes
+    f64 go, fo, ga, gn, ev;
+    air_source_table_lookup(air_source_table[14][0], &go, &fo, &ga, &gn, &ev);
+    CHECK(go == air_source_table[14][1] && ga == air_source_table[14][3] && gn == air_source_table[14][4], "table lookup at a node");
+    air_source_table_lookup(180.0, &go, &fo, &ga, &gn, &ev);
+    printf("[ref] LoKI-B++ G-values at 180 Td (dry air): O2 diss %.2f (O(1D) %.0f %%), N2(A) %.2f, N2 -> N + N(2D) %.3f per 100 eV; "
+           "N2 vibration %.0f %% of the electron power\n", go, 100 * fo, ga, gn, 100 * ev);
+    struct Case { f64 ef_mJ, ref_MJ_mol, ref_n2o_ppm, ref_o3_ppm; } cases[] = {
+        { 10.0, 39.9, 356, 30130 }, { 30.0, 44.1, 210, 32025 }, { 100.0, 37.2, 97, 30717 },
+    };
+    KinMethod method = kin_method(KinMethod_Rodas3);
+    KinControl ctl = dbd_default_control();
+    for (u32 c = 0; c < ArrayCount(cases); ++c) {
+        Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
+        AirSourceModel src = air_source_defaults();
+        src.boltzmann = 1; src.reduced_field_Td = 180.0; src.filament_J_cm3 = cases[c].ef_mJ * 1e-3;
+        DbdZones z;
+        dbd_zones_alloc(&z, &arena, model, 1);
+        z.T_K[0] = 330.0; z.p_Pa[0] = 101325.0; z.x_H2O[0] = 0.0; z.power_W_cm3[0] = 1.64; z.freq_Hz[0] = 6500.0;
+        dbd_zones_fill_padding(&z); dbd_zones_reset(&z, sp); dbd_zones_prepare_rates(&z, model);
+        f64 res = 1.32;
+        for (u32 i = 0; i < 1320; ++i)
+            dbd_step_cpu<f64x4, AirGenOps>(&z, model, sp, &src, DbdDischarge_Pulsed, &method, &ctl, i * 1e-3, Minimum((i + 1) * 1e-3, res));
+        f64 fixedN = (z.y[sp->NO * z.padded] + z.y[sp->NO2 * z.padded] + z.y[sp->NO3 * z.padded] + 2.0 * z.y[sp->N2O5 * z.padded] +
+                      z.y[sp->HNO2 * z.padded] + z.y[sp->HNO3 * z.padded]) / 6.02214076e23;
+        f64 cost = 1.64 * res / fixedN * 1e-6;
+        f64 n2o = dbd_ppm(&z, sp->N2O, 0), o3 = dbd_ppm(&z, sp->O3, 0);
+        printf("[ref] E_f %3.0f mJ/cm3, 330 K: fixed N %.1f MJ/mol (ChemPlasKin %.1f), N2O %.0f ppm (%.0f), O3 %.0f ppm (%.0f)\n",
+               cases[c].ef_mJ, cost, cases[c].ref_MJ_mol, n2o, cases[c].ref_n2o_ppm, o3, cases[c].ref_o3_ppm);
+        CHECK(cost / cases[c].ref_MJ_mol > 0.6 && cost / cases[c].ref_MJ_mol < 1.5, "fixed-N cost vs reference");
+        CHECK(n2o / cases[c].ref_n2o_ppm > 0.8 && n2o / cases[c].ref_n2o_ppm < 2.5, "N2O vs reference");
+        CHECK(o3 / cases[c].ref_o3_ppm > 1.0 && o3 / cases[c].ref_o3_ppm < 1.5, "O3 vs reference (known +35 %% bias)");
+    }
+}
+
 internal void test_nft_water() {
     // Brinkman film: Nusselt as K -> inf, Darcy in a dense mat, series / closed form agree at the switch
     f64 gS_nu = NFT_G * 0.02 / 1.0e-6, h = 3e-3;
@@ -992,6 +1033,7 @@ int main(int argc, char **argv) {
     test_f32(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
+    test_reference_source(model, &sp);
     test_hydraulics();
     test_nft_water();
     test_nft();

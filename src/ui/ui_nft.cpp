@@ -275,6 +275,8 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             ui_slider_f32("Manley factor", &pp->manley_factor, 0.3f, 1.0f, "%.2f");
             ImGui::SeparatorText("Gas and capture");
             ui_combo_u32("gas chemistry", &pp->gas_source, paw_gas_source_names, PawGas_Count);
+            ui_slider_f32("filament E/N Td", &pp->reduced_field_Td, 80.0f, 300.0f, "%.0f");
+            ui_slider_f32("filament mJ/cm3", &pp->filament_mJ_cm3, 1.0f, 200.0f, "%.0f", 1);
             if (ImGui::Button("Run chemistry (M2 kinetics)")) paw_gas_compute(&s->paw_chem, &k->gas, pp, k->drum.T_C);
             bool manual = pp->gas_T_manual != 0;
             if (ImGui::Checkbox("manual gap temperature", &manual)) pp->gas_T_manual = manual;

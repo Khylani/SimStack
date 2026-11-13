@@ -129,7 +129,9 @@ internal void dbd_zones_prepare_source(DbdZones *z, AirSpecies *sp, AirSourceMod
         for (u32 s = 0; s < n; ++s) y[s] = z->y[s * p + i];
         f64 freq = z->freq_Hz[i];
         b32 on = z->power_W_cm3[i] > 0.0 && freq > 0.0;
-        f64 pulses_per_s = 2.0 * freq;   // one micro-discharge burst per half-cycle
+        // one micro-discharge burst per half-cycle, or (filament model) a filament
+        // of filament_J_cm3 at rate power / filament_J_cm3
+        f64 pulses_per_s = source->filament_J_cm3 > 0.0 && on ? z->power_W_cm3[i] / source->filament_J_cm3 : 2.0 * freq;
         if (mode == DbdDischarge_Pulsed && on) {
             air_source_delta(sp, source, y, n, z->power_W_cm3[i] / pulses_per_s, delta, z->T_K[i]);
             for (u32 s = 0; s < n; ++s) { z->pulse[s * p + i] = delta[s]; z->src[s * p + i] = 0.0; }
