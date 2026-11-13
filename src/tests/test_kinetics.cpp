@@ -553,17 +553,27 @@ internal void test_nft() {
     CHECK(worst < 1e-6, "nft ion mass balance %.3e", worst);
     CHECK(water_err < 1e-9, "nft water balance %.3e", water_err);
 
-    // 3. thermal: no chiller, no radiant, no pump, constant ambient -> the whole system relaxes to ambient
+    // 3. thermal: at steady state the energy balance closes exactly -- pump heat in
+    //    = channel walls + tank walls out (no chiller, radiant or ambient swing)
     arena.used = 0;
     NftParams pt = p;
-    pt.auto_size = 0; pt.chiller_on = 0; pt.radiant_W_m2 = 0; pt.pump_W = 0; pt.ambient_amp_C = 0; pt.ambient_mean_C = 27.0f;
-    pt.reservoir_L = 100.0f; pt.tank_ua_W_K = 3.0f; pt.topoff_on = 0;
+    pt.auto_size = 0; pt.chiller_on = 0; pt.radiant_W_m2 = 0; pt.ambient_amp_C = 0; pt.ambient_mean_C = 27.0f;
+    pt.reservoir_L = 100.0f; pt.tank_ua_W_K = 3.0f; pt.topoff_on = 1;
     NftSystem *t = push_struct(&arena, NftSystem);
     nft_init(t, &arena, pt);
     nft_run<f32x8>(t, 20 * 1440);
-    f64 dT = fabs(t->res.T_C - 27.0);
-    printf("[nft] thermal relaxation to a constant 27 C ambient (no chiller / radiant / pump): reservoir %.4f C\n", t->res.T_C);
-    CHECK(dT < 1e-3, "nft does not relax to ambient: %.4f", dT);
+    f64 q_walls = 0.0;
+    for (u32 r = 0; r < t->rails; ++r) {
+        const NftWrap *wrap = nft_wraps + pt.bank[nft_rail_bank(t, r) ? 1 : 0].wrap;
+        f64 ua_cell = wrap->u_w_m2k * nft_profiles[pt.hyd.profile].perimeter_m * t->cell_m;
+        for (u32 j = 0; j < t->cells; ++j) q_walls += ua_cell * ((f64)nft_abs(t, r / NFT_LANES, j, NftF_T, r % NFT_LANES) - 27.0);
+    }
+    f64 q_tank = pt.tank_ua_W_K * (t->res.T_C - 27.0);
+    f64 q_pump = nft_pump_heat_W(&t->params, &t->hyd);
+    f64 balance = (q_pump - q_walls - q_tank) / q_pump;
+    printf("[nft] steady state at 27 C ambient: tank %.4f C; pump heat %.2f W = walls %.2f W + tank %.2f W (residual %.1e)\n",
+           t->res.T_C, q_pump, q_walls, q_tank, balance);
+    CHECK(fabs(balance) < 2e-3, "steady-state energy balance residual %.3e", balance);
 
     // 4. chiller keeps the tank inside its band; mylar wrap needs less chiller energy than bare PVC
     f64 kwh[2];
@@ -610,6 +620,49 @@ internal void test_nft() {
     printf("[nft] %s after %.0f days, all limits 1 (fT %.2f fN %.2f fDO %.2f): mean dry mass %.4f g vs logistic %.4f g (%.2f %%)\n",
            cil->name, days, ft, fn, fd, w, analytic, 100.0 * (w - analytic) / analytic);
     CHECK(fabs(w - analytic) / analytic < 0.01, "growth deviates from logistic: %.4f vs %.4f", w, analytic);
+}
+
+internal void test_hydraulics() {
+    // water properties vs reference tables (IAPWS): mu(20 C) 1.0016e-3 Pa s, rho(20 C) 998.21, rho(4 C) 999.97
+    f64 mu20 = nft_water_mu(20.0), rho20 = nft_water_rho(20.0), rho4 = nft_water_rho(4.0);
+    printf("[hyd] water: mu(20) %.4e Pa s, rho(20) %.3f, rho(4) %.3f kg/m3\n", mu20, rho20, rho4);
+    CHECK(fabs(mu20 / 1.0016e-3 - 1.0) < 3e-3, "viscosity %.4e", mu20);
+    CHECK(fabs(rho20 - 998.207) < 0.02 && fabs(rho4 - 999.972) < 0.01, "density %.3f %.3f", rho20, rho4);
+
+    // Colebrook: the solution satisfies the equation to machine precision; Moody value at Re 1e5, e/D 1e-4
+    f64 f = nft_colebrook(1e5, 1e-4);
+    f64 res = 1.0 / sqrt(f) + 2.0 * log10(1e-4 / 3.7 + 2.51 / (1e5 * sqrt(f)));
+    printf("[hyd] Colebrook Re 1e5, e/D 1e-4: f = %.6f, equation residual %.1e\n", f, res);
+    CHECK(fabs(res) < 1e-12, "colebrook residual %.3e", res);
+    CHECK(fabs(f - 0.018524) < 2e-5, "colebrook value %.6f", f);
+    CHECK(fabs(nft_friction(1000.0, 0.02) - 0.064) < 1e-15, "laminar f");
+
+    // network: flow conservation, pump curve balance, manifold non-uniformity, balancing
+    NftHydraulicParams hp = nft_hydraulics_defaults();
+    static NftHydraulics h;
+    nft_hydraulics_solve(&hp, 16, 20.0, &h);
+    f64 sum = h.q_eductor_motive;
+    for (u32 i = 0; i < 16; ++i) sum += h.q_channel[i];
+    f64 cons = fabs(sum - h.q_pump) / h.q_pump;
+    f64 curve = fabs(nft_pump_head(nft_pumps + hp.pump, h.q_pump) - h.head_pump);
+    printf("[hyd] %s, 3/4\" Sch40, 16 taps: pump %.2f L/min at %.3f m (%.0f W, eta %.2f), channels %.3f..%.3f L/min, "
+           "eductor %.2f -> %.2f L/min, return %.0f %% of capacity, %u bisections\n",
+           nft_pumps[hp.pump].name, h.q_pump * 60000, h.head_pump, h.pump_power_W, h.pump_eta, h.q_min * 60000,
+           h.q_max * 60000, h.q_eductor_motive * 60000, h.q_eductor_total * 60000, 100 * h.return_use, h.iterations);
+    CHECK(h.ok, "pump does not reach the manifold");
+    CHECK(cons < 1e-12, "flow not conserved: %.3e", cons);
+    CHECK(curve < 1e-9, "pump curve not balanced: %.3e m", curve);
+    CHECK(h.q_channel[0] > h.q_channel[15], "first tap should get more than the dead end");
+    hp.balance_taps = 1;
+    nft_hydraulics_balance(&hp, 16, 20.0, &h);
+    f64 spread = h.q_max / h.q_min - 1.0;
+    printf("[hyd] balanced taps: channels %.4f..%.4f L/min (spread %.1e)\n", h.q_min * 60000, h.q_max * 60000, spread);
+    CHECK(spread < 1e-3, "balancing spread %.3e", spread);
+
+    // film: laminar depth is the Nusselt film
+    f64 nu = 1.0e-6, q = 1.5 / 60000.0, w = 0.1, S = 0.02;
+    f64 hn = cbrt(3.0 * nu * (q / w) / (NFT_G * S));
+    CHECK(fabs(nft_film_depth(q, w, S, nu) - hn) < 1e-15, "laminar film depth");
 }
 
 internal void bench_nft() {
@@ -683,6 +736,7 @@ int main(int argc, char **argv) {
     test_f32(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
+    test_hydraulics();
     test_nft();
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
     if (want_bench) { bench_nft(); bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }

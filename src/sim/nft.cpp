@@ -43,7 +43,8 @@
 #define NFT_MAX_CELLS    8192        // cells per channel (>= 2 per plant)
 #define NFT_RHO_CP       4.186e6     // J / (m^3 K), water
 #define NFT_G            9.81
-#define NFT_NU           1.0e-6      // m^2/s, kinematic viscosity (20 C)
+
+#include "nft_hydraulics.cpp"
 
 enum NftField {
     NftF_T,       // C
@@ -187,16 +188,17 @@ struct NftParams {
     f32 rail_length_m;          // channel length
     u32 plants_per_rail;        // plants per channel (evenly spaced: spacing = length / plants)
     b32 auto_size;              // size reservoir, flow and chiller from the structure
-    // hydraulics
-    f32 rail_width_m, rail_perimeter_m, slope;
-    f32 flow_L_min;             // per rail
+    // hydraulics: PVC network, pump, eductor, channel profile and grade (nft_hydraulics.cpp)
+    NftHydraulicParams hyd;
+    f32 target_flow_L_min;      // per channel, for auto-sizing the pump and pipes
+    b32 pump_submersible;       // 1: all pump power heats the solution; 0: external pump, only hydraulic power
     // environment
     f32 ambient_mean_C, ambient_amp_C;
     f32 photoperiod_h, lights_on_h;
     f32 radiant_W_m2;           // on rail tops while lights are on
     f32 kla_film_per_s;
     // reservoir
-    f32 reservoir_L, tank_ua_W_K, pump_W, tank_kla_per_s;
+    f32 reservoir_L, tank_ua_W_K, tank_kla_per_s;
     b32 chiller_on;
     f32 chiller_set_C, chiller_band_C, chiller_W, chiller_cop;
     b32 dosing_on, topoff_on;
@@ -214,10 +216,9 @@ internal NftParams nft_default_params() {
     p.rail_length_m = 4.0f;
     p.plants_per_rail = 26;     // 15 cm spacing
     p.auto_size = 1;
-    p.rail_width_m = 0.10f;
-    p.rail_perimeter_m = 0.30f;
-    p.slope = 0.02f;
-    p.flow_L_min = 1.5f;
+    p.hyd = nft_hydraulics_defaults();
+    p.target_flow_L_min = 1.5f;
+    p.pump_submersible = 1;
     p.ambient_mean_C = 22.0f;   // indoor herb room
     p.ambient_amp_C = 3.0f;
     p.photoperiod_h = 16.0f;
@@ -226,7 +227,6 @@ internal NftParams nft_default_params() {
     p.kla_film_per_s = 0.01f;
     p.reservoir_L = 200.0f;
     p.tank_ua_W_K = 3.0f;
-    p.pump_W = 40.0f;
     p.tank_kla_per_s = 0.002f;
     p.chiller_on = 1;
     p.chiller_set_C = 20.0f;
@@ -278,6 +278,8 @@ struct NftSystem {
     u32 groups, cells, sites;
     u32 site_offset, site_stride;      // site row j sits on cell site_offset + j * site_stride
     f64 cell_m;                        // dx = spacing / site_stride
+    NftHydraulics hyd;                 // operating point of the network (re-solved hourly)
+    f64 hyd_solved_hour;
     u32 rails;
     NftGroup *group;                   // array, each pointing at its own contiguous block
     NftReservoir res;
@@ -313,36 +315,48 @@ internal f64 nft_do_sat_f64(f64 T) { return ((-0.000077774 * T + 0.007991) * T -
 
 internal b32 nft_rail_bank(NftSystem *s, u32 rail) { return rail >= (s->rails + 1) / 2; }
 
-// Hydraulics and per-substep coefficients for every lane; called on rebuild
-// and whenever flow / wrap / slope / radiant change.
+// Network operating point, then per-channel film and per-substep coefficients.
+// Called on rebuild, on any parameter change, and hourly (water viscosity
+// follows the tank temperature).
 internal void nft_update_lane_params(NftSystem *s) {
     NftParams *p = &s->params;
-    f64 q = (f64)p->flow_L_min / 60000.0 / (f64)p->rail_width_m;            // m^2/s per unit width
-    f64 h = cbrt(3.0 * NFT_NU * q / (NFT_G * (f64)p->slope));               // laminar sheet-flow depth
-    f64 v = q / h;
+    f64 T = s->res.V_L > 0.0 ? s->res.T_C : (f64)p->fill_T_C;
+    if (p->hyd.balance_taps) nft_hydraulics_balance(&p->hyd, s->rails, T, &s->hyd);
+    else nft_hydraulics_solve(&p->hyd, s->rails, T, &s->hyd);
+    const NftProfile *prof = nft_profiles + (p->hyd.profile % NftProfile_Count);
+    f64 w = prof->width_m, perim = prof->perimeter_m;
     f64 dx = s->cell_m;
-    // substep: Courant 0.9 on the fastest rail, an integer count per window
+    f64 depth[8192], vel[8192];
+    f64 v_max = 1e-6;
+    for (u32 r = 0; r < s->rails; ++r) {
+        f64 q = s->hyd.q_channel[r];
+        f64 S = p->hyd.slope[nft_rail_bank(s, r) ? 1 : 0];
+        depth[r] = q > 0.0 ? nft_film_depth(q, w, S, s->hyd.nu) : 1e-4;
+        vel[r] = q > 0.0 ? q / (w * depth[r]) : 0.0;
+        v_max = Maximum(v_max, vel[r]);
+    }
+    // substep: Courant 0.9 on the fastest channel, an integer count per window
     s->window_s = 60.0;
-    f64 dt_max = 0.9 * dx / v;
-    s->substeps = (u32)ceil(s->window_s / dt_max);
+    s->substeps = (u32)ceil(s->window_s / (0.9 * dx / v_max));
     if (s->substeps < 1) s->substeps = 1;
     s->dt_sub = s->window_s / (f64)s->substeps;
-    f64 vcell = (f64)p->rail_width_m * h * dx;                               // m^3
-    f64 ccell = NFT_RHO_CP * vcell;                                          // J/K
     for (u32 g = 0; g < s->groups; ++g) {
         NftLaneParams *lp = &s->group[g].lp;
         for (u32 l = 0; l < NFT_LANES; ++l) {
             u32 rail = g * NFT_LANES + l;
             b32 live = rail < s->rails;
+            u32 rr = live ? rail : 0;
             const NftWrap *wrap = nft_wraps + p->bank[live && nft_rail_bank(s, rail) ? 1 : 0].wrap;
-            lp->courant[l] = (f32)(v * s->dt_sub / dx);
-            lp->k_wall[l] = (f32)(wrap->u_w_m2k * p->rail_perimeter_m * dx * s->dt_sub / ccell);
-            lp->k_rad[l] = (f32)(wrap->absorptivity * p->rail_width_m * dx * s->dt_sub / ccell);
+            f64 vcell = w * depth[rr] * dx;                                   // m^3
+            f64 ccell = NFT_RHO_CP * vcell;                                   // J/K
+            lp->courant[l] = live ? (f32)(vel[rr] * s->dt_sub / dx) : 0.0f;
+            lp->k_wall[l] = (f32)(wrap->u_w_m2k * perim * dx * s->dt_sub / ccell);
+            lp->k_rad[l] = (f32)(wrap->absorptivity * w * dx * s->dt_sub / ccell);
             lp->k_o2[l] = (f32)(p->kla_film_per_s * s->dt_sub);
             lp->inv_vcell_L[l] = (f32)(1.0 / (vcell * 1000.0));
-            lp->flow_L_s[l] = live ? (f32)(p->flow_L_min / 60.0) : 0.0f;
-            lp->depth_m[l] = (f32)h;
-            lp->velocity_m_s[l] = (f32)v;
+            lp->flow_L_s[l] = live ? (f32)(s->hyd.q_channel[rr] * 1000.0) : 0.0f;
+            lp->depth_m[l] = (f32)depth[rr];
+            lp->velocity_m_s[l] = (f32)vel[rr];
         }
     }
 }
@@ -400,26 +414,42 @@ internal void nft_layout(NftSystem *s, NftParams *p) {
 
 // Peak sensible heat into the solution (W) for chiller sizing: channel walls
 // at the warmest ambient, radiant load on the channel tops, tank walls, pump.
-internal f64 nft_peak_heat_W(NftSystem *s, NftParams *p) {
+internal f64 nft_peak_heat_W(NftSystem *s, NftParams *p, f64 pump_heat_W) {
     f64 dT = Maximum((f64)p->ambient_mean_C + p->ambient_amp_C - p->chiller_set_C, 0.0);
+    const NftProfile *prof = nft_profiles + (p->hyd.profile % NftProfile_Count);
     f64 w = 0.0;
     for (u32 b = 0; b < 2; ++b) {
         u32 rails = b == 0 ? s->rails - s->rails / 2 : s->rails / 2;
         const NftWrap *wrap = nft_wraps + p->bank[b].wrap;
-        w += rails * p->rail_length_m * (wrap->u_w_m2k * p->rail_perimeter_m * dT + wrap->absorptivity * p->rail_width_m * p->radiant_W_m2);
+        w += rails * p->rail_length_m * (wrap->u_w_m2k * prof->perimeter_m * dT + wrap->absorptivity * prof->width_m * p->radiant_W_m2);
     }
-    return w + p->tank_ua_W_K * dT + p->pump_W;
+    return w + p->tank_ua_W_K * dT + pump_heat_W;
 }
 
-// Auto-size: ~0.75 L of reservoir per plant (>= 50 L), pump heat ~ 2.5 W per
-// channel at the per-channel flow, chiller 1.5x the peak load (>= 200 W).
+internal f64 nft_pump_heat_W(NftParams *p, NftHydraulics *h) {
+    return p->pump_submersible ? h->pump_power_W : h->rho * NFT_G * h->q_pump * h->head_pump;
+}
+
+// Auto-size from the structure: pipes for <= 1.5 m/s, the smallest pump
+// preset that delivers the target flow to the weakest channel, ~0.75 L of
+// reservoir per plant (>= 50 L), chiller 1.5x the peak heat load (>= 200 W).
 internal void nft_auto_size(NftSystem *s, NftParams *p) {
     if (!p->auto_size) return;
     f64 plants = (f64)s->rails * (f64)s->sites;
     p->reservoir_L = (f32)Maximum(50.0, 0.75 * plants);
-    p->pump_W = (f32)Maximum(20.0, 2.5 * (f64)s->rails);
     p->tank_ua_W_K = (f32)(0.5 * pow((f64)p->reservoir_L / 1000.0, 2.0 / 3.0) * 6.0 * 1.8);   // ~cube tank, U 1.8 W/m2K
-    p->chiller_W = (f32)Maximum(200.0, 1.5 * nft_peak_heat_W(s, p));
+    f64 q_target = (f64)p->target_flow_L_min / 60000.0 * s->rails;
+    u32 size = 0;
+    while (size + 1 < NftPipe_Count &&
+           q_target / (0.25 * 3.14159265358979 * nft_pipe_id_m(p->hyd.schedule80, size) * nft_pipe_id_m(p->hyd.schedule80, size)) > 1.5) ++size;
+    p->hyd.supply_size = p->hyd.manifold_size = size;
+    p->hyd.return_size = Minimum(size + 2, (u32)NftPipe_Count - 1);
+    for (u32 pump = 0; pump < NftPump_Count; ++pump) {
+        p->hyd.pump = pump;
+        nft_hydraulics_solve(&p->hyd, s->rails, p->fill_T_C, &s->hyd);
+        if (s->hyd.ok && s->hyd.q_min * 60000.0 >= p->target_flow_L_min) break;
+    }
+    p->chiller_W = (f32)Maximum(200.0, 1.5 * nft_peak_heat_W(s, p, nft_pump_heat_W(p, &s->hyd)));
 }
 
 internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
@@ -432,11 +462,12 @@ internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
         s->group[g].rows = push_array_aligned(arena, NftRow, s->cells, 64);
         s->group[g].sites = push_array_aligned(arena, NftSiteRow, s->sites, 64);
     }
-    nft_update_lane_params(s);
-    nft_update_crop_lanes(s);
-
     s->res.V_L = params.reservoir_L;
     s->res.T_C = params.fill_T_C;
+    nft_update_lane_params(s);
+    nft_update_crop_lanes(s);
+    s->hyd_solved_hour = 0.0;
+
     f64 c[NftF_Count] = {};
     c[NftF_DO] = nft_do_sat_f64(params.fill_T_C);
     for (u32 i = 0; i < NFT_IONS; ++i) c[NFT_ION0 + i] = params.recipe[i];
@@ -730,7 +761,7 @@ internal void nft_reservoir_window(NftSystem *s) {
 
     // heat: return water, tank walls, pump, chiller (hysteresis on the tank temperature)
     f64 heat_W = NFT_RHO_CP * 1e-3 * (ret[NftF_T] - q_tot * (f64)s->inlet[NftF_T])   // rho cp (L/s -> m^3/s) dT
-                 + p->tank_ua_W_K * ((f64)s->T_amb - r->T_C) + p->pump_W;
+                 + p->tank_ua_W_K * ((f64)s->T_amb - r->T_C) + nft_pump_heat_W(p, &s->hyd);
     if (p->chiller_on) {
         if (r->T_C > p->chiller_set_C + p->chiller_band_C) r->chiller_running = 1;
         if (r->T_C < p->chiller_set_C - p->chiller_band_C) r->chiller_running = 0;
@@ -743,7 +774,7 @@ internal void nft_reservoir_window(NftSystem *s) {
         s->acc.chiller_elec_J += p->chiller_W / p->chiller_cop * dt;
         s->acc.chiller_on_s += dt;
     }
-    s->acc.pump_J += p->pump_W * dt;
+    s->acc.pump_J += s->hyd.pump_power_W * dt;
     r->T_C += heat_W * dt / (NFT_RHO_CP * 1e-3 * r->V_L);
 
     // tank aeration toward saturation
@@ -858,8 +889,18 @@ internal PLATFORM_WORK_QUEUE_CALLBACK(nft_work_window) {
     for (u32 g = w->first; g < w->end; ++g) nft_group_window<f32x8>(w->s, g, w->s->ref, w->shift, w->rebase, w->light_gain);
 }
 
+// Water viscosity follows the tank temperature: re-solve the network hourly.
+internal void nft_maybe_resolve(NftSystem *s) {
+    f64 hour = floor(s->t / 3600.0);
+    if (hour != s->hyd_solved_hour) {
+        s->hyd_solved_hour = hour;
+        nft_update_lane_params(s);
+    }
+}
+
 internal void nft_window(NftSystem *s, PlatformAPI *api, PlatformWorkQueue *queue, u32 threads, Arena *frame) {
     TIMED_FUNCTION();
+    nft_maybe_resolve(s);
     nft_environment(s, s->t);
     f32 shift[NftF_Count];
     b32 rebase = nft_inlet(s, shift);
