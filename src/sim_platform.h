@@ -69,6 +69,7 @@ enum SimScene {
     SimScene_Particles,   // M1 demo: SoA particle swirl
     SimScene_Dbd,         // M2: DBD reactor zones (plug flow), plasma chemistry
     SimScene_Sweep,       // M2: independent zones over an operating-point grid
+    SimScene_Nft,         // M3: NFT rails, reservoir + chiller, plants
 };
 
 enum SimBackend {
@@ -85,6 +86,9 @@ struct SimConfig {
     b32 averaged;         // dbd / sweep: continuous source instead of discharge pulses
     u32 precision;        // dbd / sweep: 0 = f32 lanes (fast, default), 1 = f64 lanes (reference)
     u32 chem_steps;       // dbd / sweep: master steps per chemistry advance (0 = scene default)
+    f64 speed;            // nft: simulated seconds per wall second (0 = 3600)
+    f32 channel_length_m; // nft: 0 = default
+    u32 plants_per_channel; // nft: 0 = default
     const char *csv_path; // dbd / sweep: write results here (0: none)
 };
 

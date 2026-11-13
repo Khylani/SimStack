@@ -17,6 +17,8 @@
 #include "particles.cpp"
 #include "dbd.cpp"
 #include "dbd_scene.cpp"
+#include "nft.cpp"
+#include "nft_scene.cpp"
 #include "../ui/ui_simstack.cpp"
 
 #define SIM_DT_FIXED (1.0 / 1000.0)     // 1 ms master step (f64; cast to f32 for the kernels)
@@ -56,6 +58,9 @@ struct SimState {
     RandomSeries rng;
     Particles particles;
     DbdScene *dbd;     // dbd / sweep scenes (in the permanent arena)
+    NftScene *nft;     // nft scene (in the permanent arena)
+    NftParams nft_params;   // survive scene rebuilds (structure edits in the UI)
+    b32 nft_params_set;
     Camera camera;
     UiState ui;        // windowed runs only; its heap lives in SimMemory::ui_base
     SimStats last_stats;
@@ -80,10 +85,21 @@ internal void sim_reset_scene(SimState *state, SimMemory *memory) {
     state->sim_time = 0.0;
     state->accumulator = 0.0;
     state->dbd = 0;
+    state->nft = 0;
     state->rng.state = memory->config.seed ? memory->config.seed : 0x9E3779B9u;
     if (state->scene == SimScene_Particles) {
         particles_init(&state->particles, &state->permanent, memory->config.particle_count, &state->rng,
                        sqrtf(PARTICLE_SPRING));
+    } else if (state->scene == SimScene_Nft) {
+        if (!state->nft_params_set) {
+            state->nft_params = nft_default_params();
+            if (memory->config.zone_count) state->nft_params.rails = memory->config.zone_count;
+            if (memory->config.channel_length_m > 0) state->nft_params.rail_length_m = memory->config.channel_length_m;
+            if (memory->config.plants_per_channel) state->nft_params.plants_per_rail = memory->config.plants_per_channel;
+            state->nft_params_set = 1;
+        }
+        state->nft = push_struct(&state->permanent, NftScene);
+        nft_scene_init(state->nft, &state->permanent, &memory->config, &state->nft_params);
     } else {
         state->dbd = push_struct(&state->permanent, DbdScene);
         dbd_scene_init(state->dbd, &state->permanent, &memory->config, state->scene == SimScene_Sweep);
@@ -102,7 +118,7 @@ internal void sim_initialize(SimMemory *memory) {
     state->scene = memory->config.scene;
     state->camera.distance = state->scene == SimScene_Particles ? 3.5f : 4.2f;
     state->camera.pitch = 0.35f;
-    state->camera.auto_orbit = state->scene != SimScene_Dbd;
+    state->camera.auto_orbit = state->scene == SimScene_Particles || state->scene == SimScene_Sweep;
 
     sim_reset_scene(state, memory);
     memory->is_initialized = 1;
@@ -140,6 +156,10 @@ internal void sim_fill_render(SimState *state, SimInput *input, RenderCommands *
     render->view_proj = proj * view;
     if (state->dbd) {
         dbd_scene_fill_render(state->dbd, render, (u32)state->ui.view_species);
+        return;
+    }
+    if (state->nft) {
+        nft_scene_fill_render(state->nft, render);
         return;
     }
     render->batch_count = 1;
@@ -220,9 +240,34 @@ internal u32 sim_run_chemistry(SimState *state, SimMemory *memory, f64 budget_ms
     return steps;
 }
 
+// NFT: whole coupling windows (60 s of plant time each) while the accumulator
+// (in simulated seconds) holds one; same budget rules as the chemistry.
+internal u32 sim_run_nft(SimState *state, SimMemory *memory, f64 budget_ms) {
+    NftScene *sc = state->nft;
+    u32 windows = 0;
+    u64 start_ns = memory->platform.now_ns();
+    f64 per_ms = sc->last_window_wall_ms;
+    while (state->accumulator >= sc->sys.window_s - 1e-9) {
+        f64 spent_ms = (f64)(memory->platform.now_ns() - start_ns) * 1e-6;
+        if (budget_ms > 0.0 && windows > 0 && spent_ms + per_ms > budget_ms) {
+            state->accumulator = 0.0;
+            break;
+        }
+        nft_scene_window(sc, memory, &state->frame);
+        per_ms = sc->last_window_wall_ms;
+        state->accumulator -= sc->sys.window_s;
+        state->step_count += 1;
+        state->sim_time = sc->sys.t;
+        ++windows;
+    }
+    state->ui.chem_ms_frame = (f32)((f64)(memory->platform.now_ns() - start_ns) * 1e-6);
+    return windows;
+}
+
 internal PLATFORM_WORK_QUEUE_CALLBACK(sim_chemistry_job) {
     SimState *state = (SimState *)data;
-    state->chem_job.steps = sim_run_chemistry(state, state->chem_job.memory, state->chem_job.budget_ms);
+    if (state->nft) state->chem_job.steps = sim_run_nft(state, state->chem_job.memory, state->chem_job.budget_ms);
+    else state->chem_job.steps = sim_run_chemistry(state, state->chem_job.memory, state->chem_job.budget_ms);
 }
 
 SIM_API SIM_UPDATE(sim_update) {
@@ -260,11 +305,26 @@ SIM_API SIM_UPDATE(sim_update) {
 
     // Fixed timestep: accumulate wall time, step deterministically.
     u32 steps = 0;
-    b32 async_chem = ui_on && state->dbd && memory->background_queue;
+    b32 async_chem = ui_on && (state->dbd || state->nft) && memory->background_queue;
     b32 kick_chem = 0;
     b32 step_once = ui_on && state->ui.step_once;
     state->ui.step_once = 0;
-    if (!state->paused || step_once) {
+    if (state->nft && (!state->paused || step_once)) {
+        // NFT runs on its own clock: simulated seconds per wall second.
+        f64 speed = ui_on ? (f64)state->ui.nft_speed : (memory->config.speed > 0.0 ? memory->config.speed : 3600.0);
+        if (ui_on && state->ui.max_speed) speed = 1e12;
+        state->accumulator += (f64)input->dt_frame * speed;
+        f64 window = state->nft->sys.window_s;
+        if (step_once) state->accumulator = window;
+        if (ui_on) state->accumulator = Minimum(state->accumulator, window * 100000.0);
+        TIMED_BLOCK("nft_windows");
+        if (async_chem) {
+            state->chem_job.budget_ms = ui_chemistry_budget(&state->ui, input);
+            kick_chem = 1;
+        } else {
+            steps = sim_run_nft(state, memory, 0.0);
+        }
+    } else if (!state->paused || step_once) {
         f64 speed = (ui_on && state->dbd) ? (f64)state->ui.speed : 1.0;
         if (ui_on && state->dbd && state->ui.max_speed) speed = 1e9;
         state->accumulator += (f64)input->dt_frame * speed;
@@ -300,7 +360,7 @@ SIM_API SIM_UPDATE(sim_update) {
         }
     }
 
-    if (!state->dbd) {
+    if (!state->dbd && !state->nft) {
         // Example scratch use: a transient reduction buffer that is rolled back.
         SCRATCH_SCOPE(&state->scratch);
         f32 *tmp = push_array_nozero(&state->scratch, f32, 8);
@@ -316,14 +376,16 @@ SIM_API SIM_UPDATE(sim_update) {
     stats->steps_this_frame = steps;
     stats->sim_time = state->sim_time;
     stats->dt_fixed = (f32)state->dt_fixed;
-    stats->particle_count = state->dbd ? state->dbd->zones.count : state->particles.count;
+    stats->particle_count = state->dbd ? state->dbd->zones.count : state->nft ? state->nft->sys.rails : state->particles.count;
     stats->state_hash = 0;
     if (input->compute_state_hash) {
-        stats->state_hash = state->dbd ? dbd_scene_hash(state->dbd) : particles_hash(&state->particles);
+        stats->state_hash = state->dbd ? dbd_scene_hash(state->dbd)
+                          : state->nft ? nft_scene_hash(state->nft) : particles_hash(&state->particles);
     }
     stats->thread_count = memory->worker_count;
     stats->summary[0] = 0;
     if (state->dbd) dbd_scene_summary(state->dbd, stats->summary, sizeof(stats->summary), memory->worker_count);
+    if (state->nft) nft_scene_summary(state->nft, stats->summary, sizeof(stats->summary));
     stats->permanent_used = sizeof(SimState) + state->permanent.used;
     stats->permanent_size = memory->permanent_size;
     stats->frame_used = state->frame.used;

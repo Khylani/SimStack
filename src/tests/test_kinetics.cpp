@@ -18,6 +18,7 @@
 #define DEBUG_RECORD_BASE 0
 #include "../sim_platform.h"
 #include "../sim/dbd.cpp"
+#include "../sim/nft.cpp"
 #include "../platform/linux_gpu.cpp"
 #include "../platform/linux_work_queue.cpp"
 
@@ -486,6 +487,149 @@ internal void bench_tolerance(KinModel *model, AirSpecies *sp, AirSourceModel *s
     }
 }
 
+// ===========================================================================
+// NFT tests
+
+global u8 g_nft_memory[Megabytes(256)] SIM_ALIGNED(64);
+
+// Runs `windows` windows on one thread with lane type V (f32x8 or f32).
+template <class V>
+internal void nft_run(NftSystem *s, u32 windows) {
+    for (u32 w = 0; w < windows; ++w) {
+        nft_environment(s, s->t);
+        f32 shift[NftF_Count];
+        b32 rebase = nft_inlet(s, shift);
+        f32 gain = nft_light_gain(s);
+        for (u32 g = 0; g < s->groups; ++g) nft_group_window<V>(s, g, s->ref, shift, rebase, gain);
+        nft_reservoir_window(s);
+        s->t += s->window_s;
+    }
+}
+
+internal f64 nft_total_ion_mg(NftSystem *s, u32 i) {
+    return s->res.mass_mg[NFT_ION0 + i] + nft_rail_mass_mg(s, NFT_ION0 + i);
+}
+
+internal void test_nft() {
+    Arena arena = arena_make(g_nft_memory, sizeof(g_nft_memory));
+    NftParams p = nft_default_params();
+    p.rails = 12;   // 2 groups, the second half-padded
+
+    // 1. f32x8 == f32 per lane, bit for bit
+    NftSystem *a = push_struct(&arena, NftSystem), *b = push_struct(&arena, NftSystem);
+    nft_init(a, &arena, p);
+    nft_init(b, &arena, p);
+    nft_run<f32x8>(a, 600);
+    nft_run<f32>(b, 600);
+    b32 same = memcmp(&a->res, &b->res, sizeof(a->res)) == 0;
+    for (u32 g = 0; g < a->groups; ++g) {
+        same &= memcmp(a->group[g].rows, b->group[g].rows, sizeof(NftRow) * a->cells) == 0;
+        same &= memcmp(a->group[g].sites, b->group[g].sites, sizeof(NftSiteRow) * a->sites) == 0;
+    }
+    printf("[nft] %u channels x %u cells (%u plants), 10 h: f32x8 vs f32 lanes %s\n", a->rails, a->cells, a->sites,
+           same ? "bit-identical" : "DIFFERENT");
+    CHECK(same, "nft f32x8 and f32 lanes differ");
+
+    // 2. mass balance per ion and water balance over 30 days with dosing, top-off and a solution change
+    arena.used = 0;
+    NftParams pm = p;
+    pm.dump_days = 10.0f;
+    NftSystem *m = push_struct(&arena, NftSystem);
+    nft_init(m, &arena, pm);
+    f64 initial[NFT_IONS], v0 = m->res.V_L;
+    for (u32 i = 0; i < NFT_IONS; ++i) initial[i] = nft_total_ion_mg(m, i);
+    nft_run<f32x8>(m, 30 * 1440);
+    f64 worst = 0.0;
+    u32 worst_i = 0;
+    for (u32 i = 0; i < NFT_IONS; ++i) {
+        f64 in = initial[i] + m->acc.dosed_mg[i];
+        f64 out = nft_total_ion_mg(m, i) + m->acc.uptake_mg[i] + m->acc.dumped_mg[i];
+        f64 e = fabs(in - out) / in;
+        if (e > worst) { worst = e; worst_i = i; }
+    }
+    f64 water_err = fabs((v0 - m->acc.transpired_L + m->acc.topoff_L + m->acc.dosed_L - m->acc.dumped_L) - m->res.V_L) / v0;
+    printf("[nft] 30 days, dosing + top-off + dump every 10 d: worst ion mass balance error %.1e (%s), water %.1e\n",
+           worst, nft_field_names[NFT_ION0 + worst_i], water_err);
+    CHECK(worst < 1e-6, "nft ion mass balance %.3e", worst);
+    CHECK(water_err < 1e-9, "nft water balance %.3e", water_err);
+
+    // 3. thermal: no chiller, no radiant, no pump, constant ambient -> the whole system relaxes to ambient
+    arena.used = 0;
+    NftParams pt = p;
+    pt.auto_size = 0; pt.chiller_on = 0; pt.radiant_W_m2 = 0; pt.pump_W = 0; pt.ambient_amp_C = 0; pt.ambient_mean_C = 27.0f;
+    pt.reservoir_L = 100.0f; pt.tank_ua_W_K = 3.0f; pt.topoff_on = 0;
+    NftSystem *t = push_struct(&arena, NftSystem);
+    nft_init(t, &arena, pt);
+    nft_run<f32x8>(t, 20 * 1440);
+    f64 dT = fabs(t->res.T_C - 27.0);
+    printf("[nft] thermal relaxation to a constant 27 C ambient (no chiller / radiant / pump): reservoir %.4f C\n", t->res.T_C);
+    CHECK(dT < 1e-3, "nft does not relax to ambient: %.4f", dT);
+
+    // 4. chiller keeps the tank inside its band; mylar wrap needs less chiller energy than bare PVC
+    f64 kwh[2];
+    for (u32 wrap = 0; wrap < 2; ++wrap) {
+        arena.used = 0;
+        NftParams pc = p;
+        pc.auto_size = 0; pc.ambient_mean_C = 28.0f; pc.ambient_amp_C = 4.0f; pc.radiant_W_m2 = 300.0f;
+        pc.chiller_W = 1500.0f;
+        pc.bank[0].wrap = pc.bank[1].wrap = wrap == 0 ? NftWrap_BubbleMylar : NftWrap_BarePvc;
+        NftSystem *c = push_struct(&arena, NftSystem);
+        nft_init(c, &arena, pc);
+        nft_run<f32x8>(c, 2 * 1440);   // settle
+        f64 lo = 1e9, hi = -1e9, e0 = c->acc.chiller_elec_J;
+        for (u32 w = 0; w < 5 * 1440; ++w) {
+            nft_run<f32x8>(c, 1);
+            lo = Minimum(lo, c->res.T_C); hi = Maximum(hi, c->res.T_C);
+        }
+        kwh[wrap] = (c->acc.chiller_elec_J - e0) / 3.6e6;
+        printf("[nft] %-17s 28+-4 C, 300 W/m2: tank %.2f..%.2f C (set %.1f +- %.1f), chiller %.2f kWh/day\n",
+               nft_wraps[wrap == 0 ? NftWrap_BubbleMylar : NftWrap_BarePvc].name, lo, hi, pc.chiller_set_C,
+               pc.chiller_band_C, kwh[wrap] / 5.0);
+        // mylar: load well under capacity -> the band (plus one window's drift) holds.
+        // bare PVC at this load runs the 1500 W chiller near capacity and may overshoot (reported).
+        if (wrap == 0)
+            CHECK(lo > pc.chiller_set_C - pc.chiller_band_C - 0.15 && hi < pc.chiller_set_C + pc.chiller_band_C + 0.15,
+                  "chiller band violated: %.2f..%.2f", lo, hi);
+    }
+    CHECK(kwh[0] < kwh[1], "mylar should need less chiller energy (%.2f vs %.2f)", kwh[0], kwh[1]);
+
+    // 5. growth: unlimited plants follow the analytic logistic curve to harvest
+    arena.used = 0;
+    NftParams pg = p;
+    pg.bank[0].stagger_days = pg.bank[1].stagger_days = 0.0f;   // all planted at t = 0
+    pg.ambient_amp_C = 0.0f; pg.ambient_mean_C = 20.0f; pg.photoperiod_h = 24.0f;   // constant conditions
+    NftSystem *gs = push_struct(&arena, NftSystem);
+    nft_init(gs, &arena, pg);
+    const NftCrop *cil = nft_crops + pg.bank[0].crop;
+    f64 days = 20.0;
+    nft_run<f32x8>(gs, (u32)(days * 1440));
+    f64 w, ft, fn, fd;
+    nft_bank_plants(gs, 0, &w, &ft, &fn, &fd);
+    f64 e = exp(cil->rgr_per_day * days);
+    f64 analytic = cil->wmax_g * cil->w0_g * e / (cil->wmax_g + cil->w0_g * (e - 1.0));
+    printf("[nft] %s after %.0f days, all limits 1 (fT %.2f fN %.2f fDO %.2f): mean dry mass %.4f g vs logistic %.4f g (%.2f %%)\n",
+           cil->name, days, ft, fn, fd, w, analytic, 100.0 * (w - analytic) / analytic);
+    CHECK(fabs(w - analytic) / analytic < 0.01, "growth deviates from logistic: %.4f vs %.4f", w, analytic);
+}
+
+internal void bench_nft() {
+    Arena arena = arena_make(g_nft_memory, sizeof(g_nft_memory));
+    u32 channels[] = { 8, 64, 512 };
+    for (u32 ci = 0; ci < ArrayCount(channels); ++ci) {
+        arena.used = 0;
+        NftParams p = nft_default_params();
+        p.rails = channels[ci];
+        NftSystem *s = push_struct(&arena, NftSystem);
+        nft_init(s, &arena, p);
+        f64 t0 = now_s();
+        nft_run<f32x8>(s, 1440);
+        f64 wall = now_s() - t0;
+        f64 updates = (f64)s->groups * s->cells * s->substeps * 1440.0 * (f64)NftF_Count * NFT_LANES;
+        printf("[nft bench] %4u channels x %u cells, 1 day on 1 thread: %.1f ms (%.0fx real time, %.2f G lane-field updates/s)\n",
+               s->rails, s->cells, wall * 1e3, 86400.0 / wall, updates / wall * 1e-9);
+    }
+}
+
 internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
     KinMethod method = kin_method(KinMethod_Rodas3);
@@ -539,8 +683,9 @@ int main(int argc, char **argv) {
     test_f32(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
+    test_nft();
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
-    if (want_bench) { bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }
+    if (want_bench) { bench_nft(); bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }
 
     printf("%u checks, %u failed (simd=%d)\n", g_checks, g_failures, SIM_SIMD);
     free(model);
