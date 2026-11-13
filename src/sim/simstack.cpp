@@ -19,6 +19,7 @@
 #include "nft.cpp"          // (paw.cpp inside: the dbd scene's skid preset uses it)
 #include "dbd_scene.cpp"
 #include "nft_scene.cpp"
+#include "timeline.cpp"
 #include "../ui/ui_simstack.cpp"
 
 #define SIM_DT_FIXED (1.0 / 1000.0)     // 1 ms master step (f64; cast to f32 for the kernels)
@@ -39,7 +40,38 @@ struct Camera {
     f32 pitch;
     f32 distance;
     b32 auto_orbit;
+    v3 target;      // orbit / zoom centre (pan moves it)
+    b32 frame_request;          // fit the scene's bounds on the next render
+    v3 bounds_min, bounds_max;  // last framed scene bounds
+    f32 fov;        // radians, vertical
+    f32 framed_aspect;          // view aspect at the last framing
+    b32 user_moved;             // the user orbited / panned / zoomed since: keep their view
 };
+
+// Camera basis for a view rect of the given aspect.
+struct CameraBasis { v3 eye, forward, right, up; f32 tan_half, aspect; };
+internal CameraBasis camera_basis(Camera *cam, f32 aspect) {
+    CameraBasis b;
+    f32 cp = cosf(cam->pitch), sp = sinf(cam->pitch);
+    v3 offset = V3(cam->distance * cp * sinf(cam->yaw), cam->distance * sp, cam->distance * cp * cosf(cam->yaw));
+    b.eye = cam->target + offset;
+    b.forward = normalize(cam->target - b.eye);
+    b.right = normalize(cross(b.forward, V3(0.0f, 1.0f, 0.0f)));
+    b.up = cross(b.right, b.forward);
+    b.tan_half = tanf(0.5f * cam->fov);
+    b.aspect = aspect;
+    return b;
+}
+
+internal void camera_reset(Camera *cam, u32 scene) {
+    cam->yaw = scene == SimScene_Nft ? 0.55f : 0.0f;
+    cam->pitch = scene == SimScene_Nft ? 0.62f : 0.35f;
+    cam->distance = scene == SimScene_Particles ? 3.5f : 4.2f;
+    cam->target = V3(0.0f);
+    cam->fov = radians(45.0f);
+    cam->frame_request = scene != SimScene_Particles;
+    cam->user_moved = 0;
+}
 
 struct SimState {
     Arena permanent;   // the rest of the permanent block, after SimState itself
@@ -61,7 +93,11 @@ struct SimState {
     NftScene *nft;     // nft scene (in the permanent arena)
     NftParams nft_params;   // survive scene rebuilds (structure edits in the UI)
     b32 nft_params_set;
+    b32 dbd_defaults_next;  // next reset of a DBD scene drops the UI's settings
     Camera camera;
+    Timeline timeline; // keyframes (SimMemory::timeline_base); not part of any keyframe itself
+    u32 scene_generation;
+    b32 timeline_recording;   // the chemistry job records keyframes this frame
     UiState ui;        // windowed runs only; its heap lives in SimMemory::ui_base
     SimStats last_stats;
 
@@ -78,7 +114,26 @@ struct SimState {
 
 // Resetting rolls the permanent arena back to just past the SimState header
 // and rebuilds the scene from the config.
+// DBD settings the UI edits; a reset (restart) keeps them, Defaults drops them.
+struct DbdSettings {
+    DbdOperating op;
+    AirSourceModel source;
+    KinControl control;
+    u32 method_id, precision, mode, chem_steps, backend;
+    f64 residence_s;
+};
+
 internal void sim_reset_scene(SimState *state, SimMemory *memory) {
+    DbdSettings keep = {};
+    b32 keep_dbd = state->dbd && !state->dbd_defaults_next && state->scene != SimScene_Particles && state->scene != SimScene_Nft &&
+                   state->dbd->chained == (state->scene == SimScene_Dbd);
+    state->dbd_defaults_next = 0;
+    if (keep_dbd) {
+        DbdScene *d = state->dbd;
+        keep.op = d->op; keep.source = d->source; keep.control = d->control;
+        keep.method_id = d->method_id; keep.precision = d->precision; keep.mode = d->mode;
+        keep.chem_steps = d->chem_steps; keep.backend = d->backend; keep.residence_s = d->residence_s;
+    }
     if (state->dbd && state->dbd->hybrid.registered && memory->gpu.available)
         memory->gpu.gpu_host_unregister(state->dbd->hybrid.registered_block);   // the block is about to be reused
     state->permanent.used = 0;
@@ -106,7 +161,160 @@ internal void sim_reset_scene(SimState *state, SimMemory *memory) {
         state->dbd = push_struct(&state->permanent, DbdScene);
         dbd_scene_init(state->dbd, &state->permanent, &memory->config, state->scene == SimScene_Sweep);
         if (state->dbd->model.error) memory->platform.log("[dbd] mechanism error: %s\n", state->dbd->model.error_text);
+        if (keep_dbd) {
+            DbdScene *d = state->dbd;
+            d->op = keep.op; d->source = keep.source; d->control = keep.control;
+            d->method_id = (KinMethodId)keep.method_id; d->precision = (DbdPrecision)keep.precision; d->mode = (DbdDischargeMode)keep.mode;
+            d->chem_steps = keep.chem_steps; d->backend = keep.backend; d->residence_s = keep.residence_s;
+            dbd_scene_on_reload(d);          // method pointer from method_id, GPU re-upload
+            dbd_scene_apply_operating(d);
+            dbd_zones_reset(&d->zones, &d->sp);
+        }
     }
+    ++state->scene_generation;
+}
+
+// --- timeline glue -------------------------------------------------------------------
+
+internal f64 sim_default_key_interval(SimState *state) {
+    return state->nft ? 3600.0 : state->dbd ? 0.05 : 0.05;
+}
+
+// Parameters that change the simulation's future (edit -> fork).
+internal u64 sim_params_hash(SimState *state) {
+    if (state->nft) return hash_fnv1a_64(&state->nft->sys.params, sizeof(NftParams));
+    if (state->dbd) {
+        DbdScene *d = state->dbd;
+        u64 h = hash_fnv1a_64(&d->op, sizeof(d->op));
+        h = hash_fnv1a_64(&d->source, sizeof(d->source), h);
+        h = hash_fnv1a_64(&d->control, sizeof(d->control), h);
+        h = hash_fnv1a_64(&d->method_id, sizeof(d->method_id), h);
+        h = hash_fnv1a_64(&d->precision, sizeof(d->precision), h);
+        h = hash_fnv1a_64(&d->mode, sizeof(d->mode), h);
+        h = hash_fnv1a_64(&d->chem_steps, sizeof(d->chem_steps), h);
+        h = hash_fnv1a_64(&d->residence_s, sizeof(d->residence_s), h);
+        return h;
+    }
+    return 0;
+}
+
+// Inside the chemistry job: a keyframe whenever the simulation crosses the next one.
+internal void sim_timeline_maybe_record(SimState *state) {
+    Timeline *tl = &state->timeline;
+    if (state->timeline_recording && state->sim_time >= tl->next_key_t - 1e-9)
+        timeline_record(tl, &state->permanent, state->sim_time, state->step_count, state->accumulator);
+}
+
+internal void sim_timeline_restore(SimState *state, u32 key) {
+    Timeline *tl = &state->timeline;
+    timeline_restore(tl, &state->permanent, key, &state->sim_time, &state->step_count, &state->accumulator);
+    if (state->dbd) dbd_scene_on_reload(state->dbd);   // the keyframe may predate a hot reload; re-uploads the GPU mechanism
+    tl->params_hash = sim_params_hash(state);
+}
+
+// After the UI frame (its requests are in UiState), before stepping. Returns
+// 1 when the scene is in playback (no simulation this frame).
+internal b32 sim_timeline_control(SimState *state, SimMemory *memory, SimInput *input) {
+    Timeline *tl = &state->timeline;
+    UiState *ui = &state->ui;
+    state->timeline_recording = 0;
+    if (!timeline_available(tl)) { ui->scrub_t = -1.0; ui->step_back = 0; return 0; }
+    if (tl->generation != state->scene_generation || tl->frame_bytes != AlignPow2(state->permanent.used, 64)) {
+        timeline_reset(tl, &state->permanent, state->scene_generation, sim_default_key_interval(state));
+        timeline_record(tl, &state->permanent, state->sim_time, state->step_count, state->accumulator);
+        tl->params_hash = sim_params_hash(state);
+    }
+    // an edit while in the past forks: drop the recorded future, go live from here
+    u64 h = sim_params_hash(state);
+    if (h != tl->params_hash) {
+        if (tl->playback && tl->key_count) { timeline_truncate_after(tl, tl->shown_key); tl->playback = 0; }
+        tl->params_hash = h;
+    }
+    // bake
+    if (ui->bake_go && !tl->baking && tl->key_count) {
+        ui->bake_go = 0;
+        if (tl->playback) { timeline_truncate_after(tl, tl->shown_key); tl->playback = 0; }
+        else timeline_truncate_after(tl, timeline_find(tl, state->sim_time));
+        if (ui->bake_precise && state->dbd) {   // reference-grade solver settings for the bake
+            DbdScene *d = state->dbd;
+            d->precision = DbdPrecision_F64;
+            d->control.rtol = Minimum(d->control.rtol, 1e-5);
+            d->chem_steps = 1;
+            d->gpu_ready = 0;
+        }
+        tl->params_hash = sim_params_hash(state);
+        f64 dur = Maximum((f64)ui->bake_duration, 1e-3);
+        tl->interval = dur / (f64)Clamp(ui->bake_keys, 10, (s32)TIMELINE_MAX_KEYS / 2);
+        tl->bake_start = state->sim_time;
+        tl->bake_end = state->sim_time + dur;
+        if (timeline_end(tl) < state->sim_time - 1e-9) timeline_record(tl, &state->permanent, state->sim_time, state->step_count, state->accumulator);
+        tl->next_key_t = state->sim_time + tl->interval;
+        tl->baking = 1;
+        ui->bake_saved_max = ui->max_speed;
+        ui->max_speed = 1;
+        state->paused = 0;
+    }
+    if (tl->baking && (ui->bake_cancel || state->sim_time >= tl->bake_end - 1e-9)) {
+        b32 done = !ui->bake_cancel;
+        ui->bake_cancel = 0;
+        tl->baking = 0;
+        ui->max_speed = ui->bake_saved_max;
+        state->paused = 1;
+        if (done) {   // play the bake back from its start
+            tl->playback = 1;
+            tl->playhead = tl->bake_start;
+            sim_timeline_restore(state, timeline_find(tl, tl->bake_start));
+        }
+    }
+    // scrub / step through keyframes
+    if (ui->scrub_t >= 0.0 && tl->key_count && !tl->baking) {
+        if (ui->scrub_t > timeline_end(tl) + 1e-9) {
+            // past the recording: go live (from the last keyframe if we were in playback)
+            if (tl->playback) sim_timeline_restore(state, tl->key_count - 1);
+            tl->playback = 0;
+        } else {
+            f64 t = Clamp(ui->scrub_t, timeline_start(tl), timeline_end(tl));
+            u32 k = timeline_find(tl, t);
+            if (k != tl->shown_key || !tl->playback) sim_timeline_restore(state, k);
+            tl->playback = 1;
+            tl->playhead = t;
+        }
+    }
+    ui->scrub_t = -1.0;
+    if (ui->step_back && tl->key_count && !tl->baking) {
+        u32 k = tl->playback ? (tl->shown_key ? tl->shown_key - 1 : 0) : timeline_find(tl, state->sim_time - 1e-9);
+        if (!tl->playback && tl->keys[k].sim_time >= state->sim_time - 1e-9 && k > 0) --k;
+        sim_timeline_restore(state, k);
+        tl->playback = 1;
+        tl->playhead = tl->keys[k].sim_time;
+        state->paused = 1;
+    }
+    ui->step_back = 0;
+    if (tl->playback) {
+        if (ui->step_once) {   // step forward one keyframe
+            ui->step_once = 0;
+            if (tl->shown_key + 1 < tl->key_count) {
+                sim_timeline_restore(state, tl->shown_key + 1);
+                tl->playhead = tl->keys[tl->shown_key].sim_time;
+            } else {
+                tl->playback = 0;
+            }
+        } else if (!state->paused) {
+            f64 speed = state->nft ? (f64)ui->nft_speed : (f64)ui->speed;
+            if (ui->max_speed) speed *= 100.0;
+            tl->playhead += (f64)input->dt_frame * speed;
+            if (tl->playhead >= timeline_end(tl)) {   // end of the recording: go live from the last keyframe
+                if (tl->shown_key != tl->key_count - 1) sim_timeline_restore(state, tl->key_count - 1);
+                tl->playback = 0;
+            } else {
+                u32 k = timeline_find(tl, tl->playhead);
+                if (k != tl->shown_key) sim_timeline_restore(state, k);
+            }
+        }
+    }
+    if (!tl->playback) state->timeline_recording = 1;
+    (void)memory;
+    return tl->playback;
 }
 
 internal void sim_initialize(SimMemory *memory) {
@@ -117,9 +325,9 @@ internal void sim_initialize(SimMemory *memory) {
     state->scratch = arena_make(memory->scratch_base, memory->scratch_size);
 
     state->dt_fixed = SIM_DT_FIXED;
+    timeline_init(&state->timeline, memory);
     state->scene = memory->config.scene;
-    state->camera.distance = state->scene == SimScene_Particles ? 3.5f : 4.2f;
-    state->camera.pitch = 0.35f;
+    camera_reset(&state->camera, state->scene);
     state->camera.auto_orbit = state->scene == SimScene_Particles || state->scene == SimScene_Sweep;
 
     sim_reset_scene(state, memory);
@@ -133,6 +341,8 @@ internal void sim_handle_input(SimState *state, SimInput *input) {
     if (was_pressed(input->keys[SimKey_F1])) {
         state->camera.auto_orbit = !state->camera.auto_orbit;
     }
+    if (was_pressed(input->keys[SimKey_F])) { state->camera.frame_request = 1; state->camera.user_moved = 0; }
+    if (was_pressed(input->keys[SimKey_Home])) { camera_reset(&state->camera, state->scene); state->camera.auto_orbit = 0; }
     f32 orbit_speed = 1.5f * input->dt_frame;
     if (is_down(input->keys[SimKey_Left]))  state->camera.yaw -= orbit_speed;
     if (is_down(input->keys[SimKey_Right])) state->camera.yaw += orbit_speed;
@@ -143,36 +353,124 @@ internal void sim_handle_input(SimState *state, SimInput *input) {
     }
 }
 
+// Bounds of everything in the point batches.
+internal b32 render_bounds(RenderCommands *render, v3 *lo, v3 *hi) {
+    b32 any = 0;
+    *lo = V3(1e30f); *hi = V3(-1e30f);
+    for (u32 b = 0; b < render->batch_count; ++b) {
+        RenderPointBatch *pb = render->batches + b;
+        for (u32 i = 0; i < pb->count; ++i) {
+            lo->x = Minimum(lo->x, pb->px[i]); hi->x = Maximum(hi->x, pb->px[i]);
+            lo->y = Minimum(lo->y, pb->py[i]); hi->y = Maximum(hi->y, pb->py[i]);
+            lo->z = Minimum(lo->z, pb->pz[i]); hi->z = Maximum(hi->z, pb->pz[i]);
+            any = 1;
+        }
+    }
+    return any;
+}
+
+// A floor grid under the scene: 1-2-5 spacing, about a dozen lines a side,
+// fading toward its edge; major lines every 5.
+internal void render_floor_grid(RenderCommands *render, Arena *frame, v3 lo, v3 hi) {
+    f32 ext = Maximum(hi.x - lo.x, hi.z - lo.z) * 0.75f + 0.5f;
+    f32 raw = ext / 6.0f, p10 = powf(10.0f, floorf(log10f(raw)));
+    f32 step = raw / p10 < 2.0f ? p10 : raw / p10 < 5.0f ? 2.0f * p10 : 5.0f * p10;
+    v3 c = 0.5f * (lo + hi);
+    f32 y = lo.y - 0.04f * Maximum(hi.y - lo.y, 0.25f);
+    s32 n = (s32)ceilf(ext / step);
+    u32 lines = (u32)(2 * (2 * n + 1));
+    f32 *xyz = push_array_nozero(frame, f32, lines * 6);
+    u32 *rgba = push_array_nozero(frame, u32, lines * 2);
+    f32 cx = floorf(c.x / step) * step, cz = floorf(c.z / step) * step;
+    u32 v = 0;
+    for (s32 axis = 0; axis < 2; ++axis)
+        for (s32 i = -n; i <= n; ++i) {
+            f32 t = (f32)i * step;
+            b32 major = (i % 5) == 0;
+            f32 fade = 1.0f - (f32)(i < 0 ? -i : i) / (f32)(n + 1);
+            u32 a = (u32)((major ? 70.0f : 34.0f) * fade);
+            u32 col = (a << 24) | (0xA0u << 16) | (0x90u << 8) | 0x80u;
+            f32 x0 = axis == 0 ? cx + t : cx - n * step, x1 = axis == 0 ? cx + t : cx + n * step;
+            f32 z0 = axis == 0 ? cz - n * step : cz + t, z1 = axis == 0 ? cz + n * step : cz + t;
+            f32 *p = xyz + v * 3;
+            p[0] = x0; p[1] = y; p[2] = z0; p[3] = x1; p[4] = y; p[5] = z1;
+            rgba[v] = col; rgba[v + 1] = col;
+            v += 2;
+        }
+    RenderLineBatch *lb = render->line_batches + render->line_batch_count++;
+    *lb = RenderLineBatch{};
+    lb->vertex_count = v;
+    lb->xyz = xyz;
+    lb->rgba = rgba;
+    lb->width = 1.0f;
+}
+
 internal void sim_fill_render(SimState *state, SimInput *input, RenderCommands *render) {
     TIMED_FUNCTION();
     Camera *cam = &state->camera;
-    f32 cp = cosf(cam->pitch), sp = sinf(cam->pitch);
-    v3 eye = V3(cam->distance * cp * sinf(cam->yaw), cam->distance * sp, cam->distance * cp * cosf(cam->yaw));
+    if (cam->fov <= 0.0f) camera_reset(cam, state->scene);
+    render->clear_color = V4(0.030f, 0.034f, 0.046f, 1.0f);
+    if (state->dbd) dbd_scene_fill_render(state->dbd, render, (u32)state->ui.view_species);
+    else if (state->nft) nft_scene_fill_render(state->nft, render, (u32)state->ui.nft_layer);
+    else {
+        render->batch_count = 1;
+        RenderPointBatch *b = render->batches;
+        b->point_size = POINT_SIZE;
+        b->color = POINT_COLOR;
+        b->count = state->particles.count;
+        b->px = state->particles.x;
+        b->py = state->particles.y;
+        b->pz = state->particles.z;
+        b->rgba = 0;
+    }
     f32 vw = render->scene_w > 0 ? render->scene_w : (f32)input->window_width;
     f32 vh = render->scene_h > 0 ? render->scene_h : (f32)input->window_height;
     f32 aspect = vh > 0 ? vw / vh : 1.0f;
-    m4 proj = m4_perspective(radians(50.0f), aspect, 0.05f, 100.0f);
-    m4 view = m4_look_at(eye, V3(0.0f), V3(0.0f, 1.0f, 0.0f));
-
-    render->clear_color = V4(0.035f, 0.04f, 0.055f, 1.0f);
+    // frame the scene's bounds when asked (scene change, F, menu): the bounding
+    // sphere fits the narrower of the vertical and horizontal fields of view
+    if (!cam->user_moved && cam->framed_aspect > 0.0f && fabsf(aspect / cam->framed_aspect - 1.0f) > 0.05f)
+        cam->frame_request = 1;   // the view was resized (e.g. the dock layout appeared) before the user took over
+    if (cam->frame_request) {
+        cam->framed_aspect = aspect;
+        v3 lo, hi;
+        if (render_bounds(render, &lo, &hi)) {
+            cam->bounds_min = lo; cam->bounds_max = hi;
+            cam->target = 0.5f * (lo + hi);
+            f32 radius = 0.5f * length(hi - lo);
+            f32 half = Minimum(0.5f * cam->fov, atanf(tanf(0.5f * cam->fov) * aspect));
+            cam->distance = Clamp(radius / sinf(half) * 0.92f, 0.05f, 400.0f);
+        }
+        cam->frame_request = 0;
+    }
+    CameraBasis cb = camera_basis(cam, aspect);
+    f32 near_z = Maximum(0.01f, cam->distance * 0.01f), far_z = cam->distance * 20.0f + 50.0f;
+    m4 proj = m4_perspective(cam->fov, aspect, near_z, far_z);
+    m4 view = m4_look_at(cb.eye, cam->target, V3(0.0f, 1.0f, 0.0f));
     render->view_proj = proj * view;
-    if (state->dbd) {
-        dbd_scene_fill_render(state->dbd, render, (u32)state->ui.view_species);
-        return;
+    render->point_ref_w = 4.2f;   // attenuated points have their nominal size at the default framing distance
+    if (state->ui.show_grid && state->scene != SimScene_Particles) {
+        v3 lo = cam->bounds_min, hi = cam->bounds_max;
+        if (hi.x < lo.x) render_bounds(render, &lo, &hi);
+        render_floor_grid(render, &state->frame, lo, hi);
     }
-    if (state->nft) {
-        nft_scene_fill_render(state->nft, render, (u32)state->ui.nft_layer);
-        return;
+    // scene element visibility (after framing, so frame-all still sees everything)
+    if (state->nft && render->batch_count >= 2) {
+        if (!state->ui.show_cells) render->batches[0].count = 0;
+        if (!state->ui.show_plants) render->batches[1].count = 0;
     }
-    render->batch_count = 1;
-    RenderPointBatch *b = render->batches;
-    b->point_size = POINT_SIZE;
-    b->color = POINT_COLOR;
-    b->count = state->particles.count;
-    b->px = state->particles.x;
-    b->py = state->particles.y;
-    b->pz = state->particles.z;
-    b->rgba = 0;
+    // hover and selection markers, drawn over the scene
+    UiPick *marks[2] = { &state->ui.selected, &state->ui.hover };
+    for (u32 i = 0; i < 2 && render->batch_count < RENDER_MAX_BATCHES; ++i) {
+        if (!marks[i]->valid) continue;
+        f32 *xyz = push_array_nozero(&state->frame, f32, 3);
+        xyz[0] = marks[i]->pos.x; xyz[1] = marks[i]->pos.y; xyz[2] = marks[i]->pos.z;
+        RenderPointBatch *b = render->batches + render->batch_count++;
+        *b = {};
+        b->count = 1; b->px = xyz; b->py = xyz + 1; b->pz = xyz + 2; b->rgba = 0;
+        b->color = i == 0 ? V4(1.0f, 0.85f, 0.30f, 0.9f) : V4(1.0f, 1.0f, 1.0f, 0.55f);
+        b->point_size = i == 0 ? 18.0f : 14.0f;
+        b->on_top = 1;
+    }
 }
 
 SIM_API SIM_ON_RELOAD(sim_on_reload) {
@@ -236,6 +534,7 @@ internal u32 sim_run_chemistry(SimState *state, SimMemory *memory, f64 budget_ms
         state->step_count += k;
         state->sim_time += dt_chem;
         steps += k;
+        sim_timeline_maybe_record(state);
     }
     if (state->dbd->finished) state->accumulator = 0.0;
     state->ui.chem_ms_frame = (f32)((f64)(memory->platform.now_ns() - start_ns) * 1e-6);
@@ -261,6 +560,7 @@ internal u32 sim_run_nft(SimState *state, SimMemory *memory, f64 budget_ms) {
         state->step_count += 1;
         state->sim_time = sc->sys.t;
         ++windows;
+        sim_timeline_maybe_record(state);
     }
     state->ui.chem_ms_frame = (f32)((f64)(memory->platform.now_ns() - start_ns) * 1e-6);
     return windows;
@@ -303,6 +603,20 @@ SIM_API SIM_UPDATE(sim_update) {
     if (!ui_keyboard) {
         sim_handle_input(state, input);
         if (was_pressed(input->keys[SimKey_R])) sim_reset_scene(state, memory);
+        if (ui_on && was_pressed(input->keys[SimKey_Period])) { state->ui.step_once = 1; state->paused = 1; }
+        if (ui_on && was_pressed(input->keys[SimKey_Comma])) state->ui.step_back = 1;
+        if (ui_on && is_down(input->keys[SimKey_Ctrl]) && was_pressed(input->keys[SimKey_Q])) render->request_quit = 1;
+        if (ui_on && was_pressed(input->keys[SimKey_F2])) state->ui.open_shortcuts = 1;
+    }
+    b32 in_playback = ui_on ? sim_timeline_control(state, memory, input) : 0;
+    if (input->timeline_op && timeline_available(&state->timeline)) {   // headless --timeline-check
+        Timeline *tl = &state->timeline;
+        if (input->timeline_op == 1) {
+            timeline_reset(tl, &state->permanent, state->scene_generation, 1.0);
+            timeline_record(tl, &state->permanent, state->sim_time, state->step_count, state->accumulator);
+        } else if (tl->key_count) {
+            sim_timeline_restore(state, 0);
+        }
     }
 
     // Fixed timestep: accumulate wall time, step deterministically.
@@ -311,7 +625,9 @@ SIM_API SIM_UPDATE(sim_update) {
     b32 kick_chem = 0;
     b32 step_once = ui_on && state->ui.step_once;
     state->ui.step_once = 0;
-    if (state->nft && (!state->paused || step_once)) {
+    if (in_playback) {
+        // playback: the timeline restored the keyframe to show; nothing to simulate
+    } else if (state->nft && (!state->paused || step_once)) {
         // NFT runs on its own clock: simulated seconds per wall second.
         f64 speed = ui_on ? (f64)state->ui.nft_speed : (memory->config.speed > 0.0 ? memory->config.speed : 3600.0);
         if (ui_on && state->ui.max_speed) speed = 1e12;

@@ -265,6 +265,10 @@ internal s32 linux_keysym_to_simkey(KeySym sym) {
         case XK_y: case XK_Y: return SimKey_Y;
         case XK_z: case XK_Z: return SimKey_Z;
         case XK_F2:     return SimKey_F2;
+        case XK_f: case XK_F: return SimKey_F;
+        case XK_comma:  return SimKey_Comma;
+        case XK_period: return SimKey_Period;
+        case XK_q: case XK_Q: return SimKey_Q;
         default:        return -1;
     }
 }
@@ -445,6 +449,13 @@ int main(int argc, char **argv) {
     memory.scratch_base = (u8 *)block + PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE;
     memory.ui_size = PLATFORM_UI_SIZE;
     memory.ui_base = (u8 *)memory.scratch_base + PLATFORM_SCRATCH_SIZE;
+    if (!args.headless || args.timeline_check) {
+        // Timeline keyframes: a separate lazy reservation right after the main block
+        // (fixed address, so keyframes of pointer-holding scene state stay valid).
+        void *want = PLATFORM_MEMORY_BASE_ADDRESS ? (u8 *)block + PLATFORM_TOTAL_SIZE : 0;
+        void *tl = mmap(want, PLATFORM_TIMELINE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (tl != MAP_FAILED) { memory.timeline_base = tl; memory.timeline_size = PLATFORM_TIMELINE_SIZE; }
+    }
     memory.config.scene = args.scene;
     memory.config.particle_count = args.particle_count;
     memory.config.zone_count = args.zone_count;
@@ -456,6 +467,10 @@ int main(int argc, char **argv) {
     memory.config.channel_length_m = args.channel_length_m;
     memory.config.plants_per_channel = args.plants_per_channel;
     memory.config.view_layer = args.view_layer;
+    memory.config.has_pick = args.has_pick;
+    memory.config.bake_s = args.bake_s;
+    memory.config.pick_x = args.pick_x;
+    memory.config.pick_y = args.pick_y;
     memory.config.preset = args.preset;
     memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
@@ -518,11 +533,13 @@ int main(int argc, char **argv) {
         u64 t_start = linux_now_ns();
         u64 min_ns = U64_MAX, max_ns = 0, sum_ns = 0;
         u32 reloads = 0;
+        u32 half = args.headless_frames / 2;
         for (u32 frame = 0; frame < args.headless_frames; ++frame) {
             reloads += (u32)linux_check_reload(&sim, &paths, &memory);
             linux_begin_input_frame(&input);
             input.dt_frame = PLATFORM_HEADLESS_DT;
             input.compute_state_hash = (frame + 1 == args.headless_frames);
+            input.timeline_op = args.timeline_check && frame == half ? 1 : 0;
             u64 f0 = linux_now_ns();
             if (sim.is_valid) sim.update(&memory, &input, &render, &stats);
             u64 f1 = linux_now_ns();
@@ -550,6 +567,21 @@ int main(int argc, char **argv) {
             printf("[headless] %s\n", stats.summary);
         }
         printf("[headless] state hash %016llx\n", (unsigned long long)stats.state_hash);
+        if (args.timeline_check) {
+            // restore the half-way keyframe and run the second half again: must be identical
+            u64 first = stats.state_hash;
+            for (u32 frame = half; frame < args.headless_frames; ++frame) {
+                linux_begin_input_frame(&input);
+                input.dt_frame = PLATFORM_HEADLESS_DT;
+                input.compute_state_hash = (frame + 1 == args.headless_frames);
+                input.timeline_op = frame == half ? 2 : 0;
+                if (sim.is_valid) sim.update(&memory, &input, &render, &stats);
+            }
+            b32 ok = stats.state_hash == first;
+            printf("[timeline] restored frame %u and re-ran: state hash %016llx %s\n", half,
+                   (unsigned long long)stats.state_hash, ok ? "(identical)" : "MISMATCH");
+            if (!ok) return 1;
+        }
         platform_print_memory_stats(&stats);
         platform_print_debug_table(&debug_table, args.headless_frames, cycles_per_ms, 1);
         return 0;
@@ -569,7 +601,6 @@ int main(int argc, char **argv) {
 
         linux_begin_input_frame(&input);
         linux_process_events(&win, &input);
-        if (was_pressed(input.keys[SimKey_Escape])) win.running = 0;
 
         u64 now_ns = linux_now_ns();
         input.dt_frame = Clamp((f32)linux_seconds_between(last_ns, now_ns), 0.0f, PLATFORM_MAX_FRAME_DT);
@@ -577,9 +608,17 @@ int main(int argc, char **argv) {
 
         u64 work_start_ns = linux_now_ns();
         if (sim.is_valid) sim.update(&memory, &input, &render, &stats);
+        if (render.request_quit) win.running = 0;
+        b32 shot_now = render.screenshot_path != 0;
+        if (!sim.is_valid && was_pressed(input.keys[SimKey_Escape])) win.running = 0;   // no sim module: Escape still exits
         {
             TIMED_BLOCK("gl_render_frame");
             gl_render_frame(&renderer, &render, win.width, win.height);
+        }
+        if (shot_now) {   // File > Save screenshot: this frame's back buffer, before the swap
+            Arena platform_scratch = arena_make(memory.scratch_base, memory.scratch_size);
+            printf("[platform] screenshot %s: %s\n", render.screenshot_path,
+                   gl_write_screenshot_ppm(&memory.platform, &platform_scratch, render.screenshot_path, win.width, win.height) ? "ok" : "failed");
         }
         debug_table_end_frame(&debug_table);
         ++frames_in_window;

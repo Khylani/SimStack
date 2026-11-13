@@ -13,16 +13,19 @@ internal void ui_build_layout(ImGuiID dock, ImVec2 size) {
     ImGui::DockBuilderRemoveNode(dock);
     ImGui::DockBuilderAddNode(dock, (ImGuiDockNodeFlags)ImGuiDockNodeFlags_DockSpace | (ImGuiDockNodeFlags)ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::DockBuilderSetNodeSize(dock, size);
-    f32 left_frac = Clamp(360.0f / Maximum(size.x, 1.0f), 0.2f, 0.45f);
+    f32 left_frac = Clamp(360.0f * ImGui::GetStyle().FontScaleDpi / Maximum(size.x, 1.0f), 0.2f, 0.45f);
     ImGuiID left, rest, bottom, center;
     ImGui::DockBuilderSplitNode(dock, ImGuiDir_Left, left_frac, &left, &rest);
-    ImGui::DockBuilderSplitNode(rest, ImGuiDir_Down, 0.66f, &bottom, &center);
+    ImGui::DockBuilderSplitNode(rest, ImGuiDir_Down, 0.42f, &bottom, &center);   // the 3D view keeps most of the height
     ImGui::DockBuilderDockWindow("Controls", left);
     ImGui::DockBuilderDockWindow("Plots", bottom);
     ImGui::DockBuilderDockWindow("Performance", bottom);
+    ImGui::DockBuilderDockWindow("Inspector", bottom);
     ImGui::DockBuilderFinish(dock);
 }
 
+#include "ui_shell.cpp"
+#include "ui_timeline.cpp"
 #include "ui_nft.cpp"
 
 internal void ui_switch_scene(SimState *state, SimMemory *memory, u32 scene, u32 zones) {
@@ -30,6 +33,18 @@ internal void ui_switch_scene(SimState *state, SimMemory *memory, u32 scene, u32
     memory->config.zone_count = zones;
     state->scene = scene;
     sim_reset_scene(state, memory);
+    camera_reset(&state->camera, scene);
+    state->camera.auto_orbit = scene == SimScene_Particles || scene == SimScene_Sweep;
+}
+
+// Begin a dockable panel that the View menu can hide.
+internal b32 ui_begin_panel(const char *name, b32 *show) {
+    if (!*show) return 0;
+    bool open = true;
+    b32 visible = ImGui::Begin(name, &open);
+    if (!open) *show = 0;
+    if (!visible) { ImGui::End(); return 0; }
+    return 1;
 }
 
 // --- Controls -----------------------------------------------------------------------
@@ -37,7 +52,7 @@ internal void ui_switch_scene(SimState *state, SimMemory *memory, u32 scene, u32
 internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
     UiState *ui = &state->ui;
     DbdScene *scene = state->dbd;
-    if (!ImGui::Begin("Controls")) { ImGui::End(); return; }
+    if (!ui_begin_panel("Controls", &ui->show_controls)) return;
 
     // Scene
     const char *scenes[] = { "Particles (M1 demo)", "DBD reactor (plug flow)", "Operating-point sweep", "NFT system" };
@@ -54,27 +69,11 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
         return;
     }
 
-    // Run control
-    if (ImGui::Button(state->paused ? "  Run  " : "Pause")) state->paused = !state->paused;
-    ImGui::SameLine();
-    if (ImGui::Button("Step 1 ms")) { ui->step_once = 1; state->paused = 1; }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset")) sim_reset_scene(state, memory);
-    ImGui::SetNextItemWidth(-90);
-    ImGui::BeginDisabled(ui->max_speed);
-    ImGui::SliderFloat("##speed", &ui->speed, 0.01f, 1000.0f, "%.2fx real time", ImGuiSliderFlags_Logarithmic);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    bool max_speed = ui->max_speed != 0;
-    if (ImGui::Checkbox("Max", &max_speed)) ui->max_speed = max_speed;
-    ui_help("Speed asks for simulated seconds per wall second. The chemistry gets at most "
-            "~12 ms of wall time per frame; if it cannot keep up, simulated time runs slower "
-            "and the frame rate stays smooth. Max spends the whole budget every frame.");
-
-    f64 rate = 0.0;
-    if (ui->hist_count) rate = ui->hist_rate[(ui->hist_head + UI_HISTORY - 1) % UI_HISTORY];
-    ImGui::Text("t = %.3f s   %.2f sim-s/s   %llu steps", state->sim_time, rate, (unsigned long long)state->step_count);
-
+    if (scene && ui_controls_header(ui, "Restore every setting of this scene and restart")) {
+        state->dbd_defaults_next = 1;
+        sim_reset_scene(state, memory);
+        scene = state->dbd;
+    }
     if (!scene) {
         ImGui::Separator();
         ImGui::TextWrapped("The particle scene is the milestone-1 demo. Pick the reactor or the sweep above.");
@@ -83,7 +82,7 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
     }
 
     // Domain size
-    if (ImGui::CollapsingHeader("Zones", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_section(ui, "Zones", ImGuiTreeNodeFlags_DefaultOpen, 1)) {
         s32 zones = (s32)scene->zones.count;
         ImGui::SetNextItemWidth(-90);
         ImGui::InputInt("##zones", &zones, scene->chained ? 8 : 64, scene->chained ? 64 : 1024);
@@ -98,7 +97,7 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
     }
 
     // Solver
-    if (ImGui::CollapsingHeader("Solver", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_section(ui, "Solver", ImGuiTreeNodeFlags_DefaultOpen, 1)) {
         s32 backend = (s32)scene->backend;
         ImGui::RadioButton("CPU", &backend, SimBackend_Cpu);
         ImGui::BeginDisabled(!memory->gpu.available);
@@ -167,8 +166,8 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
         if (ImGui::SliderFloat("Pressure kPa", &p_kPa, 20.0f, 200.0f, "%.1f")) { op->p_Pa = p_kPa * 1000.0f; changed = 1; }
         s32 chem_ms = (s32)scene->chem_steps;
         ImGui::SetNextItemWidth(-110);
-        if (ImGui::SliderInt("Chem step ms", &chem_ms, 1, 50)) scene->chem_steps = (u32)chem_ms;
-        ui_help("Chemistry advances (and, in the reactor, plug-flow exchanges) happen every N master "
+        if (ui->advanced && ImGui::SliderInt("Chem step ms", &chem_ms, 1, 50)) scene->chem_steps = (u32)chem_ms;
+        if (ui->advanced) ui_help("Chemistry advances (and, in the reactor, plug-flow exchanges) happen every N master "
                 "steps of 1 ms. Inside a step the solver chooses its own sub-steps; larger N lets it take "
                 "long steps in quasi-steady chemistry and cuts per-step overhead (and GPU transfers).");
         f64 min_res = (f64)scene->zones.count * state->dt_fixed * (f64)scene->chem_steps * 1.01;
@@ -188,7 +187,7 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
         }
     }
 
-    if (ImGui::CollapsingHeader("Electron-impact yields")) {
+    if (ui_section(ui, "Electron-impact yields", 0, 1)) {
         ImGui::PushItemWidth(-110);
         f32 g[5] = { (f32)scene->source.g_O2_diss, (f32)scene->source.f_O1D, (f32)scene->source.g_N2A,
                      (f32)scene->source.g_N2_diss, (f32)scene->source.g_OH_per_100eV };
@@ -250,7 +249,7 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
 internal void ui_plots(SimState *state) {
     UiState *ui = &state->ui;
     DbdScene *scene = state->dbd;
-    if (!ImGui::Begin("Plots")) { ImGui::End(); return; }
+    if (!ui_begin_panel("Plots", &ui->show_plots)) return;
     if (state->nft) { ui_nft_plots(state); ImGui::End(); return; }
     if (!scene) { ImGui::TextDisabled("no chemistry in this scene"); ImGui::End(); return; }
     DbdZones *z = &scene->zones;
@@ -347,7 +346,7 @@ internal void ui_plots(SimState *state) {
 
 internal void ui_performance(SimState *state, SimMemory *memory, SimStats *stats) {
     UiState *ui = &state->ui;
-    if (!ImGui::Begin("Performance")) { ImGui::End(); return; }
+    if (!ui_begin_panel("Performance", &ui->show_performance)) return;
     if (ImGui::BeginTable("##perf", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableNextColumn();
         if (ImPlot::BeginPlot("##frame", ImVec2(-1, -1))) {
@@ -423,20 +422,30 @@ internal void ui_performance(SimState *state, SimMemory *memory, SimStats *stats
     ImGui::End();
 }
 
+#include "ui_inspect.cpp"
+
 // --- frame ----------------------------------------------------------------------------
 
 internal void ui_frame_begin(SimState *state, SimMemory *memory, SimInput *input, RenderCommands *render, SimStats *stats) {
     UiState *ui = &state->ui;
     ui_init_memory(ui, memory);
+    ui_shell_defaults(ui);
     ui_ensure_context(ui);
     ui_feed_input(input);
+    ui_apply_scale(ui);
     ImGui::NewFrame();
+
+    // menu + transport first: they take their strips out of the dockspace's work area
+    ui_main_menu(state, memory, render);
+    ui_transport(state, memory, stats);
+    ui_shortcuts_popup(ui);
 
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGuiID dock = ImGui::DockSpaceOverViewport(0, vp, ImGuiDockNodeFlags_PassthruCentralNode);
+    if (ui->relayout) { ui->layout_built = 0; ui->relayout = 0; ui->show_controls = ui->show_plots = ui->show_performance = ui->show_inspector = 1; }
     b32 fresh_layout = !ui->layout_built;
     if (!ui->layout_built) {
-        ui_build_layout(dock, vp->Size);
+        ui_build_layout(dock, vp->WorkSize);
         ui->layout_built = 1;
     }
     ImGuiDockNode *central = ImGui::DockBuilderGetCentralNode(dock);
@@ -447,23 +456,53 @@ internal void ui_frame_begin(SimState *state, SimMemory *memory, SimInput *input
         render->scene_h = central->Size.y;
     }
 
-    // Camera: drag to orbit, wheel to zoom, when the mouse is over the 3D view.
+    // Camera, when the mouse is over the 3D view:
+    //   left drag orbit; right / middle drag or Shift + left pan; wheel zooms toward the cursor
     ImGuiIO &io = ImGui::GetIO();
+    Camera *cam = &state->camera;
     b32 over_view = central && !io.WantCaptureMouse && input->mouse_inside &&
                     input->mouse_x >= render->scene_x && input->mouse_x < render->scene_x + render->scene_w &&
                     input->mouse_y >= render->scene_y && input->mouse_y < render->scene_y + render->scene_h;
-    if (over_view && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) ui->dragging = 1;
-    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) ui->dragging = 0;
-    if (ui->dragging) {
-        state->camera.yaw += io.MouseDelta.x * 0.008f;
-        state->camera.pitch = Clamp(state->camera.pitch + io.MouseDelta.y * 0.008f, -1.4f, 1.4f);
-        state->camera.auto_orbit = 0;
+    b32 shift = io.KeyShift;
+    if (over_view && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { ui->dragging = shift ? 2 : 1; ui->drag_moved = 0; }
+    if (over_view && (ImGui::IsMouseClicked(ImGuiMouseButton_Right) || ImGui::IsMouseClicked(ImGuiMouseButton_Middle))) { ui->dragging = 2; ui->drag_moved = 0; }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right) && !ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+        ui->dragging = 0;
+    f32 aspect = render->scene_h > 0 ? render->scene_w / render->scene_h : 1.0f;
+    CameraBasis cb = camera_basis(cam, aspect);
+    if (ui->dragging && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f)) {
+        ui->drag_moved += fabsf(io.MouseDelta.x) + fabsf(io.MouseDelta.y);
+        if (ui->dragging == 1) {
+            cam->yaw -= io.MouseDelta.x * 0.008f;
+            cam->pitch = Clamp(cam->pitch + io.MouseDelta.y * 0.008f, -1.45f, 1.45f);
+        } else {
+            f32 k = 2.0f * cam->distance * cb.tan_half / Maximum(render->scene_h, 1.0f);
+            cam->target = cam->target - cb.right * (io.MouseDelta.x * k) + cb.up * (io.MouseDelta.y * k);
+        }
+        cam->auto_orbit = 0;
+        cam->user_moved = 1;
     }
-    if (over_view && input->mouse_wheel != 0.0f)
-        state->camera.distance = Clamp(state->camera.distance * powf(0.9f, input->mouse_wheel), 1.0f, 30.0f);
+    if (over_view && input->mouse_wheel != 0.0f) {
+        cam->user_moved = 1;
+        // zoom toward the point under the cursor on the plane through the target
+        f32 nx = (input->mouse_x - render->scene_x) / render->scene_w * 2.0f - 1.0f;
+        f32 ny = 1.0f - (input->mouse_y - render->scene_y) / render->scene_h * 2.0f;
+        v3 dir = normalize(cb.forward + cb.right * (nx * cb.tan_half * aspect) + cb.up * (ny * cb.tan_half));
+        f32 denom = dot(dir, cb.forward);
+        f32 f = powf(0.88f, input->mouse_wheel);
+        f32 nd = Clamp(cam->distance * f, 0.05f, 400.0f);
+        f = nd / cam->distance;
+        if (denom > 1e-3f) {
+            v3 hit = cb.eye + dir * (cam->distance / denom);
+            cam->target = hit + (cam->target - hit) * f;
+        }
+        cam->distance = nd;
+    }
+    ui_view_interaction(state, memory, input, over_view);
 
     ui_controls(state, memory, stats);
     ui_performance(state, memory, stats);
+    ui_inspector(state);
     if (fresh_layout) ImGui::SetNextWindowFocus();   // Plots is the front tab of the shared node
     ui_plots(state);
 }
@@ -522,6 +561,13 @@ internal void ui_view_overlay(SimState *state, RenderCommands *render) {
 internal void ui_frame_end(SimState *state, SimInput *input, RenderCommands *render) {
     UiState *ui = &state->ui;
     ui_view_overlay(state, render);
+    if (render->scene_w > 0) {
+        ImGuiViewport *vp = ImGui::GetMainViewport();
+        ui_view_decorations(state, render, ImVec2(vp->Pos.x + render->scene_x, vp->Pos.y + render->scene_y));
+        ui->last_view_proj = render->view_proj;
+        ui->last_scene_x = vp->Pos.x + render->scene_x; ui->last_scene_y = vp->Pos.y + render->scene_y;
+        ui->last_scene_w = render->scene_w; ui->last_scene_h = render->scene_h;
+    }
     // history ring
     f32 frame_ms = input->dt_frame * 1000.0f;
     f64 advanced = state->sim_time - ui->last_sim_time;

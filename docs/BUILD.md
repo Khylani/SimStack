@@ -79,14 +79,22 @@ default 512), `--averaged` (continuous discharge source instead of one pulse
 per half-cycle), `--zones N`, `--precision f32|f64` (chemistry lane precision,
 default f32), `--chem-dt N` (chemistry advance every N ms; reactor default 1, sweep 20).
 
-The window is a docked Dear ImGui UI (controls, plots, performance) around the
-3D view; drag in the 3D view to orbit, wheel to zoom. Windowed chemistry runs as
-a background job overlapping render + swap, paced to the display rate.
+The window is a docked Dear ImGui UI around the 3D view: menu bar, Controls,
+Plots / Inspector / Performance tabs, and a transport bar with playback,
+speed, a scrubbable timeline and baking. See `docs/UI.md` for the whole
+interface. Windowed chemistry runs as a background job overlapping render +
+swap, paced to the display rate.
 
-Keys in the window: `Space`/`P` pause, `R` reset the scene, `F1` toggle camera
-auto-orbit, arrow keys orbit, `Esc` quit. The window title shows ms/frame; the
-profiler table and arena usage are printed to stdout every 120 frames unless
-`--quiet` is given.
+Keys in the window: `Space`/`P` pause, `.` step, `,` step back, `R` restart,
+`F` frame all, `Home` reset the camera, `F1` auto-orbit, `F2` shortcuts,
+arrow keys orbit, `Esc` clear the selection, `Ctrl+Q` quit. The window title
+shows ms/frame; the profiler table and arena usage are printed to stdout every
+120 frames unless `--quiet` is given.
+
+Window options: `--bake T` (bake T simulated seconds at start-up, `d`/`h`
+suffixes, then play back), `--pick FX,FY` (inspect the point at a fraction of
+the 3D view, for scripted screenshots). `--timeline-check` (headless) restores
+the half-way keyframe, re-runs, and fails unless the state hash is identical.
 
 ### Hot reload
 
@@ -206,13 +214,18 @@ src/
   sim/nft.cpp               NFT system: AoSoA channel groups, transport + plant kernels, reservoir
   sim/nft_hydraulics.cpp    PVC network: Colebrook, pump curves, manifold, eductor, film regimes
   sim/nft_scene.cpp         NFT scene: history, CSV, 3D layers
+  sim/timeline.cpp          keyframes of the scene arena: record, thin, restore, fork (playback, scrubbing, baking)
   ui/                       Dear ImGui config, UI heap + render-command emission, panels
+  ui/ui_shell.cpp           menu bar, transport bar, drawn icons, UI scale, shortcuts
+  ui/ui_timeline.cpp        timeline bar and Bake popup
+  ui/ui_inspect.cpp         picking, hover tooltip, Inspector panel, axes gizmo
   tools/kin_codegen.cpp     metaprogram: straight-line kinetics kernels -> build/gen/
 third_party/                Dear ImGui (docking) + ImPlot, pinned (THIRD_PARTY.md)
   gpu/gpu_api.h             C ABI + GpuAPI table of the optional CUDA module
   gpu/kernels.cu            nvcc TU: GPU bump arena, kinetics kernel, point kernel
   tests/test_kinetics.cpp   solver/mechanism tests and benchmarks
 docs/BUILD.md               this file
+docs/UI.md                  the window: transport, timeline / baking, 3D view, Inspector, menus
 docs/M2_KINETICS.md         the DBD chemistry solver and UI: design, verification, measurements
 docs/M3_NFT.md              NFT channels, PVC hydraulics, reservoir/chiller, plants: model, exactness, layout
 docs/PAW_SKID.md            the PAW skid preset: DBD electrical model, batch chemistry, coupling to the NFT reservoir
