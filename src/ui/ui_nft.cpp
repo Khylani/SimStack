@@ -276,8 +276,9 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             ImGui::SeparatorText("Gas and capture");
             ui_combo_u32("gas chemistry", &pp->gas_source, paw_gas_source_names, PawGas_Count);
             if (ImGui::Button("Run chemistry (M2 kinetics)")) paw_gas_compute(&s->paw_chem, &k->gas, pp, k->drum.T_C);
-            ImGui::SameLine();
-            ui_slider_f32("gas above water K", &pp->gas_dT_K, 0.0f, 150.0f, "%.0f");
+            bool manual = pp->gas_T_manual != 0;
+            if (ImGui::Checkbox("manual gap temperature", &manual)) pp->gas_T_manual = manual;
+            if (pp->gas_T_manual) ui_slider_f32("gas above water K", &pp->gas_dT_K, 0.0f, 250.0f, "%.0f");
             ui_slider_f32("dry air L/min", &pp->air_L_min, 0.5f, 30.0f, "%.1f", 1);
             ui_slider_f32("NOx cost MJ/mol", &pp->nox_MJ_mol, 5.0f, 60.0f, "%.1f");
             ui_slider_f32("N2O5 share", &pp->n2o5_share, 0.0f, 1.0f, "%.2f");
@@ -300,6 +301,15 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             if (e.bus_limited) ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "half-bridge at %.0f A", pp->bus_A_max);
             ImVec4 dens = e.W_cm2 <= 1.0 ? ImVec4(0.6f, 0.9f, 0.6f, 1) : e.W_cm2 <= 1.5 ? ImVec4(1, 0.75f, 0.3f, 1) : ImVec4(1, 0.4f, 0.3f, 1);
             ImGui::TextColored(dens, "%.2f W/cm2 (submerged limit ~1.0), bus %.2f A", e.W_cm2, e.I_bus_A);
+            {
+                const PawThermal &t = k->th;
+                ImVec4 hot = t.T_alumina_C < 180.0 ? ImVec4(0.6f, 0.9f, 0.6f, 1) : t.T_alumina_C < 220.0 ? ImVec4(1, 0.75f, 0.3f, 1)
+                                                                                                        : ImVec4(1, 0.4f, 0.3f, 1);
+                ImGui::TextColored(hot, "alumina %.0f C, gap gas %.0f C, pipe %.1f C", t.T_alumina_C, t.T_gas_K - 273.15, t.T_pipe_C);
+                if (t.T_alumina_C > 200.0)
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "Viton glands on the alumina at the pipe ends: rated ~200 C");
+                ImGui::TextDisabled("  heat across the gap: %.0f W conduction + %.0f W radiation per module", t.q_cond_W, t.q_rad_W);
+            }
             f64 regime = paw_nox_regime(e.SEI_kJ_L);
             ImGui::Text("SEI %.2f kJ/L: %s, NOx %.1f g/h as NO2", e.SEI_kJ_L, regime > 0.99 ? "NOx mode" : regime < 0.01 ? "ozone mode" : "mixed",
                         e.P_avg_W * regime / (pp->nox_MJ_mol * 1e6) * 3600.0 * 46.0);

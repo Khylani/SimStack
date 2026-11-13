@@ -87,8 +87,18 @@ Load the preset and set the real channel count, length and plants in **System**.
     the drive or flow changes.
   - In the water, NO₂ gives nitrite and nitrate 1:1; N₂O₅, HNO₃ and NO₃ give nitrate;
     HNO₂ gives nitrite.
-  - NO and N₂O are insoluble and go to the vent. N₂O is reported because it's a greenhouse
-    gas.
+  - NO pairs with NO₂ as N₂O₃ (NO + NO₂ + 2 OH⁻ → 2 NO₂⁻ + H₂O) and goes to nitrite.
+  - Unpaired NO and all N₂O are insoluble and go to the vent. N₂O is reported because it's a
+    greenhouse gas.
+
+**Module heat balance.** The rod and the alumina have no cooling path of their own, so all
+the discharge heat (90 % of the power) has to cross the 2.8 mm air gap to the water-cooled
+pipe.
+- Heat leaves by conduction (coaxial, k(T) of air) and by gray-body radiation (alumina ε
+  0.7, oxidized 316 ε 0.4).
+- The pipe sits behind a 500 W/m²K water film.
+- The gas sees the mean of the two walls.
+- The kinetics source uses this gas temperature, unless **manual gap temperature** is set.
 
 **Module in the M2 kinetics** (`--scene dbd --preset paw-skid`):
 - One module's annulus: 44.0 cm³ at 2 L/min (1.32 s residence), its delivered power per
@@ -105,7 +115,8 @@ Load the preset and set the real channel count, length and plants in **System**.
 | Alkalinity equation at the solved pH | 1.5e-21 mol/L |
 | Source water pH from KH + DIC | 10.000000 |
 | Preset + NFT, 30 days: NFT ion / water books, PAW N handover | 2.7e-7 / 1.1e-14 / exact |
-| Nitrite share of batch N | 14 % (design: 5–20 %) |
+| Nitrite share of batch N | 15 % (design: 5–20 %) |
+| Module heat balance: conduction + radiation vs discharge heat | 1.4e-12 |
 | Kinetics-sourced batch: N books (with NO / N₂O vented) | 7e-14 |
 
 ## What the preset shows
@@ -114,7 +125,7 @@ At the default 0.7 Manley factor:
 - **Power:** the three modules deliver 216 W (0.52 W/cm², SEI 2.2 kJ/L, NOx mode).
 - **Batch:** a 50 gal batch of the pH 10, KH 1.5 water reaches pH 5.5 in 8.8 h, using
   1.9 kWh of plasma energy. That's inside the design's 3–12 h.
-- **Product:** 1.34 mM nitrate and 0.22 mM nitrite (14 % of N), with 5 % of the fixed N
+- **Product:** 1.33 mM nitrate and 0.23 mM nitrite (15 % of N), with 5 % of the fixed N
   vented.
 - **NFT reservoir:** the PAW arrives with almost no alkalinity. The plants' own uptake
   slightly acidifies the reservoir, so its pH controller now doses base (209 mmol in 30
@@ -124,26 +135,42 @@ At the default 0.7 Manley factor:
   day, so one batch lasts about 8 days. A daily 50 gal top-off needs roughly 3,800 plants of
   this size.
 
-## What the chemistry says
+## What the thermal and chemistry models say
 
-The M2 kinetics, with the excited-state channels, run one module at its real operating
-point: 1.64 W/cm³, 321 K, 1.32 s, 2.2 kJ/L. They predict an ozonizer, not a NOx reactor:
-- 2.1 % O₃ (69 g/kWh, what cooled air-fed ozonizers make at this SEI).
-- Soluble nitrogen at **62 MJ/mol**, against the design's 22. N₂O at 1300 ppm also escapes.
-- A batch takes **28 h** instead of 8.8 h, too slow for a daily cadence.
-- Much more ozone reaches the water and the MnO₂ destruct.
+**The alumina runs hot.** At 72 W per module, the heat balance gives:
+- **Pipe outside:** 26 °C. It feels barely warm, as the design's start-up check expects.
+- **Alumina:** 257 °C.
+- **Gap gas:** 415 K.
 
-Both are estimates; they bracket the answer. The literature's 15–30 MJ/mol for DBD NOx
-comes from hot or poorly cooled discharges. There, vibrationally excited N₂ (N₂(v) + O → NO
-+ N, not in the mechanism yet) and thermal ozone loss switch the gas to NOx mode. The skid's
-water-cooled pipes push it toward the ozone side, though the alumina and the rod have no
-cooling path of their own.
+The Viton radial glands sit on the alumina in the caps, right at the ends of the discharge,
+so they see close to that temperature. Viton is rated about 200 °C continuous, and the UI
+flags it. Two ways to bring the alumina down:
+- Run at half burst duty: the alumina falls to about 163 °C, at half the production rate.
+- Give the rod a cooling path, for example a hollow rod with water through it, or a
+  conductive path out of the bore to a sink above the cap.
 
-What decides it is measuring ozone and NO₂ at the drum vent, or nitrate per kWh, in the
-first runs. If the skid sits in ozone mode, these levers move it toward NOx mode:
-- Less air per watt (higher SEI).
-- A hotter gap (less water cooling of the pipe, or a thicker dielectric).
-- Accepting the ozone and moving the nitrogen with a separate NOx stage.
+**The gas chemistry at that temperature.** The M2 kinetics, with the excited-state channels,
+run one module at 1.64 W/cm³, 413 K, 1.32 s, 2.2 kJ/L:
+- **Ozone collapses to 38 ppm** (the "ozone zero" of hot DBDs). At a cooled 321 K it would be
+  2.1 %, ozonizer behaviour.
+- **NO survives instead of being oxidized:** 220 ppm NO with 170 ppm NO₂, 170 ppm HNO₃,
+  50 ppm HNO₂, and 720 ppm N₂O, which is vented.
+- **Soluble nitrogen costs 92 MJ/mol**, counting NO paired with NO₂ as N₂O₃. The design
+  assumes 22, and the cooled case gave 62.
+- **A batch takes about 42 h** instead of 8.8 h.
+
+This is a lower bound on the hot-gap NOx. The mechanism has no vibrationally excited N₂, and
+N₂(v) + O → NO + N is the main reason hot air discharges reach 15–30 MJ/mol in the
+literature. Its yield depends on the vibrational distribution inside microsecond filaments,
+which needs a state-resolved solver: the planned ChemPlasKin / LoKI-B reference, not a tuned
+lumped model. Until then the design estimate stays the default gas source. The kinetics show
+the cool-gap and no-N₂(v) limits.
+
+**What settles it in the first runs:**
+- Ozone and NO₂ at the drum vent (ozone means a cool gap; NO₂ with no ozone means NOx mode).
+- Nitrate per kWh of plasma energy.
+- An infrared spot reading of the alumina at the top cap, through the creepage section
+  (it's bare ceramic).
 
 ## Calibrate first
 
@@ -159,8 +186,10 @@ The design marks three numbers as estimates. Each is a slider in **PAW skid**:
 - **Breakdown estimate:** the burning voltage uses the uniform-field estimate. Coaxial
   field enhancement and humidity shift it by about ±10 %, which the Lissajous calibration
   absorbs.
-- **Chemistry:** the M2 kinetics now include the N(²D), N₂(A) and O(¹D) channels, but not
-  N₂(v) or gas heating. They describe a cooled discharge; a hot one goes to NOx mode in ways
-  they don't capture yet.
+- **Chemistry:** the M2 kinetics include the N(²D), N₂(A) and O(¹D) channels and the gap
+  temperature, but not N₂(v). In the hot gap they underestimate NOx (see above).
+- **Thermal model:** steady state and one-dimensional across the gap. It ignores axial
+  conduction along the alumina and rod toward the caps (which would cool the glands
+  somewhat), filament hot spots, and the alumina's own dielectric loss.
 - **Not modelled:** H₂O₂ (low in a gas-fed design, per the review), HNO₂ decomposition below
   pH 4, sodium from caustic softening, and Fe-chelate oxidation by residual ozone.

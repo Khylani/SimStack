@@ -119,8 +119,8 @@ Reference: `--scene dbd --headless 30` gives 500 master steps and hash
 `3d1a11fb2aace04a` (f32 lanes, default) or `c61a1a9cc5369ab6` (`--precision f64`)
 for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
 `--scene nft --headless 600 --speed 86400` (10 simulated days) gives
-`eb7ffcfe5642537a`, and with `--preset paw-skid` `2d36575ffe8488ce`, for any `--threads`.
-`--scene dbd --preset paw-skid --headless 30` (one skid module's annulus) gives `c5bcf9b89d06ee46`.
+`eb7ffcfe5642537a`, and with `--preset paw-skid` `207c0a1cf5dc8ed4`, for any `--threads`.
+`--scene dbd --preset paw-skid --headless 30` (one skid module's annulus) gives `b39ae95e77c36e85`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.
