@@ -69,7 +69,7 @@ struct KinMech {
     KinLuDiv lu_div[KIN_MAX_LU_DIV];
     KinLuSub lu_sub[KIN_MAX_LU_SUB];
     u16 lower_begin[KIN_MAX_SPECIES + 1];  // into lower[]: strictly-lower entries of row i, ascending col
-    u16 upper_begin[KIN_MAX_SPECIES + 1];  // into upper[]: strictly-upper entries of row i, ascending col
+    u16 upper_begin[KIN_MAX_SPECIES + 1];  // into upper[]: strictly-upper entries of row i, DESCENDING col
     KinRowEntry lower[KIN_MAX_NNZ];
     KinRowEntry upper[KIN_MAX_NNZ];
 };

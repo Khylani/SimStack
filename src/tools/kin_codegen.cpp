@@ -127,6 +127,7 @@ internal void emit_kernels(FILE *f, KinModel *model, const char *prefix, const c
             "    enum { species = %u, reactions = %u, nnz = %u };\n"
             "    static const u64 signature = %s_SIGNATURE;\n"
             "    static SIM_HD u32 n(const KinMech *) { return %u; }\n"
+            "    static SIM_HD bool writer() { return true; }\n"
             "    template <class V> static SIM_HD void fun(const KinMech *, const V *k, const V *src, const V *y, V *f) { %s_fun(k, src, y, f); }\n"
             "    template <class V> static SIM_HD void neg_jac(const KinMech *, const V *k, const V *y, V *a) { %s_neg_jac(k, y, a); }\n"
             "    template <class V> static SIM_HD void factor(const KinMech *, V ghinv, V *a) { %s_factor(ghinv, a); }\n"

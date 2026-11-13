@@ -57,6 +57,7 @@ SIM_HD void dbd_advance_group(const KinMech *m, const KinMethod *method, const K
     kin_advance<V, Ops, Delta>(m, method, ctl, k, src, pulse, per, first, count, y, lane_splat((V *)0, duration), h, st,
                                Delta ? base : (const V *)0);
 
+    if (!Ops::writer()) return;   // cooperative policies: one lane of the team writes back
     for (u32 s = 0; s < n; ++s) {
         if (Delta) {
             f64 *dst = a.y + s * p + i0;

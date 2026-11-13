@@ -206,7 +206,10 @@ internal void kin_mech_finalize(KinModel *model) {
         m->upper_begin[i] = (u16)up;
         for (u32 j = 0; j < i; ++j)
             if (pattern[i][j]) { m->lower[lo].index = index[i][j]; m->lower[lo].col = (u8)j; ++lo; }
-        for (u32 j = i + 1; j < n; ++j)
+        // upper entries in DESCENDING column order: back substitution then applies
+        // each row's updates in the same order as a column-oriented sweep (which is
+        // what the warp-cooperative GPU solve does), so every path stays bit-identical
+        for (u32 j = n; j-- > i + 1;)
             if (pattern[i][j]) { m->upper[up].index = index[i][j]; m->upper[up].col = (u8)j; ++up; }
     }
     m->lower_begin[n] = (u16)lo;

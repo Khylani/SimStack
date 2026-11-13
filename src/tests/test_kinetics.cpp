@@ -37,7 +37,7 @@ internal f64 rel_err(f64 a, f64 b) {
     return s > 0.0 ? d / s : d;
 }
 
-global u8 g_arena_memory[Megabytes(64)] SIM_ALIGNED(64);
+global u8 g_arena_memory[Megabytes(256)] SIM_ALIGNED(64);
 
 // ---------------------------------------------------------------------------
 
@@ -808,6 +808,63 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
                same ? "bit-identical" : "DIFFERENT");
         CHECK(same, "gpu and cpu f32 paths differ (mode %u)", mode);
     }
+    // Regression: long multi-step runs with uploads every step (a pageable cudaMemcpy
+    // on the default stream once raced a kernel on the module's non-blocking stream).
+    {
+        KinMethod m4 = kin_method(KinMethod_Rodas3);
+        gpu.gpu_kin_set_mech(&model->mech, &m4, &ctl);
+        for (u32 precision = 0; precision < 2; ++precision) {
+            DbdZones a, b;
+            DbdGpu g = {};
+            setup_zones(&a, &arena, model, sp, src, 64, DbdDischarge_Pulsed);
+            setup_zones(&b, &arena, model, sp, src, 64, DbdDischarge_Pulsed);
+            const f64 dt = 0.02;
+            for (u32 step = 0; step < 10; ++step) {
+                f64 t0 = step * dt, t1 = (step + 1) * dt;
+                dbd_zones_prepare_source(&a, sp, src, DbdDischarge_Pulsed, t0, t1);
+                err = dbd_advance_gpu(&a, &gpu, &g, dt, precision);
+                dbd_zones_commit_pulses(&a);
+                dbd_zones_prepare_source(&b, sp, src, DbdDischarge_Pulsed, t0, t1);
+                if (precision == DbdPrecision_F32) dbd_advance_cpu<f32x8, AirGenOps, true>(&b, &model->mech, &m4, &ctl, dt);
+                else dbd_advance_cpu<f64x4, AirGenOps>(&b, &model->mech, &m4, &ctl, dt);
+                dbd_zones_commit_pulses(&b);
+            }
+            b32 same = memcmp(a.y, b.y, sizeof(f64) * (u64)a.n_species * a.padded) == 0;
+            printf("[gpu] %s lanes, 64 zones x 10 x 20 ms (upload every step): CUDA vs AVX2 %s\n",
+                   precision == DbdPrecision_F32 ? "f32" : "f64", same ? "bit-identical" : "DIFFERENT");
+            CHECK(same, "multi-step GPU run differs (precision %u)", precision);
+        }
+    }
+
+    // Warp per zone: same bits as the CPU, both precisions and discharge modes.
+    {
+        KinMethod method3 = kin_method(KinMethod_Rodas3);
+        gpu.gpu_kin_set_mech(&model->mech, &method3, &ctl);
+        CHECK(gpu.gpu_kin_set_mode(1) == 0, "warp mode rejected");
+        for (u32 precision = 0; precision < 2; ++precision)
+            for (u32 mode = 0; mode < 2; ++mode) {
+                DbdZones a, b;
+                DbdGpu g = {};
+                setup_zones(&a, &arena, model, sp, src, 24, (DbdDischargeMode)mode);
+                setup_zones(&b, &arena, model, sp, src, 24, (DbdDischargeMode)mode);
+                for (u32 step = 0; step < 5; ++step) {
+                    f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+                    dbd_zones_prepare_source(&a, sp, src, (DbdDischargeMode)mode, t0, t1);
+                    err = dbd_advance_gpu(&a, &gpu, &g, t1 - t0, precision);
+                    dbd_zones_commit_pulses(&a);
+                    CHECK(err == 0, "warp advance: %s", gpu.gpu_error_string(err));
+                    if (precision == DbdPrecision_F32) dbd_step_cpu<f32x8, AirGenOps, true>(&b, model, sp, src, (DbdDischargeMode)mode, &method3, &ctl, t0, t1);
+                    else dbd_step_cpu<f64x4, AirGenOps>(&b, model, sp, src, (DbdDischargeMode)mode, &method3, &ctl, t0, t1);
+                }
+                b32 same = memcmp(a.y, b.y, sizeof(f64) * (u64)a.n_species * a.padded) == 0 &&
+                           memcmp(a.steps, b.steps, sizeof(f64) * a.padded) == 0;
+                printf("[gpu] warp per zone, %s lanes, %s, 24 zones x 5 ms: CUDA vs AVX2 %s\n",
+                       precision == DbdPrecision_F32 ? "f32" : "f64", mode == 0 ? "pulsed  " : "averaged", same ? "bit-identical" : "DIFFERENT");
+                CHECK(same, "warp kernel differs (precision %u mode %u)", precision, mode);
+            }
+        gpu.gpu_kin_set_mode(0);
+    }
+
     // Hybrid: any split of lanes between CUDA and the CPU gives the same bits.
     {
         PlatformWorkQueue *queue = (PlatformWorkQueue *)calloc(1, sizeof(PlatformWorkQueue));
@@ -884,9 +941,24 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
                 f64 s4 = now_s();
                 gpu_s += s1 - s0; cpu_s += s2 - s1; gpu32_s += s3 - s2; cpu32_s += s4 - s3;
             }
-            printf("[gpu bench] %s %5u zones x %2u ms:  f64: CUDA %7.1f ms  AVX2x1 %7.1f ms  |  f32: CUDA %7.1f ms  AVX2x1 %7.1f ms\n",
+            // the same f32 case with one warp per zone
+            DbdZones w;
+            DbdGpu gw = {};
+            setup_zones(&w, &arena, model, sp, src, n, (DbdDischargeMode)mode);
+            gpu.gpu_kin_set_mode(1);
+            f64 warp_s = 0.0;
+            for (u32 step = 0; step < ms; ++step) {
+                f64 t0 = step * 1e-3, t1 = (step + 1) * 1e-3;
+                f64 s0 = now_s();
+                dbd_zones_prepare_source(&w, sp, src, (DbdDischargeMode)mode, t0, t1);
+                dbd_advance_gpu(&w, &gpu, &gw, t1 - t0, DbdPrecision_F32);
+                dbd_zones_commit_pulses(&w);
+                warp_s += now_s() - s0;
+            }
+            gpu.gpu_kin_set_mode(0);
+            printf("[gpu bench] %s %5u zones x %2u ms:  f64: CUDA %7.1f  AVX2x1 %7.1f  |  f32: CUDA thread %7.1f  warp %7.1f  AVX2x1 %7.1f ms\n",
                    mode == 0 ? "pulsed  " : "averaged", n, ms, gpu_s * 1e3, run_cpu ? cpu_s * 1e3 : 0.0, gpu32_s * 1e3,
-                   run_cpu ? cpu32_s * 1e3 : 0.0);
+                   warp_s * 1e3, run_cpu ? cpu32_s * 1e3 : 0.0);
         }
     }
 }

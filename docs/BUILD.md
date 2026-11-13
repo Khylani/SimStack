@@ -115,7 +115,7 @@ particle positions and step counter carry over; the title bar shows
 
 For the dbd/sweep scenes the hash covers every zone's species densities.
 Reference: `--scene dbd --headless 30` gives 500 master steps and hash
-`3741c9877f88ad5d` (f32 lanes, default) or `a2be2f374ec0cfb4` (`--precision f64`)
+`ef492929d2110e75` (f32 lanes, default) or `ef15ffac690ff7b1` (`--precision f64`)
 for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
 `--scene nft --headless 600 --speed 86400` (10 simulated days) gives
 `5e3d03b626c2e381` for any `--threads`.
