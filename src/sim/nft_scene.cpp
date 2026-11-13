@@ -356,10 +356,12 @@ internal void nft_scene_summary(NftScene *sc, char *out, u32 size) {
         PawSkid *k = &s->paw;
         u32 len = (u32)strlen(out);
         snprintf(out + len, size - len,
-                 "\n[headless] paw %s | drum %.0f L pH %.2f NO3 %.2f NO2 %.3f mM | plasma %.0f W (%.2f W/cm2, SEI %.1f kJ/L) | "
+                 "\n[headless] paw %s | drum %.0f L pH %.2f NO3 %.2f NO2 %.3f mM | plasma %.0f W (%.2f W/cm2, SEI %.1f kJ/L, "
+                 "alumina %.0f C, gap gas %.0f K) | "
                  "%.0f batches, last %.1f h %.2f kWh, nitrite %.0f %% | delivered %.0f L, %.1f mmol N | vented N %.1f %%",
                  paw_state_names[k->state], k->drum.V_L, k->drum.pH, k->drum.no3_mmol / Maximum(k->drum.V_L, 1e-9),
-                 k->drum.no2_mmol / Maximum(k->drum.V_L, 1e-9), k->el.P_avg_W, k->el.W_cm2, k->el.SEI_kJ_L, k->acc.batches,
+                 k->drum.no2_mmol / Maximum(k->drum.V_L, 1e-9), k->el.P_avg_W, k->el.W_cm2, k->el.SEI_kJ_L, k->th.T_alumina_C,
+                 k->th.T_gas_K, k->acc.batches,
                  k->acc.last_batch_h, k->acc.last_batch_kWh, 100.0 * k->acc.nitrite_frac_last, k->acc.delivered_L,
                  k->acc.delivered_N_mmol, k->acc.nox_N_mmol > 0 ? 100.0 * k->acc.vented_N_mmol / k->acc.nox_N_mmol : 0.0);
         if (k->gas.valid) {

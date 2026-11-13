@@ -742,6 +742,22 @@ internal void test_paw() {
     CHECK(fabs(e10.Cd_F * 1e12 - 241.0) < 1.0 && fabs(e10.Cg_F * 1e12 - 37.0) < 1.0, "capacitances");
     CHECK(fabs(e10.Vign_V * 1e-3 - 11.3) < 0.15 && fabs(e5.Vign_V * 1e-3 - 14.6) < 0.15, "ignition voltages");
 
+    // 1b. module heat balance: discharge heat = gap conduction + radiation; hotter with power
+    {
+        PawParams pp = paw_default_params();
+        PawElectrical e = paw_electrical(&pp);
+        PawThermal t = paw_thermal(&pp, &e, 20.0);
+        f64 q = pp.heat_frac * e.P_avg_W / pp.modules;
+        f64 bal = (t.q_cond_W + t.q_rad_W - q) / q;
+        pp.burst_duty = 0.5f;
+        PawElectrical e2 = paw_electrical(&pp);
+        PawThermal t2 = paw_thermal(&pp, &e2, 20.0);
+        printf("[paw] module heat balance at %.0f W/module: pipe %.1f C, alumina %.0f C, gap gas %.0f K; conduction %.1f W + "
+               "radiation %.1f W (residual %.1e); half duty: alumina %.0f C\n", e.P_avg_W / pp.modules, t.T_pipe_C, t.T_alumina_C,
+               t.T_gas_K, t.q_cond_W, t.q_rad_W, bal, t2.T_alumina_C);
+        CHECK(fabs(bal) < 1e-9 && t2.T_alumina_C < t.T_alumina_C && t.T_pipe_C > 20.0, "module heat balance");
+    }
+
     // 2. source water: the closed carbonate system reproduces its own pH; batch time vs the
     //    design's calculator (dose = KH + hydroxide, 300 W, 75 % capture, 15 and 30 MJ/mol)
     f64 hours[2];

@@ -36,7 +36,10 @@ global const char *const paw_gas_source_names[PawGas_Count] = { "design estimate
 struct PawParams {
     b32 enabled;
     u32 gas_source;             // PawGasSource
-    f32 gas_dT_K;               // annulus gas above the drum water (kinetics source)
+    b32 gas_T_manual;           // 0: gap temperature from the module heat balance; 1: water + gas_dT_K
+    f32 gas_dT_K;               // manual gap gas temperature above the drum water
+    f32 eps_alumina, eps_pipe;  // thermal emissivities across the gap
+    f32 h_water_W_m2K;          // pipe outside to the stirred drum water
     // modules
     u32 modules;
     u32 pipe_sch5;              // 0: Sch 10 (2.8 mm gap), 1: Sch 5 (3.9 mm)
@@ -75,7 +78,11 @@ internal PawParams paw_default_params() {
     PawParams p = {};
     p.enabled = 0;
     p.gas_source = PawGas_Design;
+    p.gas_T_manual = 0;
     p.gas_dT_K = 30.0f;
+    p.eps_alumina = 0.7f;      // alumina, 400-600 K
+    p.eps_pipe = 0.4f;         // 316, lightly oxidized inside
+    p.h_water_W_m2K = 500.0f;  // recirculated drum
     p.modules = 3;
     p.pipe_sch5 = 0;
     p.active_mm = 200.0f;
@@ -158,6 +165,55 @@ internal PawElectrical paw_electrical(const PawParams *p) {
     return e;
 }
 
+// --- module heat balance ---------------------------------------------------------------
+//
+// The rod and the alumina have no cooling path of their own: the rod's only
+// exits are the alumina and a short stem in air. At steady state the
+// discharge heat (heat_frac of the power, deposited in the gap and on the
+// dielectric surface) crosses the 2.8 mm air gap to the water-cooled pipe by
+// conduction (coaxial, air k(T)) and thermal radiation (gray coaxial
+// cylinders). Solved for the alumina surface temperature; the gas sees the
+// mean of the two walls (linear profile; filament heating in the volume
+// raises it slightly). The pipe sits a film resistance above the water.
+// Gas flow carries ~0.04 W/K out: negligible against ~0.5 W/K across the gap.
+
+struct PawThermal {
+    f64 T_pipe_C, T_alumina_C, T_gas_K;
+    f64 q_cond_W, q_rad_W;        // per module
+};
+
+internal f64 paw_air_k(f64 T_K) { return 0.0241 * pow(T_K / 273.15, 0.81); }   // W/(m K), 250-800 K
+
+internal PawThermal paw_thermal(const PawParams *p, const PawElectrical *e, f64 water_T_C) {
+    PawThermal t = {};
+    f64 L = (f64)p->active_mm * 1e-3;
+    f64 r1 = 0.5e-3 * PAW_ALUMINA_OD_MM, r2 = 0.5e-3 * paw_pipe_id_mm(p);
+    f64 q = p->modules ? (f64)p->heat_frac * e->P_avg_W / p->modules : 0.0;
+    f64 A_out = 3.14159265358979 * 0.0334 * L;                       // 1" pipe OD 33.4 mm
+    f64 Tw = water_T_C + 273.15 + q / Maximum((f64)p->h_water_W_m2K * A_out, 1e-9);
+    f64 A1 = 2.0 * 3.14159265358979 * r1 * L;
+    f64 rad_c = 5.670374419e-8 * A1 / (1.0 / p->eps_alumina + (r1 / r2) * (1.0 / p->eps_pipe - 1.0));
+    f64 lo = Tw, hi = Tw + 3000.0;
+    for (u32 it = 0; it < 200 && hi - lo > 1e-9; ++it) {
+        f64 Ts = 0.5 * (lo + hi);
+        f64 cond = 2.0 * 3.14159265358979 * paw_air_k(0.5 * (Ts + Tw)) * L * (Ts - Tw) / log(r2 / r1);
+        f64 rad = rad_c * (Ts * Ts * Ts * Ts - Tw * Tw * Tw * Tw);
+        if (cond + rad > q) hi = Ts; else lo = Ts;
+    }
+    f64 Ts = 0.5 * (lo + hi);
+    t.q_cond_W = 2.0 * 3.14159265358979 * paw_air_k(0.5 * (Ts + Tw)) * L * (Ts - Tw) / log(r2 / r1);
+    t.q_rad_W = rad_c * (Ts * Ts * Ts * Ts - Tw * Tw * Tw * Tw);
+    t.T_pipe_C = Tw - 273.15;
+    t.T_alumina_C = Ts - 273.15;
+    t.T_gas_K = 0.5 * (Ts + Tw);
+    return t;
+}
+
+internal f64 paw_gas_T_K(const PawParams *p, const PawElectrical *e, f64 water_T_C) {
+    if (p->gas_T_manual) return water_T_C + 273.15 + p->gas_dT_K;
+    return paw_thermal(p, e, water_T_C).T_gas_K;
+}
+
 // Share of the discharge energy in the NOx regime: 0 below 0.3 kJ/L, 1 above
 // 1 kJ/L, smooth in between (the reference design's regime boundaries).
 internal f64 paw_nox_regime(f64 sei_kJ_L) {
@@ -182,7 +238,7 @@ struct PawGas {
     f64 T_K, power_W_cm3, residence_s, freq_Hz;   // the operating point it was computed at
     f64 P_avg_W, air_L_min;                       // ... and what that came from (stale when they change)
     f64 x[PawS_Count];                            // outlet mole fractions
-    f64 nox_MJ_mol;                               // plasma energy per mol of soluble N (NO2, NO3, N2O5, HNO2, HNO3)
+    f64 nox_MJ_mol;                               // plasma energy per mol of soluble N (NO2, NO3, N2O5, HNO2, HNO3, NO paired with NO2)
     f64 o3_g_kWh;
 };
 
@@ -212,7 +268,7 @@ internal void paw_gas_compute(PawChem *c, PawGas *g, const PawParams *p, f64 wat
     if (!c->model || !p->modules) return;
     PawElectrical e = paw_electrical(p);
     f64 flow_cm3_s = (f64)p->air_L_min * 1000.0 / 60.0 / p->modules;
-    g->T_K = water_T_C + 273.15 + p->gas_dT_K;
+    g->T_K = paw_gas_T_K(p, &e, water_T_C);
     g->power_W_cm3 = e.P_avg_W / p->modules / e.annulus_cm3;
     g->residence_s = e.annulus_cm3 / Maximum(flow_cm3_s, 1e-9);
     g->freq_Hz = (f64)p->freq_kHz * 1e3;
@@ -237,7 +293,8 @@ internal void paw_gas_compute(PawChem *c, PawGas *g, const PawParams *p, f64 wat
     for (u32 s = 0; s < z->n_species; ++s) total += z->y[s * z->padded];
     for (u32 i = 0; i < PawS_Count; ++i) g->x[i] = total > 0.0 ? z->y[c->index[i] * z->padded] / total : 0.0;
     f64 mol_air_s = (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L;
-    f64 soluble = (g->x[PawS_NO2] + g->x[PawS_NO3] + 2.0 * g->x[PawS_N2O5] + g->x[PawS_HNO2] + g->x[PawS_HNO3]) * mol_air_s;
+    f64 soluble = (g->x[PawS_NO2] + Minimum(g->x[PawS_NO], g->x[PawS_NO2]) + g->x[PawS_NO3] + 2.0 * g->x[PawS_N2O5] +
+                   g->x[PawS_HNO2] + g->x[PawS_HNO3]) * mol_air_s;   // NO counts with its NO2 partner (N2O3)
     g->nox_MJ_mol = soluble > 0.0 ? e.P_avg_W / soluble * 1e-6 : 0.0;
     g->o3_g_kWh = e.P_avg_W > 0.0 ? g->x[PawS_O3] * mol_air_s * 48.0 / (e.P_avg_W / 3.6e6) : 0.0;
     g->valid = 1;
@@ -372,6 +429,7 @@ struct PawSkid {
     f64 state_t;                           // s in the current state
     f64 batch_t, batch_J;                  // treatment time and plasma energy of the current batch
     PawElectrical el;
+    PawThermal th;                         // module heat balance (alumina, pipe, gap gas)
     PawGas gas;                            // M2 kinetics outlet of one module (gas_source = kinetics, and for display)
     f64 capture;                           // current venturi NOx capture
     f64 plasma_on;                         // fraction of the last window with the plasma on
@@ -386,6 +444,7 @@ internal void paw_init(PawSkid *k, const PawParams *p) {
     k->acc.source_L = k->drum.V_L + k->bucket.V_L;
     k->state = PawState_Treat;
     k->el = paw_electrical(p);
+    k->th = paw_thermal(p, &k->el, k->drum.T_C);
     paw_solve_ph(&k->drum);
     paw_solve_ph(&k->bucket);
 }
@@ -462,6 +521,7 @@ internal void paw_window(PawSkid *k, const PawParams *p, f64 dt, f64 T_amb, f64 
     if (!p->enabled) return;
     k->el = paw_electrical(p);
     PawWater *d = &k->drum;
+    k->th = paw_thermal(p, &k->el, d->T_C);
     f64 on = 0.0;
     if (k->state == PawState_Treat && d->V_L > 0.0) {
         // acid still needed to reach the batch pH at the current DIC (exact
@@ -474,8 +534,8 @@ internal void paw_window(PawSkid *k, const PawParams *p, f64 dt, f64 T_amb, f64 
         f64 nox_rate;                      // soluble N, mmol / s at full on-time
         if (p->gas_source == PawGas_Kinetics && k->gas.valid) {
             const f64 *x = k->gas.x;
-            nox_rate = (x[PawS_NO2] + x[PawS_NO3] + 2.0 * x[PawS_N2O5] + x[PawS_HNO2] + x[PawS_HNO3]) *
-                       (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L * 1e3;
+            nox_rate = (x[PawS_NO2] + Minimum(x[PawS_NO], x[PawS_NO2]) + x[PawS_NO3] + 2.0 * x[PawS_N2O5] + x[PawS_HNO2] +
+                        x[PawS_HNO3]) * (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L * 1e3;
         } else {
             nox_rate = k->el.P_avg_W * paw_nox_regime(k->el.SEI_kJ_L) / ((f64)p->nox_MJ_mol * 1e6) * 1e3;
         }
@@ -492,10 +552,15 @@ internal void paw_window(PawSkid *k, const PawParams *p, f64 dt, f64 T_amb, f64 
     if (p->gas_source == PawGas_Kinetics && k->gas.valid) {
         f64 mol = (f64)p->air_L_min / 60.0 * PAW_AIR_MOL_PER_L * on * 1e3;   // mmol air / s
         const f64 *x = k->gas.x;
-        to_nitrate = (x[PawS_NO3] + 2.0 * x[PawS_N2O5] + x[PawS_HNO3] + 0.5 * x[PawS_NO2]) * mol;
-        to_nitrite = (x[PawS_HNO2] + 0.5 * x[PawS_NO2]) * mol;
+        // NO is insoluble alone, but NO + NO2 absorb together as N2O3
+        // (NO + NO2 + 2 OH- -> 2 NO2- + H2O, fast in alkaline water): the
+        // equimolar part goes to nitrite, the NO2 left over hydrolyses 1:1
+        f64 pair = Minimum(x[PawS_NO], x[PawS_NO2]);
+        f64 no2_left = x[PawS_NO2] - pair;
+        to_nitrate = (x[PawS_NO3] + 2.0 * x[PawS_N2O5] + x[PawS_HNO3] + 0.5 * no2_left) * mol;
+        to_nitrite = (x[PawS_HNO2] + 2.0 * pair + 0.5 * no2_left) * mol;
         n2o = 2.0 * x[PawS_N2O] * mol;
-        insoluble = x[PawS_NO] * mol + n2o;
+        insoluble = (x[PawS_NO] - pair) * mol + n2o;
         o3 = x[PawS_O3] * mol;
     } else {
         f64 regime = paw_nox_regime(k->el.SEI_kJ_L);
@@ -571,6 +636,6 @@ internal PawModuleOperating paw_module_operating(const PawParams *p, f64 water_T
     o.freq_Hz = (f64)p->freq_kHz * 1e3;
     o.residence_s = e.annulus_cm3 / flow_cm3_s;
     o.x_H2O = 103.0 / 101325.0;                      // dryer: dew point -20 C (e_s = 103 Pa)
-    o.T_K = water_T_C + 273.15 + 30.0;               // gas a few tens of K above the water-cooled wall
+    o.T_K = paw_gas_T_K(p, &e, water_T_C);           // module heat balance (see paw_thermal)
     return o;
 }
