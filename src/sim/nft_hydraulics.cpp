@@ -46,12 +46,12 @@ global const NftPumpModel nft_pumps[NftPump_Count] = {   // typical submersible 
 };
 
 // Standard NFT channel profiles: wetted floor width and outer perimeter.
-struct NftProfile { const char *name; f32 width_m, perimeter_m; };
+struct NftProfile { const char *name; f32 width_m, perimeter_m, height_m; };
 enum NftProfileId { NftProfile_70x40, NftProfile_100x50, NftProfile_120x60, NftProfile_Count };
 global const NftProfile nft_profiles[NftProfile_Count] = {
-    { "70 x 40 mm",  0.070f, 0.22f },
-    { "100 x 50 mm", 0.100f, 0.30f },
-    { "120 x 60 mm", 0.120f, 0.36f },
+    { "70 x 40 mm",  0.070f, 0.22f, 0.040f },
+    { "100 x 50 mm", 0.100f, 0.30f, 0.050f },
+    { "120 x 60 mm", 0.120f, 0.36f, 0.060f },
 };
 
 struct NftHydraulicParams {
