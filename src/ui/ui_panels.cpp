@@ -23,6 +23,8 @@ internal void ui_build_layout(ImGuiID dock, ImVec2 size) {
     ImGui::DockBuilderFinish(dock);
 }
 
+#include "ui_nft.cpp"
+
 internal void ui_switch_scene(SimState *state, SimMemory *memory, u32 scene, u32 zones) {
     memory->config.scene = scene;
     memory->config.zone_count = zones;
@@ -38,13 +40,18 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
     if (!ImGui::Begin("Controls")) { ImGui::End(); return; }
 
     // Scene
-    const char *scenes[] = { "Particles (M1 demo)", "DBD reactor (plug flow)", "Operating-point sweep" };
+    const char *scenes[] = { "Particles (M1 demo)", "DBD reactor (plug flow)", "Operating-point sweep", "NFT system" };
     s32 current = (s32)state->scene;
     ImGui::SetNextItemWidth(-1);
     if (ImGui::Combo("##scene", &current, scenes, ArrayCount(scenes)) && (u32)current != state->scene) {
-        u32 zones = current == SimScene_Sweep ? 1024 : 64;
+        u32 zones = current == SimScene_Sweep ? 1024 : current == SimScene_Nft ? 16 : 64;
         ui_switch_scene(state, memory, (u32)current, zones);
         scene = state->dbd;
+    }
+    if (state->nft) {
+        ui_nft_controls(state, memory);
+        ImGui::End();
+        return;
     }
 
     // Run control
@@ -92,17 +99,24 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
 
     // Solver
     if (ImGui::CollapsingHeader("Solver", ImGuiTreeNodeFlags_DefaultOpen)) {
-        s32 backend = scene->use_gpu ? 1 : 0;
+        s32 backend = (s32)scene->backend;
+        ImGui::RadioButton("CPU", &backend, SimBackend_Cpu);
         ImGui::BeginDisabled(!memory->gpu.available);
-        ImGui::RadioButton("CPU (AVX2, work queue)", &backend, 0);
         ImGui::SameLine();
-        ImGui::RadioButton("CUDA", &backend, 1);
+        ImGui::RadioButton("CUDA", &backend, SimBackend_Gpu);
+        ImGui::SameLine();
+        ImGui::RadioButton("Hybrid", &backend, SimBackend_Hybrid);
         ImGui::EndDisabled();
-        if (!memory->gpu.available) ui_help("Start with --gpu (and build with ./build.sh --cuda) to enable the CUDA backend.");
-        if ((backend == 1) != (scene->use_gpu != 0)) {
-            scene->use_gpu = backend == 1;
+        ui_help("Hybrid runs CUDA and the CPU work queue at the same time on disjoint zones, split by their "
+                "measured throughput. Both perform identical arithmetic, so results are bit-identical to either "
+                "device alone. Start with --gpu (built with ./build.sh --cuda) to enable CUDA.");
+        if ((u32)backend != scene->backend) {
+            scene->backend = (u32)backend;
             scene->gpu_ready = 0;
         }
+        if (scene->backend == SimBackend_Hybrid)
+            ImGui::TextDisabled("GPU %u / %u zones (step %.2f ms: CPU %.2f, GPU %.2f)", scene->hybrid.split, scene->zones.padded,
+                                scene->hybrid.step_ms[scene->hybrid.split / 8], scene->hybrid.last_cpu_ms, scene->hybrid.last_gpu_ms);
         s32 precision = (s32)scene->precision;
         ImGui::RadioButton("f32 lanes", &precision, DbdPrecision_F32);
         ImGui::SameLine();
@@ -223,6 +237,7 @@ internal void ui_plots(SimState *state) {
     UiState *ui = &state->ui;
     DbdScene *scene = state->dbd;
     if (!ImGui::Begin("Plots")) { ImGui::End(); return; }
+    if (state->nft) { ui_nft_plots(state); ImGui::End(); return; }
     if (!scene) { ImGui::TextDisabled("no chemistry in this scene"); ImGui::End(); return; }
     DbdZones *z = &scene->zones;
 
@@ -336,12 +351,20 @@ internal void ui_performance(SimState *state, SimMemory *memory, SimStats *stats
         }
         ImGui::TableNextColumn();
         DbdScene *scene = state->dbd;
+        if (state->nft) {
+            NftSystem *ns = &state->nft->sys;
+            ImGui::Text("NFT: %u groups of 8 channels x %u cells, %u substeps / window", ns->groups, ns->cells, ns->substeps);
+            ImGui::Text("%.3f ms per 60 s window, %.0f simulated s per wall s", state->nft->last_window_wall_ms,
+                        state->nft->last_window_wall_ms > 0 ? 60.0 / (state->nft->last_window_wall_ms * 1e-3) : 0.0);
+            ImGui::Text("chemistry %.1f of %.1f ms budget, frame %.1f ms (%.0f fps)", ui->chem_ms_frame, ui->chem_budget_ms,
+                        ui->frame_ms_smooth, ui->frame_ms_smooth > 0 ? 1000.0f / ui->frame_ms_smooth : 0.0f);
+        }
         if (scene) {
             DbdZones *z = &scene->zones;
             f64 steps = 0.0, failed = 0.0;
             for (u32 i = 0; i < z->count; ++i) { steps += z->steps[i]; failed += z->failed[i]; }
             f64 ms = scene->t * 1000.0;
-            ImGui::Text("%s, %s lanes, %s", scene->use_gpu && memory->gpu.available ? "CUDA" : "CPU",
+            ImGui::Text("%s, %s lanes, %s", scene->backend == SimBackend_Hybrid ? "CUDA + CPU" : scene->backend == SimBackend_Gpu ? "CUDA" : "CPU",
                         scene->precision == DbdPrecision_F32 ? "f32" : "f64", scene->method.name);
             ImGui::Text("%.0f steps / zone / ms   %.3f ms wall / step", ms > 0 ? steps / z->count / ms : 0.0,
                         scene->last_step_wall_ms);
@@ -436,9 +459,11 @@ internal void ui_frame_begin(SimState *state, SimMemory *memory, SimInput *input
 internal void ui_view_overlay(SimState *state, RenderCommands *render) {
     UiState *ui = &state->ui;
     DbdScene *scene = state->dbd;
-    if (!scene || render->scene_w <= 0) return;
+    if (render->scene_w <= 0) return;
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImVec2 origin = ImVec2(vp->Pos.x + render->scene_x, vp->Pos.y + render->scene_y);
+    if (state->nft) { ui_nft_overlay(state, render, origin); return; }
+    if (!scene) return;
     ImGui::SetNextWindowPos(ImVec2(origin.x + 10, origin.y + 10));
     ImGui::SetNextWindowBgAlpha(0.55f);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |

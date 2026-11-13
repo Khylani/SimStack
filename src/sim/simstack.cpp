@@ -79,6 +79,8 @@ struct SimState {
 // Resetting rolls the permanent arena back to just past the SimState header
 // and rebuilds the scene from the config.
 internal void sim_reset_scene(SimState *state, SimMemory *memory) {
+    if (state->dbd && state->dbd->hybrid.registered && memory->gpu.available)
+        memory->gpu.gpu_host_unregister(state->dbd->hybrid.registered_block);   // the block is about to be reused
     state->permanent.used = 0;
     if (memory->gpu.available) memory->gpu.gpu_arena_reset();   // every device buffer belonged to the old scene
     state->step_count = 0;
@@ -159,7 +161,7 @@ internal void sim_fill_render(SimState *state, SimInput *input, RenderCommands *
         return;
     }
     if (state->nft) {
-        nft_scene_fill_render(state->nft, render);
+        nft_scene_fill_render(state->nft, render, (u32)state->ui.nft_layer);
         return;
     }
     render->batch_count = 1;

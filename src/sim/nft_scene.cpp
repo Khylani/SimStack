@@ -124,49 +124,150 @@ internal void nft_scene_window(NftScene *sc, SimMemory *memory, Arena *frame) {
     sc->wall_ms_total += sc->last_window_wall_ms;
 }
 
-// 3D: rails side by side along x, coloured by film temperature; plants as
-// dots above their sites, rising and greening with dry mass.
-internal void nft_scene_fill_render(NftScene *sc, RenderCommands *render) {
+// --- 3D view ------------------------------------------------------------------------
+
+enum NftLayer {
+    NftLayer_Temperature, NftLayer_DeltaInlet, NftLayer_DeltaAmbient, NftLayer_DO,
+    NftLayer_NO3, NftLayer_K, NftLayer_Ca, NftLayer_EC,
+    NftLayer_Velocity, NftLayer_Depth, NftLayer_Flow,
+    NftLayer_PlantMass, NftLayer_fT, NftLayer_fN, NftLayer_fDO,
+    NftLayer_Count,
+};
+struct NftLayerInfo { const char *name, *unit; b32 diverging; b32 plants; };
+global const NftLayerInfo nft_layers[NftLayer_Count] = {
+    { "Film temperature",            "C",       0, 0 },
+    { "Temperature rise vs inlet",   "K",       1, 0 },
+    { "Temperature vs ambient",      "K",       1, 0 },
+    { "Dissolved O2",                "mg/L",    0, 0 },
+    { "Nitrate-N",                   "mg/L",    0, 0 },
+    { "Potassium",                   "mg/L",    0, 0 },
+    { "Calcium",                     "mg/L",    0, 0 },
+    { "EC (local)",                  "mS/cm",   0, 0 },
+    { "Film velocity",               "m/s",     0, 0 },
+    { "Film depth",                  "mm",      0, 0 },
+    { "Channel flow",                "L/min",   0, 0 },
+    { "Plant dry mass / max",        "",        0, 1 },
+    { "Plant temperature factor fT", "",        0, 1 },
+    { "Plant nutrient factor fN",    "",        0, 1 },
+    { "Plant O2 factor fDO",         "",        0, 1 },
+};
+
+// Diverging map for signed quantities: blue (-) - near-white (0) - red (+).
+internal u32 nft_diverging(f32 t) {             // t in [-1, 1]
+    t = Clamp(t, -1.0f, 1.0f);
+    f32 r, g, b;
+    if (t < 0.0f) { f32 a = -t; r = 0.93f - 0.80f * a; g = 0.93f - 0.55f * a; b = 0.95f - 0.20f * a; }
+    else          { f32 a = t;  r = 0.95f - 0.20f * a; g = 0.93f - 0.75f * a; b = 0.93f - 0.80f * a; }
+    return 0xFF000000u | ((u32)(b * 255.0f) << 16) | ((u32)(g * 255.0f) << 8) | (u32)(r * 255.0f);
+}
+
+// Scalar of a layer at channel r, cell j.
+internal f32 nft_layer_value(NftSystem *s, u32 layer, u32 r, u32 j) {
+    u32 g = r / NFT_LANES, l = r % NFT_LANES;
+    NftGroup *grp = s->group + g;
+    switch (layer) {
+        case NftLayer_Temperature:  return nft_abs(s, g, j, NftF_T, l);
+        case NftLayer_DeltaInlet:   return grp->rows[j].f[NftF_T][l];                    // delta from the inlet (ref)
+        case NftLayer_DeltaAmbient: return nft_abs(s, g, j, NftF_T, l) - s->T_amb;
+        case NftLayer_DO:           return nft_abs(s, g, j, NftF_DO, l);
+        case NftLayer_NO3:          return nft_abs(s, g, j, NftF_NO3, l);
+        case NftLayer_K:            return nft_abs(s, g, j, NftF_K, l);
+        case NftLayer_Ca:           return nft_abs(s, g, j, NftF_Ca, l);
+        case NftLayer_EC: {
+            f64 c[NftF_Count];
+            for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_abs(s, g, j, k, l);
+            return (f32)nft_ec_mS(c);
+        }
+        case NftLayer_Velocity:     return grp->lp.velocity_m_s[l];
+        case NftLayer_Depth:        return grp->lp.depth_m[l] * 1000.0f;
+        case NftLayer_Flow:         return grp->lp.flow_L_s[l] * 60.0f;
+        default:                    return 0.0f;
+    }
+}
+
+internal f32 nft_site_value(NftSystem *s, u32 layer, u32 r, u32 j) {
+    NftGroup *grp = s->group + r / NFT_LANES;
+    u32 l = r % NFT_LANES;
+    NftSiteRow *site = grp->sites + j;
+    switch (layer) {
+        case NftLayer_fT:  return site->fT[l];
+        case NftLayer_fN:  return site->fN[l];
+        case NftLayer_fDO: return site->fDO[l];
+        default:           return site->W[l] / grp->crop.wmax[l];
+    }
+}
+
+// Channels side by side along x (inlet at -x, drawn with the bank's grade
+// exaggerated 10x), the manifold across the inlet ends, plants above their
+// sites. Channel cells are coloured by the chosen layer; plant layers colour
+// the plants and grey the film.
+internal void nft_scene_fill_render(NftScene *sc, RenderCommands *render, u32 layer) {
     TIMED_FUNCTION();
     NftSystem *s = &sc->sys;
+    layer %= NftLayer_Count;
+    const NftLayerInfo *info = nft_layers + layer;
     f32 lo = 1e30f, hi = -1e30f;
-    for (u32 r = 0; r < s->rails; ++r)
-        for (u32 j = 0; j < s->cells; ++j) {
-            f32 T = nft_abs(s, r / NFT_LANES, j, NftF_T, r % NFT_LANES);
-            lo = Minimum(lo, T); hi = Maximum(hi, T);
+    if (info->plants) {
+        lo = 0.0f; hi = 1.0f;
+    } else {
+        for (u32 r = 0; r < s->rails; ++r)
+            for (u32 j = 0; j < s->cells; ++j) {
+                f32 v = nft_layer_value(s, layer, r, j);
+                lo = Minimum(lo, v); hi = Maximum(hi, v);
+            }
+        if (info->diverging) {
+            f32 m = Maximum(Maximum(fabsf(lo), fabsf(hi)), 0.01f);
+            lo = -m; hi = m;
+        } else if (hi - lo < 1e-6f * Maximum(fabsf(hi), 1.0f)) {
+            f32 m = 0.5f * (hi + lo), d = Maximum(fabsf(m) * 0.01f, 0.01f);
+            lo = m - d; hi = m + d;
         }
-    if (hi - lo < 1.0f) { f32 m = 0.5f * (hi + lo); lo = m - 0.5f; hi = m + 0.5f; }
+    }
     sc->view_lo = lo; sc->view_hi = hi;
     f32 span_z = 2.4f, dz = s->rails > 1 ? span_z / (f32)(s->rails - 1) : 0.0f;
+    f32 len_x = 3.6f;
     u32 n = 0, m = 0;
     for (u32 r = 0; r < s->rails; ++r) {
         NftGroup *g = s->group + r / NFT_LANES;
         u32 l = r % NFT_LANES;
-        f32 z = -0.5f * span_z + dz * (f32)r + (nft_rail_bank(s, r) ? 0.15f : -0.15f);
+        u32 bank = nft_rail_bank(s, r) ? 1 : 0;
+        f32 z = -0.5f * span_z + dz * (f32)r + (bank ? 0.12f : -0.12f);
+        f32 drop = 10.0f * s->params.hyd.slope[bank] * len_x;   // grade, exaggerated 10x
         for (u32 j = 0; j < s->cells; ++j) {
-            sc->cx[n] = -1.8f + 3.6f * (f32)j / (f32)(s->cells - 1);
-            sc->cy[n] = 0.0f;
+            f32 fx = (f32)j / (f32)(s->cells - 1);
+            sc->cx[n] = -0.5f * len_x + len_x * fx;
+            sc->cy[n] = 0.5f * drop - drop * fx;
             sc->cz[n] = z;
-            sc->ccol[n] = dbd_colormap((nft_abs(s, r / NFT_LANES, j, NftF_T, l) - lo) / (hi - lo));
+            if (info->plants) {
+                sc->ccol[n] = 0xFF4A4440u;
+            } else {
+                f32 v = nft_layer_value(s, layer, r, j);
+                sc->ccol[n] = info->diverging ? nft_diverging(v / hi) : dbd_colormap((v - lo) / (hi - lo));
+            }
             ++n;
         }
         for (u32 j = 0; j < s->sites; ++j) {
+            f32 fx = (f32)(s->site_offset + j * s->site_stride) / (f32)(s->cells - 1);
             f32 frac = g->sites[j].W[l] / g->crop.wmax[l];
-            sc->px[m] = -1.8f + 3.6f * (f32)(s->site_offset + j * s->site_stride) / (f32)(s->cells - 1);
-            sc->py[m] = 0.04f + 0.35f * frac;
+            sc->px[m] = -0.5f * len_x + len_x * fx;
+            sc->py[m] = 0.5f * drop - drop * fx + 0.04f + 0.30f * Clamp(frac, 0.0f, 1.2f);
             sc->pz[m] = z;
-            u32 gch = (u32)(90.0f + 150.0f * Clamp(frac, 0.0f, 1.0f));
-            sc->pcol[m] = 0xFF000000u | (40u << 16) | (gch << 8) | 50u;
+            if (info->plants) {
+                sc->pcol[m] = dbd_colormap(nft_site_value(s, layer, r, j));
+            } else {
+                u32 gch = (u32)(90.0f + 150.0f * Clamp(frac, 0.0f, 1.0f));
+                sc->pcol[m] = 0xFF000000u | (40u << 16) | (gch << 8) | 50u;
+            }
             ++m;
         }
     }
     render->batch_count = 2;
     RenderPointBatch *b = render->batches;
     b->count = n; b->px = sc->cx; b->py = sc->cy; b->pz = sc->cz; b->rgba = sc->ccol;
-    b->color = V4(1, 1, 1, 1); b->point_size = n <= 2048 ? 5.0f : 3.0f;
+    b->color = V4(1, 1, 1, 1); b->point_size = n <= 4096 ? 5.0f : 3.0f;
     b = render->batches + 1;
     b->count = m; b->px = sc->px; b->py = sc->py; b->pz = sc->pz; b->rgba = sc->pcol;
-    b->color = V4(1, 1, 1, 1); b->point_size = m <= 512 ? 9.0f : 5.0f;
+    b->color = V4(1, 1, 1, 1); b->point_size = m <= 1024 ? 8.0f : 4.0f;
 }
 
 internal void nft_scene_summary(NftScene *sc, char *out, u32 size) {

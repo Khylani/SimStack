@@ -32,12 +32,14 @@ struct PlatformArgs {
     u32 zone_count;
     u32 threads;          // work queue threads including the main thread
     b32 gpu;
+    b32 hybrid;
     u32 gpu_mem_mb;
     b32 averaged;
     u32 precision;        // 0 f32, 1 f64 (SimConfig::precision)
     u32 chem_steps;       // SimConfig::chem_steps
     f64 speed;            // SimConfig::speed
     f32 channel_length_m; // SimConfig (nft)
+    u32 view_layer;
     u32 plants_per_channel;
     const char *csv_path;
     u32 seed;
@@ -60,6 +62,7 @@ internal void platform_print_usage(const char *exe) {
            "  --zones N      dbd: axial zones (default 64); sweep: grid points (rounded down to a square, default 256)\n"
            "  --threads N    worker threads including the main thread (default 8, one per P-core)\n"
            "  --gpu          load build/simstack_gpu.so and run the chemistry on CUDA\n"
+           "  --hybrid       CUDA + CPU together: zones split by measured throughput (results bit-identical)\n"
            "  --gpu-mem MB   device arena size (default 512)\n"
            "  --averaged     continuous discharge source instead of one pulse per half-cycle\n"
            "  --chem-dt N    chemistry advance every N ms (master steps); reactor default 1, sweep 20\n"
@@ -103,6 +106,9 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             args.threads = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--gpu") == 0) {
             args.gpu = 1;
+        } else if (strcmp(a, "--hybrid") == 0) {
+            args.gpu = 1;
+            args.hybrid = 1;
         } else if (strcmp(a, "--gpu-mem") == 0 && next) {
             args.gpu_mem_mb = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--precision") == 0 && next) {
@@ -114,6 +120,8 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             args.zone_count = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--channel-length") == 0 && next) {
             args.channel_length_m = (f32)atof(next); ++i;
+        } else if (strcmp(a, "--layer") == 0 && next) {
+            args.view_layer = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--plants") == 0 && next) {
             args.plants_per_channel = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--speed") == 0 && next) {

@@ -30,7 +30,8 @@ struct KinControl;
 struct GpuKinLaunch {
     f64 *y, *h, *steps, *rejects, *pulses, *failed;            // solver writes
     f64 *k, *src, *pulse, *period, *pulse_first, *pulse_count; // solver reads
-    u32 padded;     // array stride (lanes); every lane is integrated
+    u32 padded;     // array stride (lanes)
+    u32 lane_count; // lanes [0, lane_count) are integrated (0: all padded lanes)
     u32 precision;  // 0: f64 lanes (reference), 1: f32 lanes, delta formulation (see dbd_lanes.h)
     f64 duration;   // master step length; the solver runs in local time [0, duration]
 };
@@ -84,9 +85,30 @@ typedef GPU_KIN_SET_MECH(gpu_kin_set_mech_fn);
 #define GPU_KIN_ADVANCE(name) s32 name(const GpuKinLaunch *launch, f32 *kernel_ms)
 typedef GPU_KIN_ADVANCE(gpu_kin_advance_fn);
 
+// Page-locks a host range (once) so the async copies below are true DMA.
+#define GPU_HOST_REGISTER(name) s32 name(void *host, u64 size)
+typedef GPU_HOST_REGISTER(gpu_host_register_fn);
+#define GPU_HOST_UNREGISTER(name) s32 name(void *host)
+typedef GPU_HOST_UNREGISTER(gpu_host_unregister_fn);
+
+// Asynchronous advance of lanes [0, launch->lane_count) of a zone block that is a
+// [rows][pitch] matrix of f64 (host and device share the layout): uploads those
+// lanes of every row, runs the kernel, downloads them for the first
+// `mutable_rows` rows, all on the module's stream. Returns immediately; the
+// caller may work on the other lanes of the same block meanwhile.
+#define GPU_KIN_ADVANCE_ASYNC(name) s32 name(const GpuKinLaunch *launch, void *host_block, void *device_block, \
+                                            u64 rows, u64 mutable_rows)
+typedef GPU_KIN_ADVANCE_ASYNC(gpu_kin_advance_async_fn);
+
+// Waits for the async advance; kernel_ms = kernel time (events), total_ms =
+// launch-to-completion including both copies.
+#define GPU_KIN_WAIT(name) s32 name(f32 *kernel_ms, f32 *total_ms)
+typedef GPU_KIN_WAIT(gpu_kin_wait_fn);
+
 #define GPU_EXPORT_NAMES(X) \
     X(gpu_init) X(gpu_error_string) X(gpu_alloc) X(gpu_arena_used) X(gpu_arena_reset) X(gpu_copy_to_device) X(gpu_copy_to_host) \
-    X(gpu_sync) X(gpu_step_points) X(gpu_kin_set_mech) X(gpu_kin_advance)
+    X(gpu_sync) X(gpu_step_points) X(gpu_kin_set_mech) X(gpu_kin_advance) X(gpu_host_register) X(gpu_host_unregister) \
+    X(gpu_kin_advance_async) X(gpu_kin_wait)
 
 // The table the platform fills from dlsym and hands to the sim.
 struct GpuAPI {

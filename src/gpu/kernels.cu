@@ -23,7 +23,8 @@ struct GpuArena {
 };
 
 static GpuArena g_gpu_arena;
-static cudaEvent_t g_kin_start, g_kin_stop;
+static cudaEvent_t g_kin_start, g_kin_stop, g_async_begin, g_async_end;
+static cudaStream_t g_stream;
 static u32 g_kin_block = 64;
 static b32 g_kin_generated;   // the uploaded mechanism matches AirGenOps
 
@@ -64,7 +65,7 @@ __global__ void step_points_kernel(f32 *x, f32 *y, f32 *z, f32 *vx, f32 *vy, f32
 template <class V, class Ops, bool Delta>
 __global__ void __launch_bounds__(64) kin_advance_kernel(GpuKinLaunch L) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= L.padded) return;
+    if (i >= (L.lane_count ? L.lane_count : L.padded)) return;
     DbdLaneArrays a;
     a.y = L.y; a.h = L.h; a.steps = L.steps; a.rejects = L.rejects; a.pulses = L.pulses; a.failed = L.failed;
     a.k = L.k; a.src = L.src; a.pulse = L.pulse; a.period = L.period;
@@ -102,6 +103,9 @@ GPU_API GPU_INIT(gpu_init) {
 
     cudaEventCreate(&g_kin_start);
     cudaEventCreate(&g_kin_stop);
+    cudaEventCreate(&g_async_begin);
+    cudaEventCreate(&g_async_end);
+    cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking);
     const char *block = getenv("SIMSTACK_KIN_BLOCK");   // experiments only
     if (block && atoi(block) > 0 && atoi(block) <= 64) g_kin_block = (u32)atoi(block);
     return 0;
@@ -156,9 +160,56 @@ GPU_API GPU_KIN_SET_MECH(gpu_kin_set_mech) {
     return (s32)err;
 }
 
+internal void gpu_kin_launch(const GpuKinLaunch *launch, cudaStream_t stream) {
+    u32 block = g_kin_block;
+    u32 lanes = launch->lane_count ? launch->lane_count : launch->padded;
+    u32 grid = (lanes + block - 1) / block;
+    if (launch->precision == 1) {
+        if (g_kin_generated) kin_advance_kernel<f32, AirGenOps, true><<<grid, block, 0, stream>>>(*launch);
+        else kin_advance_kernel<f32, KinOpsGpu, true><<<grid, block, 0, stream>>>(*launch);
+    } else {
+        if (g_kin_generated) kin_advance_kernel<f64, AirGenOps, false><<<grid, block, 0, stream>>>(*launch);
+        else kin_advance_kernel<f64, KinOpsGpu, false><<<grid, block, 0, stream>>>(*launch);
+    }
+}
+
+GPU_API GPU_HOST_REGISTER(gpu_host_register) {
+    cudaError_t err = cudaHostRegister(host, size, cudaHostRegisterDefault);
+    if (err == cudaErrorHostMemoryAlreadyRegistered) { cudaGetLastError(); return 0; }
+    return (s32)err;
+}
+
+GPU_API GPU_HOST_UNREGISTER(gpu_host_unregister) {
+    cudaStreamSynchronize(g_stream);
+    return (s32)cudaHostUnregister(host);
+}
+
+GPU_API GPU_KIN_ADVANCE_ASYNC(gpu_kin_advance_async) {
+    u64 pitch = (u64)launch->padded * sizeof(f64);
+    u64 width = (u64)(launch->lane_count ? launch->lane_count : launch->padded) * sizeof(f64);
+    cudaEventRecord(g_async_begin, g_stream);
+    cudaError_t err = cudaMemcpy2DAsync(device_block, pitch, host_block, pitch, width, rows, cudaMemcpyHostToDevice, g_stream);
+    if (err != cudaSuccess) return (s32)err;
+    cudaEventRecord(g_kin_start, g_stream);
+    gpu_kin_launch(launch, g_stream);
+    cudaEventRecord(g_kin_stop, g_stream);
+    err = cudaMemcpy2DAsync(host_block, pitch, device_block, pitch, width, mutable_rows, cudaMemcpyDeviceToHost, g_stream);
+    if (err != cudaSuccess) return (s32)err;
+    cudaEventRecord(g_async_end, g_stream);
+    return (s32)cudaGetLastError();
+}
+
+GPU_API GPU_KIN_WAIT(gpu_kin_wait) {
+    cudaError_t err = cudaEventSynchronize(g_async_end);
+    if (err != cudaSuccess) return (s32)err;
+    if (kernel_ms) cudaEventElapsedTime(kernel_ms, g_kin_start, g_kin_stop);
+    if (total_ms) cudaEventElapsedTime(total_ms, g_async_begin, g_async_end);
+    return (s32)cudaGetLastError();
+}
+
 GPU_API GPU_KIN_ADVANCE(gpu_kin_advance) {
     u32 block = g_kin_block;
-    u32 grid = (launch->padded + block - 1) / block;
+    u32 grid = ((launch->lane_count ? launch->lane_count : launch->padded) + block - 1) / block;
     cudaEventRecord(g_kin_start);
     if (launch->precision == 1) {
         if (g_kin_generated) kin_advance_kernel<f32, AirGenOps, true><<<grid, block>>>(*launch);

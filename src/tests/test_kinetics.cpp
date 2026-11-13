@@ -808,6 +808,46 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
                same ? "bit-identical" : "DIFFERENT");
         CHECK(same, "gpu and cpu f32 paths differ (mode %u)", mode);
     }
+    // Hybrid: any split of lanes between CUDA and the CPU gives the same bits.
+    {
+        PlatformWorkQueue *queue = (PlatformWorkQueue *)calloc(1, sizeof(PlatformWorkQueue));
+        linux_make_work_queue(queue, 3, -1, 0);
+        PlatformAPI api = {};
+        api.add_work_entry = linux_add_work_entry;
+        api.complete_all_work = linux_complete_all_work;
+        api.now_ns = [](void) -> u64 { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (u64)ts.tv_sec * 1000000000ull + ts.tv_nsec; };
+        static u8 frame_mem[Megabytes(8)];
+        Arena frame = arena_make(frame_mem, sizeof(frame_mem));
+        for (u32 precision = 0; precision < 2; ++precision) {
+            KinMethod method2 = kin_method(KinMethod_Rodas3);
+            gpu.gpu_kin_set_mech(&model->mech, &method2, &ctl);
+            DbdZones ref;
+            setup_zones(&ref, &arena, model, sp, src, 64, DbdDischarge_Pulsed);
+            for (u32 step = 0; step < 3; ++step) {
+                if (precision == DbdPrecision_F32) dbd_step_cpu<f32x8, AirGenOps, true>(&ref, model, sp, src, DbdDischarge_Pulsed, &method2, &ctl, step * 1e-3, (step + 1) * 1e-3);
+                else dbd_step_cpu<f64x4, AirGenOps>(&ref, model, sp, src, DbdDischarge_Pulsed, &method2, &ctl, step * 1e-3, (step + 1) * 1e-3);
+            }
+            u32 splits[] = { 0, 8, 24, 40, 64 };
+            b32 all_same = 1;
+            for (u32 si = 0; si < ArrayCount(splits); ++si) {
+                DbdZones z;
+                DbdGpu g = {};
+                DbdHybrid hy = {};
+                hy.force_split = (s32)splits[si];
+                setup_zones(&z, &arena, model, sp, src, 64, DbdDischarge_Pulsed);
+                for (u32 step = 0; step < 3; ++step) {
+                    dbd_zones_prepare_source(&z, sp, src, DbdDischarge_Pulsed, step * 1e-3, (step + 1) * 1e-3);
+                    s32 e2 = dbd_advance_hybrid(&z, &gpu, &g, &hy, 1e-3, precision, &model->mech, &method2, &ctl, 1, &api, queue, 4, &frame);
+                    CHECK(e2 == 0, "hybrid advance: %s", gpu.gpu_error_string(e2));
+                    dbd_zones_commit_pulses(&z);
+                }
+                all_same &= memcmp(z.y, ref.y, sizeof(f64) * (u64)z.n_species * z.padded) == 0;
+            }
+            printf("[gpu] hybrid CUDA+CPU, %s lanes, splits 0/8/24/40/64 of 64 zones: %s\n",
+                   precision == DbdPrecision_F32 ? "f32" : "f64", all_same ? "all bit-identical to the CPU" : "DIFFERENT");
+            CHECK(all_same, "hybrid split changes results (precision %u)", precision);
+        }
+    }
     if (!bench) return;
 
     // Throughput: averaged mode, 10 ms per run; one launch per 1 ms master step.

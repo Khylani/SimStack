@@ -75,6 +75,7 @@ enum SimScene {
 enum SimBackend {
     SimBackend_Cpu,       // AVX2 lanes across the work queue
     SimBackend_Gpu,       // CUDA, one thread per zone (bit-identical to the CPU)
+    SimBackend_Hybrid,    // CUDA + CPU work queue on disjoint lanes, split by measured throughput (bit-identical)
 };
 
 struct SimConfig {
@@ -89,6 +90,7 @@ struct SimConfig {
     f64 speed;            // nft: simulated seconds per wall second (0 = 3600)
     f32 channel_length_m; // nft: 0 = default
     u32 plants_per_channel; // nft: 0 = default
+    u32 view_layer;       // initial 3D layer (nft: NftLayer)
     const char *csv_path; // dbd / sweep: write results here (0: none)
 };
 

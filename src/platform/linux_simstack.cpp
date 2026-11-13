@@ -448,13 +448,14 @@ int main(int argc, char **argv) {
     memory.config.scene = args.scene;
     memory.config.particle_count = args.particle_count;
     memory.config.zone_count = args.zone_count;
-    memory.config.backend = args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
+    memory.config.backend = args.hybrid ? SimBackend_Hybrid : args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
     memory.config.averaged = args.averaged;
     memory.config.precision = args.precision;
     memory.config.chem_steps = args.chem_steps;
     memory.config.speed = args.speed;
     memory.config.channel_length_m = args.channel_length_m;
     memory.config.plants_per_channel = args.plants_per_channel;
+    memory.config.view_layer = args.view_layer;
     memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
     memory.platform.read_entire_file = linux_read_entire_file;

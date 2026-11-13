@@ -54,7 +54,9 @@ Run:
 
 ```sh
 ./build/simstack --scene dbd              # real-time UI, 64-zone DBD plug-flow reactor (see docs/M2_KINETICS.md)
-./build/simstack --scene sweep --gpu      # real-time UI, 32 x 32 operating-point sweep on CUDA
+./build/simstack --scene sweep --hybrid   # real-time UI, 32 x 32 sweep on CUDA + CPU together
+./build/simstack --scene nft              # real-time UI, NFT channels / hydraulics / chiller / plants (docs/M3_NFT.md)
+./build/simstack --scene nft --channels 64 --channel-length 8 --plants 50 --headless 1440 --speed 86400 --csv runs/nft.csv
 ./build/simstack --scene dbd --headless 300 --csv runs/reactor.csv   # 5 s of chemistry, outlet time series
 ./build/simstack --scene sweep --zones 1024 --averaged --headless 121 --csv runs/sweep.csv [--gpu]
 ./build/simstack                          # windowed, 65536 particles (M1 demo scene)
@@ -63,6 +65,11 @@ Run:
 ./build/simstack --frames 240 --screenshot out.ppm   # windowed, quit after 240 frames, dump the last frame
 ./build/simstack --help
 ```
+
+NFT options: `--channels N`, `--channel-length M`, `--plants N` (per channel),
+`--speed X` (simulated seconds per wall second; headless frames are 1/60 s),
+`--layer N` (initial 3D layer). `--hybrid` runs chemistry on CUDA and the CPU
+at once with a measured split (bit-identical to either alone).
 
 Chemistry options: `--threads N` (work-queue threads including the main
 thread, default 8, workers pinned one per P-core), `--gpu` (load
@@ -109,7 +116,9 @@ particle positions and step counter carry over; the title bar shows
 For the dbd/sweep scenes the hash covers every zone's species densities.
 Reference: `--scene dbd --headless 30` gives 500 master steps and hash
 `3741c9877f88ad5d` (f32 lanes, default) or `a2be2f374ec0cfb4` (`--precision f64`)
-for clang and gcc, any `--threads`, and `--gpu`.
+for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
+`--scene nft --headless 600 --speed 86400` (10 simulated days) gives
+`5e3d03b626c2e381` for any `--threads`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.
@@ -192,6 +201,9 @@ src/
   sim/dbd_lanes.h           per-lane-group DBD advance shared by CPU and CUDA
   sim/dbd.cpp               DBD zones: SoA block, discharge source, CPU (threads) / GPU advance, plug flow
   sim/dbd_scene.cpp         reactor and sweep scenes, operating point, CSV, 3D view
+  sim/nft.cpp               NFT system: AoSoA channel groups, transport + plant kernels, reservoir
+  sim/nft_hydraulics.cpp    PVC network: Colebrook, pump curves, manifold, eductor, film regimes
+  sim/nft_scene.cpp         NFT scene: history, CSV, 3D layers
   ui/                       Dear ImGui config, UI heap + render-command emission, panels
   tools/kin_codegen.cpp     metaprogram: straight-line kinetics kernels -> build/gen/
 third_party/                Dear ImGui (docking) + ImPlot, pinned (THIRD_PARTY.md)
@@ -200,4 +212,5 @@ third_party/                Dear ImGui (docking) + ImPlot, pinned (THIRD_PARTY.m
   tests/test_kinetics.cpp   solver/mechanism tests and benchmarks
 docs/BUILD.md               this file
 docs/M2_KINETICS.md         the DBD chemistry solver and UI: design, verification, measurements
+docs/M3_NFT.md              NFT channels, PVC hydraulics, reservoir/chiller, plants: model, exactness, layout
 ```
