@@ -32,6 +32,13 @@ struct UiHeap {
     u64 alloc_count;
 };
 
+struct UiPick {
+    b32 valid;
+    u32 kind;                   // UiPickKind
+    u32 index;                  // point index within its set
+    v3 pos;
+};
+
 struct UiState {
     b32 memory_ready;
     Arena fonts;                // persistent part of the UI block
@@ -62,13 +69,39 @@ struct UiState {
     s32 nft_profile_field;      // field plotted along the channel
     s32 profile_x_time;         // axial profile x axis: 0 = zone index, 1 = residence time
     char export_path[256];
-    b32 dragging;
+    b32 dragging;               // 1 orbit, 2 pan
+    f32 drag_moved;             // pixels moved since the press (click vs drag)
     f32 chem_ms_frame;          // chemistry wall time this frame (set by simstack.cpp)
     f32 chem_budget_ms;         // wall time the chemistry may use this frame
     f32 frame_ms_smooth;        // measured frame interval (EMA), for display
     f32 target_fps;             // the budget aims to keep this frame rate
     f32 join_ms;                // this frame's wait for last frame's chemistry job
     b32 manual_fps;             // 0: target follows the display (vsync) rate
+
+    // shell
+    b32 shell_ready;            // defaults below applied
+    b32 show_controls, show_plots, show_performance, show_inspector;
+    b32 show_grid, show_labels, show_legend, show_hints, show_axes;
+    b32 show_cells, show_plants;    // NFT scene elements
+    b32 advanced;                   // Controls: show every section (0 = the essentials)
+    UiPick hover, selected;
+    m4 last_view_proj;              // last frame's camera, for picking
+    f32 last_scene_x, last_scene_y, last_scene_w, last_scene_h;
+    f32 ui_scale;               // 0 = automatic (from the window height)
+    f32 applied_scale;
+    b32 open_shortcuts, open_about;
+    b32 relayout;               // rebuild the default dock layout next frame
+    char screenshot_path[256];
+    u32 screenshot_count;
+
+    // timeline / playback requests (applied by simstack.cpp after the UI frame)
+    b32 step_back;
+    f64 scrub_t;                // < 0: none
+    b32 bake_go, bake_cancel, bake_precise;
+    f32 bake_duration;          // sim seconds
+    s32 bake_keys;
+    b32 bake_saved_max;
+    b32 bake_cli_done;          // --bake applied
 };
 
 // Chemistry budget for this frame's background job: 90 % of the target frame

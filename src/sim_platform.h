@@ -93,6 +93,9 @@ struct SimConfig {
     u32 view_layer;       // initial 3D layer (nft: NftLayer)
     u32 preset;           // nft / dbd: 0 default, 1 PAW skid (3x DBD, 50 gal batch, 300 gal NFT)
     const char *csv_path; // dbd / sweep: write results here (0: none)
+    b32 has_pick;         // windowed: hover + select the point at (pick_x, pick_y), fractions of the 3D view
+    f32 pick_x, pick_y;
+    f64 bake_s;           // windowed: bake this many simulated seconds at start-up, then play back
 };
 
 struct SimMemory {
@@ -106,6 +109,8 @@ struct SimMemory {
     void *scratch_base;
     u64 ui_size;          // UI: fonts + the size-class heap Dear ImGui/ImPlot allocate from
     void *ui_base;        // (reset wholesale on hot reload; nothing is malloc'd at runtime)
+    u64 timeline_size;    // keyframes for playback / scrubbing / baking (reserved, committed on touch;
+    void *timeline_base;  //  0 = no timeline)
 
     SimConfig config;
     PlatformAPI platform;
@@ -160,6 +165,10 @@ enum SimKey {
     SimKey_Y,
     SimKey_Z,
     SimKey_F2,
+    SimKey_F,             // frame all
+    SimKey_Comma,         // step back (keyframe)
+    SimKey_Period,        // step forward
+    SimKey_Q,             // Ctrl+Q quits
     SimKey_Count,
 };
 
@@ -178,6 +187,7 @@ struct SimInput {
 
     b32 headless;             // no renderer: platform drives with a fixed dt
     b32 compute_state_hash;   // ask the sim to fill SimStats::state_hash
+    u32 timeline_op;          // headless --timeline-check: 1 record a keyframe, 2 restore the first one
 };
 
 // ----------------------------------------------------------------------------
@@ -189,7 +199,20 @@ struct RenderPointBatch {
     const f32 *px, *py, *pz;  // SoA positions in sim memory (valid until next update)
     const u32 *rgba;          // optional per-point colour (0xAABBGGRR); 0: use `color`
     v4 color;
-    f32 point_size;
+    f32 point_size;           // pixels at the reference depth (RenderCommands::point_ref_w)
+    b32 attenuate;            // 1: size scales with 1/depth (points grow when zoomed in)
+    b32 on_top;               // 1: drawn without the depth test (highlights)
+};
+
+// Line segments (pairs of vertices), interleaved xyz, optional per-vertex colour.
+#define RENDER_MAX_LINE_BATCHES 16
+struct RenderLineBatch {
+    u32 vertex_count;         // 2 per segment
+    const f32 *xyz;
+    const u32 *rgba;          // optional per-vertex colour; 0: `color`
+    v4 color;
+    f32 width;                // pixels (1 where wide lines are unsupported)
+    b32 on_top;
 };
 
 #define RENDER_MAX_BATCHES 32
@@ -226,6 +249,11 @@ struct RenderCommands {
     f32 scene_x, scene_y, scene_w, scene_h;   // 3D view rect in window pixels (w == 0: whole window)
     u32 batch_count;
     RenderPointBatch batches[RENDER_MAX_BATCHES];
+    f32 point_ref_w;          // clip-space w at which attenuated points have point_size pixels
+    u32 line_batch_count;
+    RenderLineBatch line_batches[RENDER_MAX_LINE_BATCHES];
+    b32 request_quit;         // the UI asked the platform to exit
+    const char *screenshot_path;   // the UI asked for a screenshot of this frame (PPM)
 
     u32 tex_op_count;
     RenderTexOp tex_ops[RENDER_MAX_TEX_OPS];

@@ -14,6 +14,7 @@
 #define PLATFORM_SCRATCH_SIZE   Megabytes(64)
 #define PLATFORM_UI_SIZE        Megabytes(256)
 #define PLATFORM_TOTAL_SIZE     (PLATFORM_PERMANENT_SIZE + PLATFORM_FRAME_SIZE + PLATFORM_SCRATCH_SIZE + PLATFORM_UI_SIZE)
+#define PLATFORM_TIMELINE_SIZE  Gigabytes(16)  // separate reservation (Linux): keyframes, committed on touch
 #if SIM_INTERNAL
 #define PLATFORM_MEMORY_BASE_ADDRESS ((void *)0x200000000000ull)
 #else
@@ -49,6 +50,10 @@ struct PlatformArgs {
     b32 quiet;            // suppress periodic timing prints in windowed mode
     u32 windowed_frames;  // 0 = run until closed
     const char *screenshot_path;   // write a PPM of the last windowed frame
+    b32 has_pick;
+    f32 pick_x, pick_y;
+    b32 timeline_check;
+    f64 bake_s;
 };
 
 internal void platform_print_usage(const char *exe) {
@@ -74,6 +79,11 @@ internal void platform_print_usage(const char *exe) {
            "  --csv F        dbd: outlet time series (rewritten every simulated second); sweep: final grid\n"
            "  --frames N     windowed: quit after N frames\n"
            "  --screenshot F windowed: write the last frame as a binary PPM to F\n"
+           "  --pick FX,FY   windowed: inspect the point at (FX, FY), fractions of the 3D view\n"
+           "  --bake T       windowed: bake T simulated seconds (nft: suffix d for days, e.g. 7d)\n"
+           "                 at start-up, then play the recording back\n"
+           "  --timeline-check  headless: keyframe at the half-way frame, finish, restore it,\n"
+           "                 finish again; both state hashes must match (exit 1 if not)\n"
            "  --particles N  particles scene: count (default 65536)\n"
            "  --seed N       particle seed (default 1)\n"
            "  --size WxH     window size (default 1280x720)\n"
@@ -128,6 +138,16 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             else if (strcmp(next, "paw-skid") == 0) args.preset = 1;
             else { printf("unknown preset %s (default | paw-skid)\n", next); exit(1); }
             ++i;
+        } else if (strcmp(a, "--bake") == 0 && next) {
+            char *end = 0;
+            args.bake_s = strtod(next, &end);
+            if (end && (*end == 'd' || *end == 'D')) args.bake_s *= 86400.0;
+            else if (end && (*end == 'h' || *end == 'H')) args.bake_s *= 3600.0;
+            ++i;
+        } else if (strcmp(a, "--timeline-check") == 0) {
+            args.timeline_check = 1;
+        } else if (strcmp(a, "--pick") == 0 && next) {
+            args.has_pick = sscanf(next, "%f,%f", &args.pick_x, &args.pick_y) == 2; ++i;
         } else if (strcmp(a, "--layer") == 0 && next) {
             args.view_layer = (u32)atoi(next); ++i;
         } else if (strcmp(a, "--plants") == 0 && next) {

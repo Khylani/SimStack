@@ -97,6 +97,9 @@ struct GLRenderer {
     GLint u_point_size;
     GLint u_color;
     GLint u_use_vcol;
+    GLint u_ref_w;        // > 0: attenuate point size by depth
+    GLuint line_program, line_vao, line_vbo[2];
+    GLint u_line_view_proj, u_line_color, u_line_use_vcol;
 
     GLuint ui_program;
     GLuint ui_vao, ui_vbo, ui_ibo;
@@ -136,14 +139,35 @@ global const char *gl_point_vertex_src =
     "layout(location = 3) in vec4 pcol;\n"
     "uniform mat4 u_view_proj;\n"
     "uniform float u_point_size;\n"
+    "uniform float u_ref_w;\n"
     "uniform vec4 u_color;\n"
     "uniform int u_use_vcol;\n"
     "out vec4 v_col;\n"
     "void main() {\n"
     "    gl_Position = u_view_proj * vec4(px, py, pz, 1.0);\n"
-    "    gl_PointSize = u_point_size;\n"
+    "    float s = u_ref_w > 0.0 ? u_point_size * u_ref_w / max(gl_Position.w, 1e-3) : u_point_size;\n"
+    "    gl_PointSize = clamp(s, 1.0, 96.0);\n"
     "    v_col = u_use_vcol != 0 ? pcol : u_color;\n"
     "}\n";
+
+global const char *gl_line_vertex_src =
+    "#version 330 core\n"
+    "layout(location = 0) in vec3 pos;\n"
+    "layout(location = 1) in vec4 col;\n"
+    "uniform mat4 u_view_proj;\n"
+    "uniform vec4 u_color;\n"
+    "uniform int u_use_vcol;\n"
+    "out vec4 v_col;\n"
+    "void main() {\n"
+    "    gl_Position = u_view_proj * vec4(pos, 1.0);\n"
+    "    v_col = u_use_vcol != 0 ? col : u_color;\n"
+    "}\n";
+
+global const char *gl_line_fragment_src =
+    "#version 330 core\n"
+    "in vec4 v_col;\n"
+    "out vec4 frag_color;\n"
+    "void main() { frag_color = v_col; }\n";
 
 global const char *gl_point_fragment_src =
     "#version 330 core\n"
@@ -153,7 +177,8 @@ global const char *gl_point_fragment_src =
     "    vec2 d = gl_PointCoord * 2.0 - 1.0;\n"
     "    float r2 = dot(d, d);\n"
     "    if (r2 > 1.0) discard;\n"
-    "    frag_color = vec4(v_col.rgb * (1.0 - 0.35 * r2), v_col.a);\n"   // soft round dots
+    "    float edge = 1.0 - smoothstep(0.75, 1.0, r2);\n"
+    "    frag_color = vec4(v_col.rgb * (1.0 - 0.30 * r2), v_col.a * edge);\n"   // soft, antialiased round dots
     "}\n";
 
 internal GLuint gl_compile_shader(GLenum type, const char *src) {
@@ -320,6 +345,21 @@ internal b32 gl_renderer_init(GLRenderer *r) {
     r->u_point_size = glGetUniformLocation(r->program, "u_point_size");
     r->u_color = glGetUniformLocation(r->program, "u_color");
     r->u_use_vcol = glGetUniformLocation(r->program, "u_use_vcol");
+    r->u_ref_w = glGetUniformLocation(r->program, "u_ref_w");
+    r->line_program = gl_link_program(gl_line_vertex_src, gl_line_fragment_src);
+    if (!r->line_program) return 0;
+    r->u_line_view_proj = glGetUniformLocation(r->line_program, "u_view_proj");
+    r->u_line_color = glGetUniformLocation(r->line_program, "u_color");
+    r->u_line_use_vcol = glGetUniformLocation(r->line_program, "u_use_vcol");
+    glGenVertexArrays(1, &r->line_vao);
+    glGenBuffers(2, r->line_vbo);
+    glBindVertexArray(r->line_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->line_vbo[0]);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, r->line_vbo[1]);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, 0);
+    glBindVertexArray(0);
 
     glGenVertexArrays(1, &r->vao);
     glBindVertexArray(r->vao);
@@ -344,7 +384,7 @@ internal void gl_render_frame(GLRenderer *r, RenderCommands *cmds, u32 width, u3
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     gl_apply_tex_ops(r, cmds);
 
-    if (cmds->batch_count) {
+    if (cmds->batch_count || cmds->line_batch_count) {
         if (cmds->scene_w > 0.0f && cmds->scene_h > 0.0f) {
             GLint x = (GLint)cmds->scene_x, y = (GLint)((f32)height - cmds->scene_y - cmds->scene_h);
             glViewport(x, y, (GLsizei)cmds->scene_w, (GLsizei)cmds->scene_h);
@@ -352,12 +392,43 @@ internal void gl_render_frame(GLRenderer *r, RenderCommands *cmds, u32 width, u3
             glEnable(GL_SCISSOR_TEST);
         }
         glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        // lines first (grid, outlines), then points; on-top batches last without depth
+        glUseProgram(r->line_program);
+        glUniformMatrix4fv(r->u_line_view_proj, 1, GL_FALSE, &cmds->view_proj.e[0][0]);
+        glBindVertexArray(r->line_vao);
+        for (u32 pass = 0; pass < 2; ++pass)
+            for (u32 b = 0; b < cmds->line_batch_count && b < RENDER_MAX_LINE_BATCHES; ++b) {
+                RenderLineBatch *lb = cmds->line_batches + b;
+                if (!lb->vertex_count || !lb->xyz || (lb->on_top != 0) != (pass == 1)) continue;
+                if (pass == 1) glDisable(GL_DEPTH_TEST);
+                glLineWidth(lb->width > 0.0f ? lb->width : 1.0f);
+                glUniform4fv(r->u_line_color, 1, lb->color.e);
+                glBindBuffer(GL_ARRAY_BUFFER, r->line_vbo[0]);
+                glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)lb->vertex_count * 3 * (GLsizeiptr)sizeof(f32), lb->xyz, GL_STREAM_DRAW);
+                if (lb->rgba) {
+                    glBindBuffer(GL_ARRAY_BUFFER, r->line_vbo[1]);
+                    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)lb->vertex_count * 4, lb->rgba, GL_STREAM_DRAW);
+                    glEnableVertexAttribArray(1);
+                } else {
+                    glDisableVertexAttribArray(1);
+                }
+                glUniform1i(r->u_line_use_vcol, lb->rgba ? 1 : 0);
+                glDrawArrays(GL_LINES, 0, (GLsizei)lb->vertex_count);
+                glEnable(GL_DEPTH_TEST);
+            }
+        glLineWidth(1.0f);
         glUseProgram(r->program);
         glUniformMatrix4fv(r->u_view_proj, 1, GL_FALSE, &cmds->view_proj.e[0][0]);
         glBindVertexArray(r->vao);
-        for (u32 b = 0; b < cmds->batch_count && b < RENDER_MAX_BATCHES; ++b) {
-            RenderPointBatch *batch = cmds->batches + b;
-            if (!batch->count || !batch->px) continue;
+        u32 nb = Minimum(cmds->batch_count, (u32)RENDER_MAX_BATCHES);
+        for (u32 bi = 0; bi < 2 * nb; ++bi) {
+            RenderPointBatch *batch = cmds->batches + (bi % nb);
+            if (!batch->count || !batch->px || (batch->on_top != 0) != (bi >= nb)) continue;
+            if (batch->on_top) glDisable(GL_DEPTH_TEST); else glEnable(GL_DEPTH_TEST);
+            glUniform1f(r->u_ref_w, batch->attenuate ? cmds->point_ref_w : 0.0f);
             glUniform1f(r->u_point_size, batch->point_size);
             glUniform4fv(r->u_color, 1, batch->color.e);
             GLsizeiptr bytes = (GLsizeiptr)batch->count * (GLsizeiptr)sizeof(f32);
@@ -376,6 +447,8 @@ internal void gl_render_frame(GLRenderer *r, RenderCommands *cmds, u32 width, u3
             glUniform1i(r->u_use_vcol, batch->rgba ? 1 : 0);
             glDrawArrays(GL_POINTS, 0, (GLsizei)batch->count);
         }
+        glEnable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
         glBindVertexArray(0);
         glDisable(GL_SCISSOR_TEST);
         glViewport(0, 0, (GLsizei)width, (GLsizei)height);

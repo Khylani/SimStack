@@ -38,32 +38,17 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
     NftParams *p = &s->params;
     char buf[64];
 
-    // run
-    if (ImGui::Button(state->paused ? "  Run  " : "Pause")) state->paused = !state->paused;
-    ImGui::SameLine();
-    if (ImGui::Button("Step 1 min")) { ui->step_once = 1; state->paused = 1; }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset")) ui_nft_rebuild(state, memory);
-    ImGui::SetNextItemWidth(-90);
-    ImGui::BeginDisabled(ui->max_speed);
-    ImGui::SliderFloat("##nftspeed", &ui->nft_speed, 1.0f, 2.6e6f, "%.0fx real time", ImGuiSliderFlags_Logarithmic);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    bool max_speed = ui->max_speed != 0;
-    if (ImGui::Checkbox("Max", &max_speed)) ui->max_speed = max_speed;
-    f64 rate = ui->hist_count ? ui->hist_rate[(ui->hist_head + UI_HISTORY - 1) % UI_HISTORY] : 0.0;
-    f64 hour = fmod(s->t / 3600.0, 24.0);
-    ImGui::Text("day %.2f  %02d:%02d  %s  %s/s", s->t / 86400.0, (int)hour, (int)((hour - (int)hour) * 60.0),
-                s->light > 0.5f ? "lights on" : "lights off", ui_duration(rate, buf, sizeof(buf)));
+    (void)buf;
 
     // presets: whole-system starting points
     {
         static s32 preset = -1;
         if (preset < 0) preset = (s32)Minimum(memory->config.preset, (u32)NftPreset_Count - 1);
-        ImGui::SetNextItemWidth(-60);
-        ImGui::Combo("##preset", &preset, nft_preset_names, NftPreset_Count);
-        ImGui::SameLine();
-        if (ImGui::Button("Load")) {
+        ImGui::SetNextItemWidth(-1);
+        b32 picked = ImGui::Combo("##preset", &preset, nft_preset_names, NftPreset_Count);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Whole-system starting point; picking one loads it");
+        b32 defaults = ui_controls_header(ui, "Reload the preset: every parameter back to its value, and restart");
+        if (picked || defaults) {
             state->nft_params = nft_preset((u32)preset);
             sim_reset_scene(state, memory);
             sc = state->nft; s = &sc->sys; p = &s->params;
@@ -120,7 +105,7 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
     }
 
     // hydraulics
-    if (ImGui::CollapsingHeader("Hydraulics (PVC)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_section(ui, "Hydraulics (PVC)", ImGuiTreeNodeFlags_DefaultOpen, 1)) {
         NftHydraulicParams *hp = &p->hyd;
         const char *pumps[NftPump_Count], *profiles[NftProfile_Count];
         for (u32 i = 0; i < NftPump_Count; ++i) pumps[i] = nft_pumps[i].name;
@@ -193,7 +178,7 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
     }
 
     // water use, transpiration and root mats
-    if (ImGui::CollapsingHeader("Water & roots", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_section(ui, "Water & roots", ImGuiTreeNodeFlags_DefaultOpen, 1)) {
         ImGui::PushItemWidth(-130);
         ui_slider_f32("Baille A (radiation)", &p->baille_A, 0.0f, 1.0f, "%.2f");
         ui_slider_f32("Baille B W/m2/kPa", &p->baille_B, 0.0f, 60.0f, "%.1f");
