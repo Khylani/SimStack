@@ -16,8 +16,8 @@
 
 #include "particles.cpp"
 #include "dbd.cpp"
+#include "nft.cpp"          // (paw.cpp inside: the dbd scene's skid preset uses it)
 #include "dbd_scene.cpp"
-#include "nft.cpp"
 #include "nft_scene.cpp"
 #include "../ui/ui_simstack.cpp"
 
@@ -94,7 +94,7 @@ internal void sim_reset_scene(SimState *state, SimMemory *memory) {
                        sqrtf(PARTICLE_SPRING));
     } else if (state->scene == SimScene_Nft) {
         if (!state->nft_params_set) {
-            state->nft_params = nft_default_params();
+            state->nft_params = nft_preset(memory->config.preset);
             if (memory->config.zone_count) state->nft_params.rails = memory->config.zone_count;
             if (memory->config.channel_length_m > 0) state->nft_params.rail_length_m = memory->config.channel_length_m;
             if (memory->config.plants_per_channel) state->nft_params.plants_per_rail = memory->config.plants_per_channel;

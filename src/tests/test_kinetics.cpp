@@ -711,6 +711,103 @@ internal void test_nft_water() {
     CHECK(fabs(ta_res) < 1e-13, "pH solve residual %.3e", ta_res);
 }
 
+internal void test_paw() {
+    // 1. electrical model vs the reference design's Manley tables (ideal power, Sch 10, one module)
+    struct Row { f32 len_mm, f_kHz, v_kV, W; } rows[] = {
+        { 152, 5, 12, 35 }, { 152, 10, 13, 165 }, { 152, 10, 14, 255 }, { 152, 5, 16, 225 },
+        { 203, 5, 13, 110 }, { 203, 10, 14, 345 }, { 203, 20, 16, 1190 },
+    };
+    f64 worst = 0.0;
+    for (u32 i = 0; i < ArrayCount(rows); ++i) {
+        PawParams pp = paw_default_params();
+        pp.modules = 1; pp.manley_factor = 1.0f; pp.flyback_W_max = 1e9f; pp.bus_V = 1e6f;
+        pp.active_mm = rows[i].len_mm; pp.freq_kHz = rows[i].f_kHz; pp.v_peak_kV = rows[i].v_kV;
+        PawElectrical e = paw_electrical(&pp);
+        worst = Maximum(worst, fabs(e.P_on_W / rows[i].W - 1.0));
+    }
+    PawParams p10 = paw_default_params(), p5 = paw_default_params();
+    p10.active_mm = p5.active_mm = 152.0f;
+    p5.pipe_sch5 = 1;
+    PawElectrical e10 = paw_electrical(&p10), e5 = paw_electrical(&p5);
+    printf("[paw] Manley power vs the design review's table: worst %.1f %% (rounded table); C_d %.0f pF C_g %.0f pF per 152 mm; "
+           "ignition %.1f kV pk (Sch 10), %.1f kV pk (Sch 5)\n", 100.0 * worst, e10.Cd_F * 1e12, e10.Cg_F * 1e12,
+           e10.Vign_V * 1e-3, e5.Vign_V * 1e-3);
+    CHECK(worst < 0.06, "Manley table %.3f", worst);
+    CHECK(fabs(e10.Cd_F * 1e12 - 241.0) < 1.0 && fabs(e10.Cg_F * 1e12 - 37.0) < 1.0, "capacitances");
+    CHECK(fabs(e10.Vign_V * 1e-3 - 11.3) < 0.15 && fabs(e5.Vign_V * 1e-3 - 14.6) < 0.15, "ignition voltages");
+
+    // 2. source water: the closed carbonate system reproduces its own pH; batch time vs the
+    //    design's calculator (dose = KH + hydroxide, 300 W, 75 % capture, 15 and 30 MJ/mol)
+    f64 hours[2];
+    for (u32 v = 0; v < 2; ++v) {
+        PawParams pp = paw_default_params();
+        pp.enabled = 1;
+        pp.manley_factor = 1.0f;                  // 310 W ideal, flyback-limited to 300 W
+        pp.capture_lo = pp.capture_hi = 0.75f;
+        pp.stage2_on = 0;
+        pp.nox_MJ_mol = v == 0 ? 15.0f : 30.0f;
+        static PawSkid k;
+        paw_init(&k, &pp);
+        if (v == 0) {
+            PawWater w = k.drum;
+            f64 ph = w.pH;
+            w.pH = 7.0;
+            paw_solve_ph(&w);
+            printf("[paw] source water: pH %.6f recomputed from KH %.2f meq/L + DIC %.3f mM (set %.1f)\n", w.pH,
+                   pp.source_kh_meq, k.drum.dic_mmol / k.drum.V_L, ph);
+            CHECK(fabs(w.pH - pp.source_pH) < 1e-6, "source pH %.6f", w.pH);
+        }
+        f64 t = 0.0;
+        while (k.state == PawState_Treat && t < 40 * 3600.0) { paw_window(&k, &pp, 60.0, 20.0, 420e-6); t += 60.0; }
+        hours[v] = k.acc.last_batch_h;
+        // 3. nitrogen books: fixed N = drum + bucket + vented
+        f64 n_in = k.acc.nox_N_mmol, n_out = k.drum.no3_mmol + k.drum.no2_mmol + k.bucket.no3_mmol + k.bucket.no2_mmol + k.acc.vented_N_mmol;
+        CHECK(fabs(n_in - n_out) / n_in < 1e-12, "paw N books %.3e", (n_in - n_out) / n_in);
+        // 4. the pH satisfies the alkalinity equation
+        PawWater *d = &k.drum;
+        NftAcidBase a = nft_acid_base(d->T_C, paw_ionic_strength(d));
+        f64 res = paw_alk_closed(&a, paw_ka_hno2(d->T_C), d->pH, d->dic_mmol / d->V_L * 1e-3, d->no2_mmol / d->V_L * 1e-3) -
+                  paw_ta_meq(d) * 1e-3;
+        CHECK(fabs(res) < 1e-12, "paw pH residual %.3e", res);
+        if (v == 1) printf("[paw] N books %.1e, alkalinity residual %.1e mol/L, end pH %.3f\n", (n_in - n_out) / n_in, res, d->pH);
+    }
+    f64 mol = (1.5 + 0.1) * 1e-3 * 189.3;
+    f64 calc_lo = mol * 15e6 / 0.75 / 300.0 / 3600.0, calc_hi = mol * 30e6 / 0.75 / 300.0 / 3600.0;
+    printf("[paw] batch to pH 5.5 at 300 W, 75 %% capture: %.2f h (15 MJ/mol), %.2f h (30 MJ/mol); design calculator %.2f / %.2f h\n",
+           hours[0], hours[1], calc_lo, calc_hi);
+    CHECK(fabs(hours[0] / calc_lo - 1.0) < 0.1 && fabs(hours[1] / calc_hi - 1.0) < 0.1, "batch time vs calculator");
+
+    // 5. the preset coupled to the NFT system for 30 days: books still close with PAW top-offs
+    static u8 mem[Megabytes(64)] SIM_ALIGNED(64);
+    Arena arena = arena_make(mem, sizeof(mem));
+    NftParams np = nft_preset(NftPreset_PawSkid);
+    np.rails = 12;
+    NftSystem *m = push_struct(&arena, NftSystem);
+    nft_init(m, &arena, np);
+    f64 initial[NFT_IONS], v0 = m->res.V_L + nft_rail_volume_L(m);
+    for (u32 i = 0; i < NFT_IONS; ++i) initial[i] = nft_total_ion_mg(m, i);
+    nft_run<f32x8>(m, 30 * 1440);
+    f64 worst_ion = 0.0;
+    for (u32 i = 0; i < NFT_IONS; ++i) {
+        f64 in = initial[i] + m->acc.dosed_mg[i];
+        f64 out = nft_total_ion_mg(m, i) + m->acc.uptake_mg[i] + m->acc.dumped_mg[i];
+        worst_ion = Maximum(worst_ion, fabs(in - out) / in);
+    }
+    NftAccounts *ac = &m->acc;
+    f64 water_err = fabs((v0 - ac->transpired_L - ac->evap_channel_L - ac->evap_tank_L + ac->topoff_L + ac->dosed_L +
+                          ac->acid_L + ac->base_L - ac->dumped_L) - (m->res.V_L + nft_rail_volume_L(m))) / v0;
+    f64 n_err = fabs(ac->paw_N_mg - m->paw.acc.delivered_N_mmol * PAW_N_MG) / Maximum(ac->paw_N_mg, 1e-30);
+    PawSkid *k = &m->paw;
+    printf("[paw] preset + NFT, 30 days: %.0f batches of %.1f h / %.2f kWh, nitrite %.0f %% of batch N, %.0f L delivered "
+           "(%.0f mg N); NFT ions %.1e, water %.1e, PAW N handover %.1e; NFT pH %.2f (acid %.0f, base %.0f mmol)\n",
+           k->acc.batches, k->acc.last_batch_h, k->acc.last_batch_kWh, 100.0 * k->acc.nitrite_frac_last, k->acc.delivered_L,
+           ac->paw_N_mg, worst_ion, water_err, n_err, m->pH, ac->acid_mmol, ac->base_mmol);
+    CHECK(worst_ion < 1e-6 && water_err < 1e-9 && n_err < 1e-12, "preset books");
+    CHECK(k->acc.nitrite_frac_last > 0.05 && k->acc.nitrite_frac_last < 0.20, "nitrite share %.3f outside the design's 5-20 %%",
+          k->acc.nitrite_frac_last);
+    CHECK(k->acc.batches >= 2 && k->acc.delivered_L > 0.0, "preset made no batches");
+}
+
 internal void test_hydraulics() {
     // water properties vs reference tables (IAPWS): mu(20 C) 1.0016e-3 Pa s, rho(20 C) 998.21, rho(4 C) 999.97
     f64 mu20 = nft_water_mu(20.0), rho20 = nft_water_rho(20.0), rho4 = nft_water_rho(4.0);
@@ -851,6 +948,7 @@ int main(int argc, char **argv) {
     test_hydraulics();
     test_nft_water();
     test_nft();
+    test_paw();
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
     if (want_bench) { bench_nft(); bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }
 

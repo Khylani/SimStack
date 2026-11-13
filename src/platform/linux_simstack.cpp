@@ -456,6 +456,7 @@ int main(int argc, char **argv) {
     memory.config.channel_length_m = args.channel_length_m;
     memory.config.plants_per_channel = args.plants_per_channel;
     memory.config.view_layer = args.view_layer;
+    memory.config.preset = args.preset;
     memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
     memory.platform.read_entire_file = linux_read_entire_file;

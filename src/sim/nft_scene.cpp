@@ -14,6 +14,8 @@ enum NftCol {           // history columns (one row per simulated hour)
     NftCol_TranspLd, NftCol_EvapLd,                // plant water use / evaporation (channels + tank), L/day over the hour
     NftCol_AcidMmol, NftCol_BaseMmol,              // cumulative pH-control doses
     NftCol_HoldupL, NftCol_FilmMaxMm,              // water held in the channels; deepest film (root mats)
+    NftCol_PawPH, NftCol_PawNO3, NftCol_PawNO2,    // PAW drum: pH, nitrate / nitrite mM
+    NftCol_PawO3, NftCol_PawW, NftCol_PawL,        // dissolved O3 mg/L, plasma W (window mean), drum L
     NftCol_Count,
 };
 global const char *const nft_col_names[NftCol_Count] = {
@@ -23,6 +25,7 @@ global const char *const nft_col_names[NftCol_Count] = {
     "fT_A", "fT_B", "fN_A", "fN_B", "fDO_A", "fDO_B", "water_used_L",
     "pH", "alkalinity_meq_L", "plant_water_L_day", "evaporation_L_day", "acid_mmol", "base_mmol",
     "channel_holdup_L", "film_max_mm",
+    "paw_pH", "paw_NO3_mM", "paw_NO2_mM", "paw_O3_mg_L", "paw_plasma_W", "paw_drum_L",
 };
 
 #define NFT_HISTORY (24 * 730)    // two years of hourly rows
@@ -86,6 +89,14 @@ internal void nft_scene_sample(NftScene *sc) {
     row[NftCol_BaseMmol] = s->acc.base_mmol;
     row[NftCol_HoldupL] = s->acc.holdup_L;
     row[NftCol_FilmMaxMm] = s->max_depth_m * 1e3;
+    PawWater *d = &s->paw.drum;
+    f64 v = Maximum(d->V_L, 1e-9);
+    row[NftCol_PawPH] = d->pH;
+    row[NftCol_PawNO3] = d->no3_mmol / v;
+    row[NftCol_PawNO2] = d->no2_mmol / v;
+    row[NftCol_PawO3] = d->o3_mmol * 48.0 / v;
+    row[NftCol_PawW] = s->paw.el.P_avg_W * s->paw.plasma_on;
+    row[NftCol_PawL] = d->V_L;
 }
 
 internal void nft_scene_init(NftScene *sc, Arena *arena, SimConfig *config, NftParams *params) {
@@ -341,6 +352,17 @@ internal void nft_scene_summary(NftScene *sc, char *out, u32 size) {
              s->acc.evap_channel_L + s->acc.evap_tank_L, s->max_depth_m * 1e3, s->acc.holdup_L, wa, wb, s->acc.harvests[0], s->acc.harvest_g[0], s->acc.bolted[0],
              s->acc.harvests[1], s->acc.harvest_g[1], s->acc.bolted[1],
              sc->windows ? sc->wall_ms_total / (f64)sc->windows : 0.0);
+    if (s->params.paw.enabled) {
+        PawSkid *k = &s->paw;
+        u32 len = (u32)strlen(out);
+        snprintf(out + len, size - len,
+                 "\n[headless] paw %s | drum %.0f L pH %.2f NO3 %.2f NO2 %.3f mM | plasma %.0f W (%.2f W/cm2, SEI %.1f kJ/L) | "
+                 "%.0f batches, last %.1f h %.2f kWh, nitrite %.0f %% | delivered %.0f L, %.1f mmol N | vented N %.1f %%",
+                 paw_state_names[k->state], k->drum.V_L, k->drum.pH, k->drum.no3_mmol / Maximum(k->drum.V_L, 1e-9),
+                 k->drum.no2_mmol / Maximum(k->drum.V_L, 1e-9), k->el.P_avg_W, k->el.W_cm2, k->el.SEI_kJ_L, k->acc.batches,
+                 k->acc.last_batch_h, k->acc.last_batch_kWh, 100.0 * k->acc.nitrite_frac_last, k->acc.delivered_L,
+                 k->acc.delivered_N_mmol, k->acc.nox_N_mmol > 0 ? 100.0 * k->acc.vented_N_mmol / k->acc.nox_N_mmol : 0.0);
+    }
 }
 
 internal u64 nft_scene_hash(NftScene *sc) {
@@ -349,6 +371,7 @@ internal u64 nft_scene_hash(NftScene *sc) {
     h = hash_fnv1a_64(s->ref, sizeof(s->ref), h);
     h = hash_fnv1a_64(&s->R_meq, sizeof(s->R_meq), h);
     h = hash_fnv1a_64(&s->acc, sizeof(s->acc), h);
+    if (s->params.paw.enabled) h = hash_fnv1a_64(&s->paw, sizeof(s->paw), h);
     for (u32 g = 0; g < s->groups; ++g) {
         h = hash_fnv1a_64(s->group[g].rows, sizeof(NftRow) * s->cells, h);
         h = hash_fnv1a_64(s->group[g].sites, sizeof(NftSiteRow) * s->sites, h);
