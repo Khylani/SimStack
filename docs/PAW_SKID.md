@@ -176,8 +176,10 @@ N + NO₂; see `tools/ref/README.md`):
 - **The two models place the switch differently.** The reduced model collapses the same
   way at E_f ≤ 10 mJ/cm³ (74 MJ/mol) but sits half in ozone mode at 30.
 - **Best current estimate: 30–75 MJ/mol, ozone near zero.** That's 12–30 h for a pH 10, KH
-  1.5 batch at 216 W, against the design's 22 MJ/mol and 8.8 h. Neither code has N₂(v),
-  which can only make NO cheaper.
+  1.5 batch at 216 W, against the design's 22 MJ/mol and 8.8 h.
+- **Vibrational N₂ doesn't change this.** A state-to-state reference (`tools/ref/n2vib`)
+  shows that the water and CO₂ in the feed hold T_v at about 600–780 K, matching CARS in
+  1 atm air DBDs, which keeps the vibrational NO path below 0.3 %.
 - The default gas source stays the design estimate until a measurement anchors it.
 
 **What settles it in the first runs:**

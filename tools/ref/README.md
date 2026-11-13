@@ -113,5 +113,6 @@ Case: `chemplaskin_case/`, with `air_plasma_n2o5.yaml` made by `add_n2o5.py`.
   air-fed ozonizer practice. The Boltzmann source needs no extra efficiency factor.
 - **The original mechanism needed fixing too:** without N₂O₅ it falls into NOx mode at
   330 K. `add_n2o5.py` fixes that.
-- **Not in either code:** N₂(v) chemistry (N₂(v) + O → NO + N). ChemPlasKin carries N₂
-  vibrational energy only as a heat reservoir.
+- **N₂(v) chemistry** (N₂(v) + O → NO + N) is in neither code; ChemPlasKin carries N₂
+  vibrational energy only as a heat reservoir. The state-to-state reference in `n2vib/`
+  covers it: T_v matches CARS, and vibrational NO is below 0.3 % at the skid's conditions.
