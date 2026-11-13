@@ -62,7 +62,7 @@ internal void kin_fail(KinModel *model, const char *text, const char *detail) {
 internal b32 kin_parse_formula(const char *name, u8 *counts) {
     for (u32 e = 0; e < KIN_ELEMENTS; ++e) counts[e] = 0;
     const char *p = name;
-    while (*p) {
+    while (*p && *p != '(') {                 // "N2(A)", "O(1D)": the label in parentheses is the state
         s32 element = -1;
         for (u32 e = 0; e < KIN_ELEMENTS; ++e) if (*p == kin_element_names[e][0]) element = (s32)e;
         if (element < 0) return 0;

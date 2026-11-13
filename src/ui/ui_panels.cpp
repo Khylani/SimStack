@@ -190,10 +190,13 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
 
     if (ImGui::CollapsingHeader("Electron-impact yields")) {
         ImGui::PushItemWidth(-110);
-        f32 g[3] = { (f32)scene->source.g_O_per_100eV, (f32)scene->source.g_N_per_100eV, (f32)scene->source.g_OH_per_100eV };
-        if (ImGui::SliderFloat("G(O) /100eV", &g[0], 0.0f, 12.0f, "%.2f")) scene->source.g_O_per_100eV = g[0];
-        if (ImGui::SliderFloat("G(N) /100eV", &g[1], 0.0f, 4.0f, "%.2f")) scene->source.g_N_per_100eV = g[1];
-        if (ImGui::SliderFloat("G(OH) /100eV", &g[2], 0.0f, 4.0f, "%.2f")) scene->source.g_OH_per_100eV = g[2];
+        f32 g[5] = { (f32)scene->source.g_O2_diss, (f32)scene->source.f_O1D, (f32)scene->source.g_N2A,
+                     (f32)scene->source.g_N2_diss, (f32)scene->source.g_OH_per_100eV };
+        if (ImGui::SliderFloat("G(O2 diss) /100eV", &g[0], 0.0f, 6.0f, "%.2f")) scene->source.g_O2_diss = g[0];
+        if (ImGui::SliderFloat("O(1D) share", &g[1], 0.0f, 1.0f, "%.2f")) scene->source.f_O1D = g[1];
+        if (ImGui::SliderFloat("G(N2(A)) /100eV", &g[2], 0.0f, 6.0f, "%.2f")) scene->source.g_N2A = g[2];
+        if (ImGui::SliderFloat("G(N2 diss) /100eV", &g[3], 0.0f, 2.0f, "%.2f")) scene->source.g_N2_diss = g[3];
+        if (ImGui::SliderFloat("G(OH) /100eV", &g[4], 0.0f, 4.0f, "%.2f")) scene->source.g_OH_per_100eV = g[4];
         ImGui::PopItemWidth();
         ImGui::TextDisabled("radicals per 100 eV at reference air; surrogate until\nthe ChemPlasKin reduction tables exist");
     }

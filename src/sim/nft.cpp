@@ -409,6 +409,7 @@ struct NftSystem {
     f32 max_depth_m;
     f64 evap_channel_L_s, evap_tank_L_s, transp_L_s;   // rates over the last window
     PawSkid paw;                       // plasma-activated water batch skid (params.paw)
+    PawChem paw_chem;                  // its M2 kinetics workspace (one module's annulus)
     f32 ref[NftF_Count];               // rail cells store x - ref (deltas): ref = this window's inlet
 };
 
@@ -790,6 +791,8 @@ internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
     memset(&s->acc, 0, sizeof(s->acc));   // the books start from the made-up batch
     s->acc.holdup_L = holdup;
     paw_init(&s->paw, &params.paw);
+    paw_chem_alloc(&s->paw_chem, arena);
+    if (params.paw.enabled) paw_gas_compute(&s->paw_chem, &s->paw.gas, &params.paw, s->paw.drum.T_C);
     // the channels hold the same adjusted solution as the tank
     for (u32 k = 1; k < NftF_Count; ++k) s->ref[k] = (f32)nft_reservoir_conc(s, k);
     CopyArray(s->inlet, s->ref, NftF_Count);

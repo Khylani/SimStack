@@ -79,6 +79,17 @@ Load the preset and set the real channel count, length and plants in **System**.
 4. **Refill.** When the drum is empty, it refills from the bucket plus fresh source water,
    and the bucket refills.
 
+**Gas source.** There are two choices for what leaves the modules:
+- **Design estimate** (default): SEI regimes plus an energy cost.
+- **M2 air kinetics:** one module's annulus as plug flow, at its power density, residence
+  time and frequency, with dry feed and gas `gas_dT_K` (30 K) above the drum water.
+  - It runs at init, on preset load and on **Run chemistry**. The UI flags it as stale when
+    the drive or flow changes.
+  - In the water, NO₂ gives nitrite and nitrate 1:1; N₂O₅, HNO₃ and NO₃ give nitrate;
+    HNO₂ gives nitrite.
+  - NO and N₂O are insoluble and go to the vent. N₂O is reported because it's a greenhouse
+    gas.
+
 **Module in the M2 kinetics** (`--scene dbd --preset paw-skid`):
 - One module's annulus: 44.0 cm³ at 2 L/min (1.32 s residence), its delivered power per
   volume (1.6 W/cm³), 6.5 kHz, dry air, gas about 30 K above the water.
@@ -94,7 +105,8 @@ Load the preset and set the real channel count, length and plants in **System**.
 | Alkalinity equation at the solved pH | 1.5e-21 mol/L |
 | Source water pH from KH + DIC | 10.000000 |
 | Preset + NFT, 30 days: NFT ion / water books, PAW N handover | 2.7e-7 / 1.1e-14 / exact |
-| Nitrite share of batch N | 9 % (design: 5–20 %) |
+| Nitrite share of batch N | 14 % (design: 5–20 %) |
+| Kinetics-sourced batch: N books (with NO / N₂O vented) | 7e-14 |
 
 ## What the preset shows
 
@@ -102,7 +114,7 @@ At the default 0.7 Manley factor:
 - **Power:** the three modules deliver 216 W (0.52 W/cm², SEI 2.2 kJ/L, NOx mode).
 - **Batch:** a 50 gal batch of the pH 10, KH 1.5 water reaches pH 5.5 in 8.8 h, using
   1.9 kWh of plasma energy. That's inside the design's 3–12 h.
-- **Product:** 1.43 mM nitrate and 0.13 mM nitrite (9 % of N), with 5 % of the fixed N
+- **Product:** 1.34 mM nitrate and 0.22 mM nitrite (14 % of N), with 5 % of the fixed N
   vented.
 - **NFT reservoir:** the PAW arrives with almost no alkalinity. The plants' own uptake
   slightly acidifies the reservoir, so its pH controller now doses base (209 mmol in 30
@@ -111,6 +123,27 @@ At the default 0.7 Manley factor:
 - **Batch pace:** with the default 416-plant layout the reservoir only needs about 23 L a
   day, so one batch lasts about 8 days. A daily 50 gal top-off needs roughly 3,800 plants of
   this size.
+
+## What the chemistry says
+
+The M2 kinetics, with the excited-state channels, run one module at its real operating
+point: 1.64 W/cm³, 321 K, 1.32 s, 2.2 kJ/L. They predict an ozonizer, not a NOx reactor:
+- 2.1 % O₃ (69 g/kWh, what cooled air-fed ozonizers make at this SEI).
+- Soluble nitrogen at **62 MJ/mol**, against the design's 22. N₂O at 1300 ppm also escapes.
+- A batch takes **28 h** instead of 8.8 h, too slow for a daily cadence.
+- Much more ozone reaches the water and the MnO₂ destruct.
+
+Both are estimates; they bracket the answer. The literature's 15–30 MJ/mol for DBD NOx
+comes from hot or poorly cooled discharges. There, vibrationally excited N₂ (N₂(v) + O → NO
++ N, not in the mechanism yet) and thermal ozone loss switch the gas to NOx mode. The skid's
+water-cooled pipes push it toward the ozone side, though the alumina and the rod have no
+cooling path of their own.
+
+What decides it is measuring ozone and NO₂ at the drum vent, or nitrate per kWh, in the
+first runs. If the skid sits in ozone mode, these levers move it toward NOx mode:
+- Less air per watt (higher SEI).
+- A hotter gap (less water cooling of the pipe, or a thicker dielectric).
+- Accepting the ozone and moving the nitrogen with a separate NOx stage.
 
 ## Calibrate first
 
@@ -126,11 +159,8 @@ The design marks three numbers as estimates. Each is a slider in **PAW skid**:
 - **Breakdown estimate:** the burning voltage uses the uniform-field estimate. Coaxial
   field enhancement and humidity shift it by about ±10 %, which the Lissajous calibration
   absorbs.
-- **Chemistry gap:** the NOx/O₃ split comes from SEI regimes and an energy cost, not yet from
-  the M2 kinetics. The current air mechanism predicts the wrong regime at these conditions:
-  2 % O₃ and about 100 ppm NOx, against a few thousand ppm NOx. Its surrogate electron
-  source makes only ground-state N, O and OH. Real air DBDs make NO mainly through
-  N(²D) + O₂ → NO + O and through N₂(A) and O(¹D) channels. Adding those excited states is
-  the next refinement. The module preset in the dbd scene is set up to validate it.
+- **Chemistry:** the M2 kinetics now include the N(²D), N₂(A) and O(¹D) channels, but not
+  N₂(v) or gas heating. They describe a cooled discharge; a hot one goes to NOx mode in ways
+  they don't capture yet.
 - **Not modelled:** H₂O₂ (low in a gas-fed design, per the review), HNO₂ decomposition below
   pH 4, sodium from caustic softening, and Fe-chelate oxidation by residual ozone.
