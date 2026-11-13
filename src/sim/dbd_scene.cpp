@@ -152,6 +152,9 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
         scene->op.power_W_cm3 = mo.power_W_cm3;
         scene->op.freq_Hz = mo.freq_Hz;
         scene->residence_s = mo.residence_s;
+        scene->source.boltzmann = 1;
+        scene->source.reduced_field_Td = pp.reduced_field_Td;
+        scene->source.filament_J_cm3 = pp.filament_mJ_cm3 * 1e-3;
     }
     dbd_scene_apply_operating(scene);
     dbd_zones_reset(z, &scene->sp);

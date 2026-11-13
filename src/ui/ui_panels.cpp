@@ -197,6 +197,17 @@ internal void ui_controls(SimState *state, SimMemory *memory, SimStats *stats) {
         if (ImGui::SliderFloat("G(N2(A)) /100eV", &g[2], 0.0f, 6.0f, "%.2f")) scene->source.g_N2A = g[2];
         if (ImGui::SliderFloat("G(N2 diss) /100eV", &g[3], 0.0f, 2.0f, "%.2f")) scene->source.g_N2_diss = g[3];
         if (ImGui::SliderFloat("G(OH) /100eV", &g[4], 0.0f, 4.0f, "%.2f")) scene->source.g_OH_per_100eV = g[4];
+        bool boltz = scene->source.boltzmann != 0;
+        if (ImGui::Checkbox("Boltzmann G-values (LoKI-B++ table)", &boltz)) scene->source.boltzmann = boltz;
+        if (scene->source.boltzmann) {
+            f32 en = (f32)scene->source.reduced_field_Td;
+            if (ImGui::SliderFloat("E/N Td", &en, 50.0f, 400.0f, "%.0f")) scene->source.reduced_field_Td = en;
+            f64 go, fo, ga, gn, ev;
+            air_source_table_lookup(en, &go, &fo, &ga, &gn, &ev);
+            ImGui::TextDisabled("G: O2 diss %.2f (O(1D) %.0f %%), N2(A) %.2f, N2 diss %.3f; vibration %.0f %%", go, 100 * fo, ga, gn, 100 * ev);
+        }
+        f32 ef = (f32)(scene->source.filament_J_cm3 * 1e3);
+        if (ImGui::SliderFloat("filament mJ/cm3 (0 = averaged)", &ef, 0.0f, 200.0f, "%.1f")) scene->source.filament_J_cm3 = ef * 1e-3;
         ImGui::PopItemWidth();
         ImGui::TextDisabled("radicals per 100 eV at reference air; surrogate until\nthe ChemPlasKin reduction tables exist");
     }

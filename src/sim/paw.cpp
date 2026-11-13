@@ -38,6 +38,8 @@ struct PawParams {
     u32 gas_source;             // PawGasSource
     b32 gas_T_manual;           // 0: gap temperature from the module heat balance; 1: water + gas_dT_K
     f32 gas_dT_K;               // manual gap gas temperature above the drum water
+    f32 reduced_field_Td;       // micro-discharge E/N for the Boltzmann G-values (kinetics source)
+    f32 filament_mJ_cm3;        // micro-discharge energy density (kinetics source)
     f32 eps_alumina, eps_pipe;  // thermal emissivities across the gap
     f32 h_water_W_m2K;          // pipe outside to the stirred drum water
     // modules
@@ -80,6 +82,8 @@ internal PawParams paw_default_params() {
     p.gas_source = PawGas_Design;
     p.gas_T_manual = 0;
     p.gas_dT_K = 30.0f;
+    p.reduced_field_Td = 180.0f;   // air DBD filaments: 150-250 Td
+    p.filament_mJ_cm3 = 30.0f;     // a few uJ in a ~100 um filament across the 2.8 mm gap
     p.eps_alumina = 0.7f;      // alumina, 400-600 K
     p.eps_pipe = 0.4f;         // 316, lightly oxidized inside
     p.h_water_W_m2K = 500.0f;  // recirculated drum
@@ -274,6 +278,11 @@ internal void paw_gas_compute(PawChem *c, PawGas *g, const PawParams *p, f64 wat
     g->freq_Hz = (f64)p->freq_kHz * 1e3;
     g->P_avg_W = e.P_avg_W;
     g->air_L_min = p->air_L_min;
+    // LoKI-B++ G-values at the filaments' reduced field, filament-resolved pulses
+    // (validated against ChemPlasKin full kinetics at these conditions: docs/M2_KINETICS.md)
+    c->src.boltzmann = 1;
+    c->src.reduced_field_Td = p->reduced_field_Td;
+    c->src.filament_J_cm3 = (f64)p->filament_mJ_cm3 * 1e-3;
     DbdZones *z = &c->zones;
     z->T_K[0] = g->T_K; z->p_Pa[0] = 101325.0; z->x_H2O[0] = 103.0 / 101325.0;   // dryer: -20 C dew point
     z->power_W_cm3[0] = g->power_W_cm3; z->freq_Hz[0] = g->freq_Hz;

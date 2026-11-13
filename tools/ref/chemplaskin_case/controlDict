@@ -1,0 +1,44 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+|     ____ _                    ____  _           _  ___                      |
+|    / ___| |__   ___ _ __ ___ |  _ \| | __ _ ___| |/ (_)_ __                 |
+|   | |   | '_ \ / _ \ '_ ` _ \| |_) | |/ _` / __| ' /| | '_ \                |
+|   | |___| | | |  __/ | | | | |  __/| | (_| \__ \ . \| | | | |               |
+|    \____|_| |_|\___|_| |_| |_|_|   |_|\__,_|___/_|\_\_|_| |_|               |
+|                                                                             |
+|   A Freeware for Unified Gas-Plasma Kinetics Simulation                     |
+|   Version:      1.2 (February 2026)                                         |
+|   Developed by: Xiao Shao                                                   |
+|   Organization: King Abdullah University of Science and Technology (KAUST)  |
+|   Contact:      xiao.shao@kaust.edu.sa                                      |
+\*---------------------------------------------------------------------------*/
+
+// ================ Time Control Parameters ================
+
+startTime      0.0;     // Simulation start time [s]
+endTime        1.32;
+nPulses        72;     // test
+
+// ================ Time Step Parameters ================
+
+dt1            1e-10;   // time step during the pulse [s]
+dt_max         1e-5;    // Maximum time step allowed [s]
+
+pulseExten     1e-5;    // Fast relaxation or pulse influence stage [s]
+NstepInPulse   2000;    // up to 200 ns: every pulse reaches its energy cap
+NstepAfPulse   100;     // Number of time steps during pulseExten
+
+dT_max         10.0;   // Maximum temperature increase per step allowed, [K]
+
+odes
+{
+      reltol      1e-5;  //  Relative tolerance
+      abstol      1e-10;  //  Absolute tolerance
+}
+
+// ================ Output Log ================
+outputFile       "<case>/out.csv";
+//writeSpecies   all; // Write ALL species
+writeSpecies   Electron, O, O3, NO, NO2, NO3, N2O5, N2O, N, N(2D), N2(A3), O(1D); // selected
+//speciesAmount    moleFraction; // 'moleFraction' or 'numberDensity'(default)
+
+// ************************************************************************* //
