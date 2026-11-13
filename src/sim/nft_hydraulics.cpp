@@ -145,17 +145,21 @@ internal f64 nft_pipe_loss(f64 q, f64 d, f64 L, f64 K, f64 nu) {
     return (f * L / d + K) * v * v / (2.0 * NFT_G);
 }
 
-// Flow through a tap discharging to atmosphere at head H (m): solve
-// H = (K + f L/d + 1) v^2 / 2g with f(Re(v)) by fixed point (monotone, fast).
+// Flow through a tap discharging to atmosphere at head H (m):
+// H = (K + 1 + f L/d) v^2 / 2g. Laminar (f = 64 nu / (v d)) is a quadratic in
+// v, solved exactly; otherwise fixed-point on f(Re(v)), which contracts fast
+// because f varies slowly with v.
 internal f64 nft_tap_flow(f64 H, f64 d, f64 L, f64 K, f64 nu) {
     if (H <= 0.0) return 0.0;
     f64 A = 0.25 * 3.14159265358979 * d * d;
-    f64 v = sqrt(2.0 * NFT_G * H / (K + 1.0));
-    for (u32 it = 0; it < 60; ++it) {
+    f64 a = K + 1.0, b = 64.0 * nu * L / (d * d), c = -2.0 * NFT_G * H;
+    f64 v = (-b + sqrt(b * b - 4.0 * a * c)) / (2.0 * a);       // laminar root
+    if (v * d / nu < 2300.0) return v * A;
+    for (u32 it = 0; it < 50; ++it) {
         f64 f = nft_friction(v * d / nu, d);
         f64 vn = sqrt(2.0 * NFT_G * H / (K + 1.0 + f * L / d));
-        if (fabs(vn - v) < 1e-14 * vn) { v = vn; break; }
-        v = 0.5 * (v + vn);
+        if (fabs(vn - v) < 1e-15 * vn) { v = vn; break; }
+        v = vn;
     }
     return v * A;
 }
@@ -205,7 +209,7 @@ internal f64 nft_manifold_march(NftHydraulicParams *hp, NftHydraulics *h, u32 ta
     return q_carry;
 }
 
-// Solve the operating point. Bisection on the dead-end head: the residual
+// Solve the operating point on the dead-end head: the residual
 // H_pump(Q_total) - H_discharge decreases monotonically with it.
 internal void nft_hydraulics_solve(NftHydraulicParams *hp, u32 taps, f64 T_C, NftHydraulics *h) {
     taps = Clamp(taps, 1u, 8192u);
@@ -228,17 +232,31 @@ internal void nft_hydraulics_solve(NftHydraulicParams *hp, u32 taps, f64 T_C, Nf
     };
     Eval lo_e = evaluate(0.0);
     h->ok = lo_e.residual > 0.0;
-    f64 lo = 0.0, hi = pump->h0_m;
     Eval e = lo_e;
     u32 it = 0;
     if (h->ok) {
-        for (it = 0; it < 200; ++it) {
-            f64 mid = 0.5 * (lo + hi);
-            e = evaluate(mid);
-            if (e.residual > 0.0) lo = mid; else hi = mid;
-            if (hi - lo < 1e-13 * Maximum(hi, 1e-6)) break;
+        // Illinois regula falsi on the dead-end head: bracketed like bisection,
+        // superlinear like secant.
+        f64 a = 0.0, fa = lo_e.residual;
+        f64 b = pump->h0_m;
+        Eval eb = evaluate(b);
+        f64 fb = eb.residual;
+        int side = 0;
+        for (it = 0; it < 100; ++it) {
+            f64 x = (a * fb - b * fa) / (fb - fa);
+            e = evaluate(x);
+            f64 fx = e.residual;
+            if (fabs(fx) < 1e-12 || fabs(b - a) < 1e-14 * Maximum(fabs(b), 1e-6)) break;
+            if (fx * fb > 0.0) {
+                b = x; fb = fx;
+                if (side == -1) fa *= 0.5;
+                side = -1;
+            } else {
+                a = x; fa = fx;
+                if (side == 1) fb *= 0.5;
+                side = 1;
+            }
         }
-        e = evaluate(0.5 * (lo + hi));
     } else {
         for (u32 i = 0; i < taps; ++i) { h->q_channel[i] = 0.0; h->head_tap[i] = 0.0; }
         e.q_m = e.q_e = 0.0; e.H_d = 0.0; e.H_m = 0.0;

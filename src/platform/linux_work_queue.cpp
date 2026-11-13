@@ -73,7 +73,17 @@ internal void *linux_worker_thread(void *param) {
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     }
     for (;;) {
-        if (linux_do_next_work_entry(queue)) sem_wait(&queue->semaphore);
+        if (!linux_do_next_work_entry(queue)) continue;
+        // Nothing to do: spin ~50 us before sleeping, so back-to-back batches
+        // (one per coupling window / master step) don't pay the OS wake latency.
+        u64 t0 = __rdtsc();
+        b32 found = 0;
+        while (__rdtsc() - t0 < 150000) {   // ~50 us at ~3 GHz TSC
+            if (__atomic_load_n(&queue->next_entry_to_read, __ATOMIC_ACQUIRE) !=
+                __atomic_load_n(&queue->next_entry_to_write, __ATOMIC_ACQUIRE)) { found = 1; break; }
+            _mm_pause();
+        }
+        if (!found) sem_wait(&queue->semaphore);
     }
     return 0;
 }

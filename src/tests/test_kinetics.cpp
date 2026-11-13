@@ -646,7 +646,7 @@ internal void test_hydraulics() {
     f64 cons = fabs(sum - h.q_pump) / h.q_pump;
     f64 curve = fabs(nft_pump_head(nft_pumps + hp.pump, h.q_pump) - h.head_pump);
     printf("[hyd] %s, 3/4\" Sch40, 16 taps: pump %.2f L/min at %.3f m (%.0f W, eta %.2f), channels %.3f..%.3f L/min, "
-           "eductor %.2f -> %.2f L/min, return %.0f %% of capacity, %u bisections\n",
+           "eductor %.2f -> %.2f L/min, return %.0f %% of capacity, %u regula-falsi steps\n",
            nft_pumps[hp.pump].name, h.q_pump * 60000, h.head_pump, h.pump_power_W, h.pump_eta, h.q_min * 60000,
            h.q_max * 60000, h.q_eductor_motive * 60000, h.q_eductor_total * 60000, 100 * h.return_use, h.iterations);
     CHECK(h.ok, "pump does not reach the manifold");

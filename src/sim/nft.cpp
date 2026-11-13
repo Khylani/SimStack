@@ -278,8 +278,8 @@ struct NftSystem {
     u32 groups, cells, sites;
     u32 site_offset, site_stride;      // site row j sits on cell site_offset + j * site_stride
     f64 cell_m;                        // dx = spacing / site_stride
-    NftHydraulics hyd;                 // operating point of the network (re-solved hourly)
-    f64 hyd_solved_hour;
+    NftHydraulics hyd;                 // operating point of the network
+    f64 hyd_solved_T;                  // tank temperature it was solved at
     u32 rails;
     NftGroup *group;                   // array, each pointing at its own contiguous block
     NftReservoir res;
@@ -321,6 +321,7 @@ internal b32 nft_rail_bank(NftSystem *s, u32 rail) { return rail >= (s->rails + 
 internal void nft_update_lane_params(NftSystem *s) {
     NftParams *p = &s->params;
     f64 T = s->res.V_L > 0.0 ? s->res.T_C : (f64)p->fill_T_C;
+    s->hyd_solved_T = T;
     if (p->hyd.balance_taps) nft_hydraulics_balance(&p->hyd, s->rails, T, &s->hyd);
     else nft_hydraulics_solve(&p->hyd, s->rails, T, &s->hyd);
     const NftProfile *prof = nft_profiles + (p->hyd.profile % NftProfile_Count);
@@ -466,7 +467,6 @@ internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
     s->res.T_C = params.fill_T_C;
     nft_update_lane_params(s);
     nft_update_crop_lanes(s);
-    s->hyd_solved_hour = 0.0;
 
     f64 c[NftF_Count] = {};
     c[NftF_DO] = nft_do_sat_f64(params.fill_T_C);
@@ -604,8 +604,7 @@ SIM_HD void nft_plants(NftGroup *grp, u32 lane, u32 sites, u32 site_offset, u32 
 
 // Transport: `substeps` upwind advection + wall/radiant heat + O2 exchange +
 // site uptake, all rows of one group, in deltas from `ref` (the inlet, so the
-// inflow delta is 0). Rows are swept outlet -> inlet so each row reads its
-// upstream neighbour's old value. Outlet deltas are summed for the return flow.
+// inflow delta is 0). Outlet deltas are summed for the return flow.
 template <class V>
 SIM_HD void nft_transport(NftGroup *grp, u32 lane, u32 cells, u32 sites, u32 site_offset, u32 site_stride,
                           const f32 *ref, f32 T_amb, f32 radiant_now, u32 substeps) {
@@ -625,6 +624,11 @@ SIM_HD void nft_transport(NftGroup *grp, u32 lane, u32 cells, u32 sites, u32 sit
     for (u32 s = 0; s < substeps; ++s) {
         NftRow *last = grp->rows + cells - 1;
         for (u32 k = 0; k < NftF_Count; ++k) out[k] = out[k] + lane_load_f32(last->f[k] + lane, (V *)0);
+        // Sweep outlet -> inlet so each row reads its upstream neighbour's old
+        // value from memory (carrying it in registers instead spills: measured).
+        // Sites are counted down with the sweep, no divide in the row loop.
+        s32 next_site = sites ? (s32)sites - 1 : -1;
+        u32 next_site_row = last_site_row;
         for (u32 j = cells; j-- > 0;) {
             NftRow *row = grp->rows + j;
             V x[NftF_Count];
@@ -645,8 +649,10 @@ SIM_HD void nft_transport(NftGroup *grp, u32 lane, u32 cells, u32 sites, u32 sit
             // O2 exchange with the air in the gully (saturation at the absolute temperature)
             x[NftF_DO] = lane_fmadd(ko, nft_do_sat(refT + x[NftF_T]) - (refDO + x[NftF_DO]), x[NftF_DO]);
             // plant site: uptake and root respiration, booked as what was actually removed
-            if (j >= site_offset && j <= last_site_row && (j - site_offset) % site_stride == 0) {
-                NftSiteRow *site = grp->sites + (j - site_offset) / site_stride;
+            if (next_site >= 0 && j == next_site_row) {
+                NftSiteRow *site = grp->sites + next_site;
+                --next_site;
+                next_site_row -= site_stride;
                 for (u32 k = 1; k < NftF_Count; ++k) {
                     V before = x[k];
                     x[k] = lane_max(x[k] - lane_load_f32(site->drop[k] + lane, (V *)0), floor_[k]);
@@ -889,13 +895,10 @@ internal PLATFORM_WORK_QUEUE_CALLBACK(nft_work_window) {
     for (u32 g = w->first; g < w->end; ++g) nft_group_window<f32x8>(w->s, g, w->s->ref, w->shift, w->rebase, w->light_gain);
 }
 
-// Water viscosity follows the tank temperature: re-solve the network hourly.
+// Water viscosity follows the tank temperature (~1.2 %/K, film depth ~0.4 %/K):
+// re-solve the network when the tank has moved 1 K since the last solve.
 internal void nft_maybe_resolve(NftSystem *s) {
-    f64 hour = floor(s->t / 3600.0);
-    if (hour != s->hyd_solved_hour) {
-        s->hyd_solved_hour = hour;
-        nft_update_lane_params(s);
-    }
+    if (fabs(s->res.T_C - s->hyd_solved_T) > 1.0) nft_update_lane_params(s);
 }
 
 internal void nft_window(NftSystem *s, PlatformAPI *api, PlatformWorkQueue *queue, u32 threads, Arena *frame) {
@@ -905,7 +908,10 @@ internal void nft_window(NftSystem *s, PlatformAPI *api, PlatformWorkQueue *queu
     f32 shift[NftF_Count];
     b32 rebase = nft_inlet(s, shift);
     f32 light_gain = nft_light_gain(s);
-    if (!queue || threads <= 1 || s->groups <= 1) {
+    // Small systems: the whole window is a fraction of a millisecond; dispatching
+    // it costs more than it saves. ~1.5 ns per row-substep per group measured.
+    f64 work_rows = (f64)s->groups * s->cells * s->substeps;
+    if (!queue || threads <= 1 || s->groups <= 1 || work_rows < 2.0e5) {
         for (u32 g = 0; g < s->groups; ++g) nft_group_window<f32x8>(s, g, s->ref, shift, rebase, light_gain);
     } else {
         u32 chunks = Minimum(s->groups, threads * 2);
