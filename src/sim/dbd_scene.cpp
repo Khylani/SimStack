@@ -52,7 +52,8 @@ struct DbdScene {
     DbdGpu gpu;
     b32 generated;             // straight-line kernels match this mechanism
     u32 precision;             // DbdPrecision
-    b32 use_gpu;
+    u32 backend;               // SimBackend: CPU, GPU, or hybrid split
+    DbdHybrid hybrid;
     b32 gpu_ready;             // mechanism/method/control uploaded
 
     f64 t;                     // chemistry time [s]
@@ -125,7 +126,8 @@ internal void dbd_scene_init(DbdScene *scene, Arena *arena, SimConfig *config, b
     scene->chained = !sweep;
     scene->chem_steps = config->chem_steps ? config->chem_steps : (sweep ? 20 : 1);
     scene->residence_s = 2.0;
-    scene->use_gpu = config->backend == SimBackend_Gpu;
+    scene->backend = config->backend;
+    scene->hybrid.force_split = -1;
     scene->csv_path = config->csv_path;
 
     u32 count = config->zone_count;
@@ -217,27 +219,32 @@ internal s32 dbd_scene_step(DbdScene *scene, SimMemory *memory, Arena *frame, f6
     f64 t0 = scene->t, t1 = scene->t + dt;
     dbd_zones_prepare_source(z, &scene->sp, &scene->source, scene->mode, t0, t1);
     s32 err = 0;
-    if (scene->use_gpu && memory->gpu.available) {
-        if (!scene->gpu_ready) {
-            err = memory->gpu.gpu_kin_set_mech(&scene->model.mech, &scene->method, &scene->control);
-            if (err) {
-                memory->platform.log("[dbd] gpu_kin_set_mech: %s; falling back to the CPU\n", memory->gpu.gpu_error_string(err));
-                scene->use_gpu = 0;
-            }
-            scene->gpu_ready = 1;
+    b32 wants_gpu = scene->backend != SimBackend_Cpu && memory->gpu.available;
+    if (wants_gpu && !scene->gpu_ready) {
+        err = memory->gpu.gpu_kin_set_mech(&scene->model.mech, &scene->method, &scene->control);
+        if (err) {
+            memory->platform.log("[dbd] gpu_kin_set_mech: %s; falling back to the CPU\n", memory->gpu.gpu_error_string(err));
+            scene->backend = SimBackend_Cpu;
+            wants_gpu = 0;
         }
+        scene->gpu_ready = 1;
     }
-    b32 done_on_gpu = 0;
-    if (scene->use_gpu && memory->gpu.available) {
-        err = dbd_advance_gpu(z, &memory->gpu, &scene->gpu, dt, scene->precision);
+    b32 done = 0;
+    if (wants_gpu) {
+        if (scene->backend == SimBackend_Hybrid)
+            err = dbd_advance_hybrid(z, &memory->gpu, &scene->gpu, &scene->hybrid, dt, scene->precision, &scene->model.mech,
+                                     &scene->method, &scene->control, scene->generated, &memory->platform,
+                                     memory->work_queue, memory->worker_count, frame);
+        else
+            err = dbd_advance_gpu(z, &memory->gpu, &scene->gpu, dt, scene->precision);
         if (err) {
             memory->platform.log("[dbd] gpu advance failed: %s; falling back to the CPU\n", memory->gpu.gpu_error_string(err));
-            scene->use_gpu = 0;
+            scene->backend = SimBackend_Cpu;
         } else {
-            done_on_gpu = 1;
+            done = 1;
         }
     }
-    if (!done_on_gpu) {
+    if (!done) {
         dbd_advance_threads(z, &scene->model.mech, &scene->method, &scene->control, dt, scene->generated, scene->precision,
                             &memory->platform, memory->work_queue, memory->worker_count, frame);
     }
@@ -357,7 +364,7 @@ internal void dbd_scene_summary(DbdScene *scene, char *out, u32 size, u32 thread
              "%.0f steps/zone/ms, %.2f ms wall/step, %u failed",
              scene->chained ? "reactor" : "sweep", z->count, scene->mode == DbdDischarge_Pulsed ? "pulsed" : "averaged",
              scene->precision == DbdPrecision_F32 ? "f32" : "f64",
-             scene->use_gpu ? "gpu" : (threads > 1 ? "cpu-mt" : "cpu"), scene->t,
+             scene->backend == SimBackend_Hybrid ? "hybrid" : scene->backend == SimBackend_Gpu ? "gpu" : (threads > 1 ? "cpu-mt" : "cpu"), scene->t,
              scene->chained ? "outlet" : "corner",
              dbd_ppm(z, scene->sp.O3, at), dbd_ppm(z, scene->sp.NO, at), dbd_ppm(z, scene->sp.NO2, at),
              dbd_ppm(z, scene->sp.N2O5, at), dbd_ppm(z, scene->sp.HNO2, at), dbd_ppm(z, scene->sp.HNO3, at),

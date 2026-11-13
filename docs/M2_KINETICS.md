@@ -191,6 +191,33 @@ Sweeps over 4096 independent zones, 8 P-cores vs CUDA, f32 lanes:
 | averaged, 20 ms coupling (default) | **21.3** | 18.1 |
 | pulsed, 20 ms coupling | 0.06 | **0.09** |
 
+### Hybrid: CPU and GPU together (`--hybrid`, UI "Hybrid")
+
+CPU and GPU lanes perform identical IEEE operations, so a batch can be **split between the
+two in any ratio without changing a single bit** (tested at splits 0/8/24/40/64 of 64 zones,
+f32 and f64). The GPU takes lanes [0, n) asynchronously: the zone block is page-locked
+once, and lanes [0, n) of every row move in one `cudaMemcpy2DAsync`. Meanwhile the CPU work
+queue integrates [n, N).
+
+The split is chosen by measurement:
+1. One CPU-only step gives the CPU cost per lane.
+2. Two GPU probes (8 lanes and half) give the GPU's fixed latency and per-lane cost.
+3. The split that equalizes the two follows analytically, or is 0 if the GPU's latency
+   alone exceeds the whole CPU step.
+4. A local search refines it: step time is kept as an EMA per split; neighbours are probed
+   at several scales; the probe interval backs off to 1024 steps while probes lose, and
+   splits known to be worse are skipped.
+
+The split is timing-dependent, but the results are not.
+
+| Case (4096 zones unless noted) | CPU (8 P-cores) | CUDA | Hybrid |
+| --- | --- | --- | --- |
+| sweep, pulsed | 0.06 | 0.09 | **0.14** (GPU takes ~63%) |
+| sweep, averaged (20 ms chemistry step) | ~17–20 | 18 | ~17 (the per-step work is too small for the GPU's latency) |
+| reactor, 64 zones, pulsed | ~2.8–3.4 | 0.006 | ~2.8–3.1 (picks CPU-only) |
+
+Machine noise is about ±15% (other jobs were running).
+
 ### Why CUDA is not faster here, and what fp32 changed
 
 The RTX 3060 (GA106) runs FP64 at 1/64 of its FP32 rate, about 0.2 TFLOPS, and has no

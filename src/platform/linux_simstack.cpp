@@ -448,10 +448,14 @@ int main(int argc, char **argv) {
     memory.config.scene = args.scene;
     memory.config.particle_count = args.particle_count;
     memory.config.zone_count = args.zone_count;
-    memory.config.backend = args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
+    memory.config.backend = args.hybrid ? SimBackend_Hybrid : args.gpu ? SimBackend_Gpu : SimBackend_Cpu;
     memory.config.averaged = args.averaged;
     memory.config.precision = args.precision;
     memory.config.chem_steps = args.chem_steps;
+    memory.config.speed = args.speed;
+    memory.config.channel_length_m = args.channel_length_m;
+    memory.config.plants_per_channel = args.plants_per_channel;
+    memory.config.view_layer = args.view_layer;
     memory.config.csv_path = args.csv_path;
     memory.config.seed = args.seed;
     memory.platform.read_entire_file = linux_read_entire_file;
@@ -529,7 +533,11 @@ int main(int argc, char **argv) {
         printf("[headless] %u frames in %.3f s (%.3f ms/frame avg, %.3f min, %.3f max), %u reloads\n",
                args.headless_frames, wall, (f64)sum_ns * 1e-6 / (f64)args.headless_frames,
                (f64)min_ns * 1e-6, (f64)max_ns * 1e-6, reloads);
-        if (args.scene == SimScene_Particles) {
+        if (args.scene == SimScene_Nft) {
+            printf("[headless] %.2f simulated days in %.3f s wall (%.0fx real time)\n", stats.sim_time / 86400.0,
+                   (f64)sum_ns * 1e-9, stats.sim_time / ((f64)sum_ns * 1e-9));
+            printf("[headless] %s\n", stats.summary);
+        } else if (args.scene == SimScene_Particles) {
             printf("[headless] %llu fixed steps (dt %.4f s), sim time %.3f s, %u particles, "
                    "%.1f M particle-steps/s\n",
                    (unsigned long long)stats.step_count, stats.dt_fixed, stats.sim_time, stats.particle_count,

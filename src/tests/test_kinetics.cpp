@@ -18,6 +18,7 @@
 #define DEBUG_RECORD_BASE 0
 #include "../sim_platform.h"
 #include "../sim/dbd.cpp"
+#include "../sim/nft.cpp"
 #include "../platform/linux_gpu.cpp"
 #include "../platform/linux_work_queue.cpp"
 
@@ -486,6 +487,202 @@ internal void bench_tolerance(KinModel *model, AirSpecies *sp, AirSourceModel *s
     }
 }
 
+// ===========================================================================
+// NFT tests
+
+global u8 g_nft_memory[Megabytes(256)] SIM_ALIGNED(64);
+
+// Runs `windows` windows on one thread with lane type V (f32x8 or f32).
+template <class V>
+internal void nft_run(NftSystem *s, u32 windows) {
+    for (u32 w = 0; w < windows; ++w) {
+        nft_environment(s, s->t);
+        f32 shift[NftF_Count];
+        b32 rebase = nft_inlet(s, shift);
+        f32 gain = nft_light_gain(s);
+        for (u32 g = 0; g < s->groups; ++g) nft_group_window<V>(s, g, s->ref, shift, rebase, gain);
+        nft_reservoir_window(s);
+        s->t += s->window_s;
+    }
+}
+
+internal f64 nft_total_ion_mg(NftSystem *s, u32 i) {
+    return s->res.mass_mg[NFT_ION0 + i] + nft_rail_mass_mg(s, NFT_ION0 + i);
+}
+
+internal void test_nft() {
+    Arena arena = arena_make(g_nft_memory, sizeof(g_nft_memory));
+    NftParams p = nft_default_params();
+    p.rails = 12;   // 2 groups, the second half-padded
+
+    // 1. f32x8 == f32 per lane, bit for bit
+    NftSystem *a = push_struct(&arena, NftSystem), *b = push_struct(&arena, NftSystem);
+    nft_init(a, &arena, p);
+    nft_init(b, &arena, p);
+    nft_run<f32x8>(a, 600);
+    nft_run<f32>(b, 600);
+    b32 same = memcmp(&a->res, &b->res, sizeof(a->res)) == 0;
+    for (u32 g = 0; g < a->groups; ++g) {
+        same &= memcmp(a->group[g].rows, b->group[g].rows, sizeof(NftRow) * a->cells) == 0;
+        same &= memcmp(a->group[g].sites, b->group[g].sites, sizeof(NftSiteRow) * a->sites) == 0;
+    }
+    printf("[nft] %u channels x %u cells (%u plants), 10 h: f32x8 vs f32 lanes %s\n", a->rails, a->cells, a->sites,
+           same ? "bit-identical" : "DIFFERENT");
+    CHECK(same, "nft f32x8 and f32 lanes differ");
+
+    // 2. mass balance per ion and water balance over 30 days with dosing, top-off and a solution change
+    arena.used = 0;
+    NftParams pm = p;
+    pm.dump_days = 10.0f;
+    NftSystem *m = push_struct(&arena, NftSystem);
+    nft_init(m, &arena, pm);
+    f64 initial[NFT_IONS], v0 = m->res.V_L;
+    for (u32 i = 0; i < NFT_IONS; ++i) initial[i] = nft_total_ion_mg(m, i);
+    nft_run<f32x8>(m, 30 * 1440);
+    f64 worst = 0.0;
+    u32 worst_i = 0;
+    for (u32 i = 0; i < NFT_IONS; ++i) {
+        f64 in = initial[i] + m->acc.dosed_mg[i];
+        f64 out = nft_total_ion_mg(m, i) + m->acc.uptake_mg[i] + m->acc.dumped_mg[i];
+        f64 e = fabs(in - out) / in;
+        if (e > worst) { worst = e; worst_i = i; }
+    }
+    f64 water_err = fabs((v0 - m->acc.transpired_L + m->acc.topoff_L + m->acc.dosed_L - m->acc.dumped_L) - m->res.V_L) / v0;
+    printf("[nft] 30 days, dosing + top-off + dump every 10 d: worst ion mass balance error %.1e (%s), water %.1e\n",
+           worst, nft_field_names[NFT_ION0 + worst_i], water_err);
+    CHECK(worst < 1e-6, "nft ion mass balance %.3e", worst);
+    CHECK(water_err < 1e-9, "nft water balance %.3e", water_err);
+
+    // 3. thermal: at steady state the energy balance closes exactly -- pump heat in
+    //    = channel walls + tank walls out (no chiller, radiant or ambient swing)
+    arena.used = 0;
+    NftParams pt = p;
+    pt.auto_size = 0; pt.chiller_on = 0; pt.radiant_W_m2 = 0; pt.ambient_amp_C = 0; pt.ambient_mean_C = 27.0f;
+    pt.reservoir_L = 100.0f; pt.tank_ua_W_K = 3.0f; pt.topoff_on = 1;
+    NftSystem *t = push_struct(&arena, NftSystem);
+    nft_init(t, &arena, pt);
+    nft_run<f32x8>(t, 20 * 1440);
+    f64 q_walls = 0.0;
+    for (u32 r = 0; r < t->rails; ++r) {
+        const NftWrap *wrap = nft_wraps + pt.bank[nft_rail_bank(t, r) ? 1 : 0].wrap;
+        f64 ua_cell = wrap->u_w_m2k * nft_profiles[pt.hyd.profile].perimeter_m * t->cell_m;
+        for (u32 j = 0; j < t->cells; ++j) q_walls += ua_cell * ((f64)nft_abs(t, r / NFT_LANES, j, NftF_T, r % NFT_LANES) - 27.0);
+    }
+    f64 q_tank = pt.tank_ua_W_K * (t->res.T_C - 27.0);
+    f64 q_pump = nft_pump_heat_W(&t->params, &t->hyd);
+    f64 balance = (q_pump - q_walls - q_tank) / q_pump;
+    printf("[nft] steady state at 27 C ambient: tank %.4f C; pump heat %.2f W = walls %.2f W + tank %.2f W (residual %.1e)\n",
+           t->res.T_C, q_pump, q_walls, q_tank, balance);
+    CHECK(fabs(balance) < 2e-3, "steady-state energy balance residual %.3e", balance);
+
+    // 4. chiller keeps the tank inside its band; mylar wrap needs less chiller energy than bare PVC
+    f64 kwh[2];
+    for (u32 wrap = 0; wrap < 2; ++wrap) {
+        arena.used = 0;
+        NftParams pc = p;
+        pc.auto_size = 0; pc.ambient_mean_C = 28.0f; pc.ambient_amp_C = 4.0f; pc.radiant_W_m2 = 300.0f;
+        pc.chiller_W = 1500.0f;
+        pc.bank[0].wrap = pc.bank[1].wrap = wrap == 0 ? NftWrap_BubbleMylar : NftWrap_BarePvc;
+        NftSystem *c = push_struct(&arena, NftSystem);
+        nft_init(c, &arena, pc);
+        nft_run<f32x8>(c, 2 * 1440);   // settle
+        f64 lo = 1e9, hi = -1e9, e0 = c->acc.chiller_elec_J;
+        for (u32 w = 0; w < 5 * 1440; ++w) {
+            nft_run<f32x8>(c, 1);
+            lo = Minimum(lo, c->res.T_C); hi = Maximum(hi, c->res.T_C);
+        }
+        kwh[wrap] = (c->acc.chiller_elec_J - e0) / 3.6e6;
+        printf("[nft] %-17s 28+-4 C, 300 W/m2: tank %.2f..%.2f C (set %.1f +- %.1f), chiller %.2f kWh/day\n",
+               nft_wraps[wrap == 0 ? NftWrap_BubbleMylar : NftWrap_BarePvc].name, lo, hi, pc.chiller_set_C,
+               pc.chiller_band_C, kwh[wrap] / 5.0);
+        // mylar: load well under capacity -> the band (plus one window's drift) holds.
+        // bare PVC at this load runs the 1500 W chiller near capacity and may overshoot (reported).
+        if (wrap == 0)
+            CHECK(lo > pc.chiller_set_C - pc.chiller_band_C - 0.15 && hi < pc.chiller_set_C + pc.chiller_band_C + 0.15,
+                  "chiller band violated: %.2f..%.2f", lo, hi);
+    }
+    CHECK(kwh[0] < kwh[1], "mylar should need less chiller energy (%.2f vs %.2f)", kwh[0], kwh[1]);
+
+    // 5. growth: unlimited plants follow the analytic logistic curve to harvest
+    arena.used = 0;
+    NftParams pg = p;
+    pg.bank[0].stagger_days = pg.bank[1].stagger_days = 0.0f;   // all planted at t = 0
+    pg.ambient_amp_C = 0.0f; pg.ambient_mean_C = 20.0f; pg.photoperiod_h = 24.0f;   // constant conditions
+    NftSystem *gs = push_struct(&arena, NftSystem);
+    nft_init(gs, &arena, pg);
+    const NftCrop *cil = nft_crops + pg.bank[0].crop;
+    f64 days = 20.0;
+    nft_run<f32x8>(gs, (u32)(days * 1440));
+    f64 w, ft, fn, fd;
+    nft_bank_plants(gs, 0, &w, &ft, &fn, &fd);
+    f64 e = exp(cil->rgr_per_day * days);
+    f64 analytic = cil->wmax_g * cil->w0_g * e / (cil->wmax_g + cil->w0_g * (e - 1.0));
+    printf("[nft] %s after %.0f days, all limits 1 (fT %.2f fN %.2f fDO %.2f): mean dry mass %.4f g vs logistic %.4f g (%.2f %%)\n",
+           cil->name, days, ft, fn, fd, w, analytic, 100.0 * (w - analytic) / analytic);
+    CHECK(fabs(w - analytic) / analytic < 0.01, "growth deviates from logistic: %.4f vs %.4f", w, analytic);
+}
+
+internal void test_hydraulics() {
+    // water properties vs reference tables (IAPWS): mu(20 C) 1.0016e-3 Pa s, rho(20 C) 998.21, rho(4 C) 999.97
+    f64 mu20 = nft_water_mu(20.0), rho20 = nft_water_rho(20.0), rho4 = nft_water_rho(4.0);
+    printf("[hyd] water: mu(20) %.4e Pa s, rho(20) %.3f, rho(4) %.3f kg/m3\n", mu20, rho20, rho4);
+    CHECK(fabs(mu20 / 1.0016e-3 - 1.0) < 3e-3, "viscosity %.4e", mu20);
+    CHECK(fabs(rho20 - 998.207) < 0.02 && fabs(rho4 - 999.972) < 0.01, "density %.3f %.3f", rho20, rho4);
+
+    // Colebrook: the solution satisfies the equation to machine precision; Moody value at Re 1e5, e/D 1e-4
+    f64 f = nft_colebrook(1e5, 1e-4);
+    f64 res = 1.0 / sqrt(f) + 2.0 * log10(1e-4 / 3.7 + 2.51 / (1e5 * sqrt(f)));
+    printf("[hyd] Colebrook Re 1e5, e/D 1e-4: f = %.6f, equation residual %.1e\n", f, res);
+    CHECK(fabs(res) < 1e-12, "colebrook residual %.3e", res);
+    CHECK(fabs(f - 0.018524) < 2e-5, "colebrook value %.6f", f);
+    CHECK(fabs(nft_friction(1000.0, 0.02) - 0.064) < 1e-15, "laminar f");
+
+    // network: flow conservation, pump curve balance, manifold non-uniformity, balancing
+    NftHydraulicParams hp = nft_hydraulics_defaults();
+    static NftHydraulics h;
+    nft_hydraulics_solve(&hp, 16, 20.0, &h);
+    f64 sum = h.q_eductor_motive;
+    for (u32 i = 0; i < 16; ++i) sum += h.q_channel[i];
+    f64 cons = fabs(sum - h.q_pump) / h.q_pump;
+    f64 curve = fabs(nft_pump_head(nft_pumps + hp.pump, h.q_pump) - h.head_pump);
+    printf("[hyd] %s, 3/4\" Sch40, 16 taps: pump %.2f L/min at %.3f m (%.0f W, eta %.2f), channels %.3f..%.3f L/min, "
+           "eductor %.2f -> %.2f L/min, return %.0f %% of capacity, %u regula-falsi steps\n",
+           nft_pumps[hp.pump].name, h.q_pump * 60000, h.head_pump, h.pump_power_W, h.pump_eta, h.q_min * 60000,
+           h.q_max * 60000, h.q_eductor_motive * 60000, h.q_eductor_total * 60000, 100 * h.return_use, h.iterations);
+    CHECK(h.ok, "pump does not reach the manifold");
+    CHECK(cons < 1e-12, "flow not conserved: %.3e", cons);
+    CHECK(curve < 1e-9, "pump curve not balanced: %.3e m", curve);
+    CHECK(h.q_channel[0] > h.q_channel[15], "first tap should get more than the dead end");
+    hp.balance_taps = 1;
+    nft_hydraulics_balance(&hp, 16, 20.0, &h);
+    f64 spread = h.q_max / h.q_min - 1.0;
+    printf("[hyd] balanced taps: channels %.4f..%.4f L/min (spread %.1e)\n", h.q_min * 60000, h.q_max * 60000, spread);
+    CHECK(spread < 1e-3, "balancing spread %.3e", spread);
+
+    // film: laminar depth is the Nusselt film
+    f64 nu = 1.0e-6, q = 1.5 / 60000.0, w = 0.1, S = 0.02;
+    f64 hn = cbrt(3.0 * nu * (q / w) / (NFT_G * S));
+    CHECK(fabs(nft_film_depth(q, w, S, nu) - hn) < 1e-15, "laminar film depth");
+}
+
+internal void bench_nft() {
+    Arena arena = arena_make(g_nft_memory, sizeof(g_nft_memory));
+    u32 channels[] = { 8, 64, 512 };
+    for (u32 ci = 0; ci < ArrayCount(channels); ++ci) {
+        arena.used = 0;
+        NftParams p = nft_default_params();
+        p.rails = channels[ci];
+        NftSystem *s = push_struct(&arena, NftSystem);
+        nft_init(s, &arena, p);
+        f64 t0 = now_s();
+        nft_run<f32x8>(s, 1440);
+        f64 wall = now_s() - t0;
+        f64 updates = (f64)s->groups * s->cells * s->substeps * 1440.0 * (f64)NftF_Count * NFT_LANES;
+        printf("[nft bench] %4u channels x %u cells, 1 day on 1 thread: %.1f ms (%.0fx real time, %.2f G lane-field updates/s)\n",
+               s->rails, s->cells, wall * 1e3, 86400.0 / wall, updates / wall * 1e-9);
+    }
+}
+
 internal void bench_cpu(KinModel *model, AirSpecies *sp, AirSourceModel *src) {
     Arena arena = arena_make(g_arena_memory, sizeof(g_arena_memory));
     KinMethod method = kin_method(KinMethod_Rodas3);
@@ -539,8 +736,10 @@ int main(int argc, char **argv) {
     test_f32(model, &sp, &src);
     test_conservation(model, &sp, &src);
     test_ozone_yield(model, &sp, &src);
+    test_hydraulics();
+    test_nft();
     if (want_gpu) test_gpu(model, &sp, &src, want_bench);
-    if (want_bench) { bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }
+    if (want_bench) { bench_nft(); bench_kernels(model, &sp); bench_tolerance(model, &sp, &src); bench_cpu(model, &sp, &src); }
 
     printf("%u checks, %u failed (simd=%d)\n", g_checks, g_failures, SIM_SIMD);
     free(model);
@@ -608,6 +807,46 @@ internal void test_gpu(KinModel *model, AirSpecies *sp, AirSourceModel *src, b32
         printf("[gpu] %s, 16 zones x 5 ms, f32 lanes: CUDA vs AVX2 %s\n", mode == 0 ? "pulsed  " : "averaged",
                same ? "bit-identical" : "DIFFERENT");
         CHECK(same, "gpu and cpu f32 paths differ (mode %u)", mode);
+    }
+    // Hybrid: any split of lanes between CUDA and the CPU gives the same bits.
+    {
+        PlatformWorkQueue *queue = (PlatformWorkQueue *)calloc(1, sizeof(PlatformWorkQueue));
+        linux_make_work_queue(queue, 3, -1, 0);
+        PlatformAPI api = {};
+        api.add_work_entry = linux_add_work_entry;
+        api.complete_all_work = linux_complete_all_work;
+        api.now_ns = [](void) -> u64 { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (u64)ts.tv_sec * 1000000000ull + ts.tv_nsec; };
+        static u8 frame_mem[Megabytes(8)];
+        Arena frame = arena_make(frame_mem, sizeof(frame_mem));
+        for (u32 precision = 0; precision < 2; ++precision) {
+            KinMethod method2 = kin_method(KinMethod_Rodas3);
+            gpu.gpu_kin_set_mech(&model->mech, &method2, &ctl);
+            DbdZones ref;
+            setup_zones(&ref, &arena, model, sp, src, 64, DbdDischarge_Pulsed);
+            for (u32 step = 0; step < 3; ++step) {
+                if (precision == DbdPrecision_F32) dbd_step_cpu<f32x8, AirGenOps, true>(&ref, model, sp, src, DbdDischarge_Pulsed, &method2, &ctl, step * 1e-3, (step + 1) * 1e-3);
+                else dbd_step_cpu<f64x4, AirGenOps>(&ref, model, sp, src, DbdDischarge_Pulsed, &method2, &ctl, step * 1e-3, (step + 1) * 1e-3);
+            }
+            u32 splits[] = { 0, 8, 24, 40, 64 };
+            b32 all_same = 1;
+            for (u32 si = 0; si < ArrayCount(splits); ++si) {
+                DbdZones z;
+                DbdGpu g = {};
+                DbdHybrid hy = {};
+                hy.force_split = (s32)splits[si];
+                setup_zones(&z, &arena, model, sp, src, 64, DbdDischarge_Pulsed);
+                for (u32 step = 0; step < 3; ++step) {
+                    dbd_zones_prepare_source(&z, sp, src, DbdDischarge_Pulsed, step * 1e-3, (step + 1) * 1e-3);
+                    s32 e2 = dbd_advance_hybrid(&z, &gpu, &g, &hy, 1e-3, precision, &model->mech, &method2, &ctl, 1, &api, queue, 4, &frame);
+                    CHECK(e2 == 0, "hybrid advance: %s", gpu.gpu_error_string(e2));
+                    dbd_zones_commit_pulses(&z);
+                }
+                all_same &= memcmp(z.y, ref.y, sizeof(f64) * (u64)z.n_species * z.padded) == 0;
+            }
+            printf("[gpu] hybrid CUDA+CPU, %s lanes, splits 0/8/24/40/64 of 64 zones: %s\n",
+                   precision == DbdPrecision_F32 ? "f32" : "f64", all_same ? "all bit-identical to the CPU" : "DIFFERENT");
+            CHECK(all_same, "hybrid split changes results (precision %u)", precision);
+        }
     }
     if (!bench) return;
 

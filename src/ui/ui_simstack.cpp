@@ -52,11 +52,14 @@ struct UiState {
     f64 last_sim_time;
 
     // controls
-    f32 speed;                  // simulated seconds per wall second (windowed)
+    f32 speed;                  // simulated seconds per wall second (windowed chemistry)
+    f32 nft_speed;              // simulated seconds per wall second (NFT)
     b32 max_speed;              // ignore speed, spend the whole chemistry budget
     b32 step_once;
     s32 heat_species;
-    s32 view_species;           // coloured in the 3D view
+    s32 view_species;           // coloured in the 3D view (DBD)
+    s32 nft_layer;              // NftLayer shown in the 3D view
+    s32 nft_profile_field;      // field plotted along the channel
     s32 profile_x_time;         // axial profile x axis: 0 = zone index, 1 = residence time
     char export_path[256];
     b32 dragging;
@@ -155,6 +158,8 @@ internal void ui_init_memory(UiState *ui, SimMemory *memory) {
         ui->font_mono = (u8 *)f.data; ui->font_mono_size = f.size;
     }
     ui->speed = 1.0f;
+    ui->nft_speed = 3600.0f;
+    ui->nft_layer = (s32)memory->config.view_layer;
     ui->heat_species = 0;
     ui->profile_x_time = 1;
     snprintf(ui->export_path, sizeof(ui->export_path), "dbd_export.csv");

@@ -222,14 +222,18 @@ internal PLATFORM_WORK_QUEUE_CALLBACK(dbd_work_advance) {
     dbd_work_run((DbdWork *)data);
 }
 
+// Lanes [first_lane, end_lane) (multiples of 8; default: all).
 internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod *method, const KinControl *ctl,
                                   f64 duration, b32 generated, u32 precision, PlatformAPI *api,
-                                  PlatformWorkQueue *queue, u32 threads, Arena *frame) {
+                                  PlatformWorkQueue *queue, u32 threads, Arena *frame,
+                                  u32 first_lane = 0, u32 end_lane = U32_MAX) {
     TIMED_FUNCTION();
     const u32 w = precision == DbdPrecision_F32 ? (u32)LaneTraits<f32x8>::width : (u32)LaneTraits<f64x4>::width;
-    u32 groups = z->padded / w;
+    end_lane = Minimum(end_lane, z->padded);
+    if (first_lane >= end_lane) return;
+    u32 groups = (end_lane - first_lane) / w;
     if (!queue || threads <= 1 || groups <= 1) {
-        DbdWork all = { z, m, method, ctl, duration, 0, z->padded, generated, precision };
+        DbdWork all = { z, m, method, ctl, duration, first_lane, end_lane, generated, precision };
         dbd_work_run(&all);
         return;
     }
@@ -243,8 +247,8 @@ internal void dbd_advance_threads(DbdZones *z, const KinMech *m, const KinMethod
         DbdWork *item = work + used++;
         item->z = z; item->m = m; item->method = method; item->ctl = ctl;
         item->duration = duration;
-        item->first = g * w;
-        item->end = Minimum(groups, g + per) * w;
+        item->first = first_lane + g * w;
+        item->end = first_lane + Minimum(groups, g + per) * w;
         item->generated = generated;
         item->precision = precision;
         api->add_work_entry(queue, dbd_work_advance, item);
@@ -286,6 +290,174 @@ internal s32 dbd_advance_gpu(DbdZones *z, GpuAPI *gpu, DbdGpu *g, f64 duration, 
     if (err) return err;
     ++g->launches;
     return gpu->gpu_copy_to_host(z->block, g->d_block, sizeof(f64) * z->mutable_count);
+}
+
+// Hybrid CPU + GPU: lanes [0, n) go to the GPU asynchronously while the CPU
+// work queue integrates [n, padded). Both paths perform identical IEEE
+// operations, so the result is bit-identical to either device alone for ANY
+// split; the split can therefore follow measurements (timing-dependent)
+// without affecting determinism.
+//
+// Split choice: the step's wall time is measured for every split tried (in
+// groups of 8 lanes, 0 = CPU only ... all = GPU only) and kept as an EMA. The
+// split with the best time is used; every 8th step a neighbour of it is tried
+// at several scales (+-1, +-4, +-16 groups). This finds the optimum including
+// the GPU's fixed latency (launch, copies, per-thread dependency chain), which a
+// throughput ratio misses, and follows drift as the chemistry gets stiffer.
+#define DBD_HYBRID_BUCKETS 1025
+struct DbdHybrid {
+    f32 step_ms[DBD_HYBRID_BUCKETS];     // EMA of step wall time per split (index = split / 8), 0 = untried
+    u32 tried_at[DBD_HYBRID_BUCKETS];    // step count when each split was last measured
+    u32 split;                           // lanes given to the GPU next step (multiple of 8)
+    u32 steps;
+    u32 explore_interval;                // steps between probes: 8, doubling to 1024 while probes lose
+    u32 next_probe;
+    u32 best_bucket;
+    b32 probing;
+    u32 phase;                           // 0: CPU-only baseline, 1-2: GPU probes, 3: model split + local search
+    f64 cpu_ms_per_lane, gpu_probe_ms[2];
+    u32 gpu_probe_lanes[2];
+    b32 registered;                      // host block page-locked
+    void *registered_block;
+    f32 last_gpu_ms, last_cpu_ms;
+    s32 force_split;                     // tests: >= 0 fixes the split
+};
+
+internal u32 dbd_hybrid_best(DbdHybrid *hy, u32 buckets) {
+    u32 best = hy->split / 8;
+    f32 best_ms = 1e30f;
+    for (u32 b = 0; b < buckets; ++b)
+        if (hy->step_ms[b] > 0.0f && hy->step_ms[b] < best_ms) { best_ms = hy->step_ms[b]; best = b; }
+    return best;
+}
+
+internal s32 dbd_advance_hybrid(DbdZones *z, GpuAPI *gpu, DbdGpu *g, DbdHybrid *hy, f64 duration, u32 precision,
+                                const KinMech *m, const KinMethod *method, const KinControl *ctl, b32 generated,
+                                PlatformAPI *api, PlatformWorkQueue *queue, u32 threads, Arena *frame) {
+    TIMED_FUNCTION();
+    if (!g->d_block || g->capacity < z->block_count) {
+        g->d_block = (f64 *)gpu->gpu_alloc(sizeof(f64) * z->block_count);
+        g->capacity = g->d_block ? z->block_count : 0;
+        if (!g->d_block) return 2;
+    }
+    if (!hy->registered || hy->registered_block != z->block) {
+        s32 err = gpu->gpu_host_register(z->block, sizeof(f64) * z->block_count);
+        if (err) return err;
+        hy->registered = 1;
+        hy->registered_block = z->block;
+        for (u32 b = 0; b < DBD_HYBRID_BUCKETS; ++b) { hy->step_ms[b] = 0.0f; hy->tried_at[b] = 0; }
+        hy->split = 0;                   // phase 0: CPU-only baseline
+        hy->phase = 0;
+        hy->explore_interval = 8;
+        hy->next_probe = 0;
+        hy->best_bucket = hy->split / 8;
+        hy->probing = 0;
+    }
+    u32 padded = z->padded;
+    u32 buckets = Minimum(padded / 8 + 1, (u32)DBD_HYBRID_BUCKETS);
+    u32 split = hy->force_split >= 0 ? (u32)hy->force_split : hy->split;
+    split = Minimum(split & ~7u, padded);
+
+    u64 t0 = api->now_ns();
+    s32 err = 0;
+    if (split > 0) {
+#define DEV(field) (g->d_block + (z->field - z->block))
+        GpuKinLaunch L = {};
+        L.y = DEV(y); L.h = DEV(h);
+        L.steps = DEV(steps); L.rejects = DEV(rejects); L.pulses = DEV(pulses); L.failed = DEV(failed);
+        L.k = DEV(k); L.src = DEV(src); L.pulse = DEV(pulse); L.period = DEV(period);
+        L.pulse_first = DEV(pulse_first); L.pulse_count = DEV(pulse_count);
+#undef DEV
+        L.padded = padded;
+        L.lane_count = split;
+        L.precision = precision;
+        L.duration = duration;
+        err = gpu->gpu_kin_advance_async(&L, z->block, g->d_block, z->block_count / padded, z->mutable_count / padded);
+        if (err) return err;
+    }
+    dbd_advance_threads(z, m, method, ctl, duration, generated, precision, api, queue, threads, frame, split, padded);
+    u64 t1 = api->now_ns();
+    f32 kernel_ms = 0.0f, gpu_ms = 0.0f;
+    if (split > 0) {
+        err = gpu->gpu_kin_wait(&kernel_ms, &gpu_ms);
+        if (err) return err;
+        g->last_kernel_ms = kernel_ms;
+        ++g->launches;
+    }
+    u64 t2 = api->now_ns();
+    hy->last_gpu_ms = gpu_ms;
+    hy->last_cpu_ms = (f32)((f64)(t1 - t0) * 1e-6);
+    if (hy->force_split >= 0) return 0;
+
+    // record this split's step time, then choose the next split
+    f32 step_ms = (f32)((f64)(t2 - t0) * 1e-6);
+    u32 b = split / 8;
+    hy->step_ms[b] = hy->step_ms[b] > 0.0f ? 0.7f * hy->step_ms[b] + 0.3f * step_ms : step_ms;
+    hy->tried_at[b] = ++hy->steps;
+
+    // Start: model T_gpu(n) = o + n c_g, T_cpu(n) = (N - n) c_c from one CPU-only
+    // step and two GPU probes, then the split that equalizes them (0 if the GPU's
+    // fixed latency alone exceeds the whole CPU step).
+    if (hy->phase < 3) {
+        if (hy->phase == 0) {
+            hy->cpu_ms_per_lane = step_ms / (f64)padded;
+            hy->gpu_probe_lanes[0] = Minimum(8u, padded);
+            hy->split = hy->gpu_probe_lanes[0];
+            hy->phase = 1;
+            return 0;
+        }
+        u32 i = hy->phase - 1;
+        hy->gpu_probe_ms[i] = gpu_ms;
+        if (hy->phase == 1 && padded >= 32) {
+            hy->gpu_probe_lanes[1] = AlignPow2(padded / 2, 8);
+            hy->split = hy->gpu_probe_lanes[1];
+            hy->phase = 2;
+            return 0;
+        }
+        f64 o = hy->gpu_probe_ms[0], cg = 0.0;
+        if (hy->phase == 2) {
+            cg = Maximum((hy->gpu_probe_ms[1] - hy->gpu_probe_ms[0]) / (f64)(hy->gpu_probe_lanes[1] - hy->gpu_probe_lanes[0]), 1e-9);
+            o = Maximum(hy->gpu_probe_ms[0] - cg * hy->gpu_probe_lanes[0], 0.0);
+        } else {
+            cg = hy->gpu_probe_ms[0] / (f64)hy->gpu_probe_lanes[0];
+            o = 0.0;
+        }
+        f64 cc = hy->cpu_ms_per_lane;
+        f64 n = ((f64)padded * cc - o) / (cg + cc);
+        n = Clamp(n, 0.0, (f64)padded);
+        f64 t_split = Maximum(o + n * cg, ((f64)padded - n) * cc);
+        u32 lanes = t_split < 0.95 * (f64)padded * cc ? ((u32)(n + 4.0) & ~7u) : 0u;
+        hy->split = Minimum(lanes, padded);
+        hy->best_bucket = hy->split / 8;
+        hy->next_probe = hy->steps + hy->explore_interval;
+        hy->phase = 3;
+        return 0;
+    }
+    u32 best = dbd_hybrid_best(hy, buckets);
+    if (hy->probing) {
+        // a probe either found a better split (keep exploring eagerly) or not (back off)
+        hy->explore_interval = best != hy->best_bucket ? 8 : Minimum(hy->explore_interval * 2, 1024u);
+        hy->probing = 0;
+    }
+    hy->best_bucket = best;
+    u32 next = best;
+    if (hy->steps >= hy->next_probe) {
+        static const s32 offsets[] = { 1, -1, 4, -4, 16, -16, 64, -64, 256, -256 };
+        f32 best_ms = hy->step_ms[best];
+        for (u32 t = 0; t < ArrayCount(offsets); ++t) {
+            s32 cand = (s32)best + offsets[(hy->steps / 8 + t) % ArrayCount(offsets)];
+            if (cand < 0 || cand >= (s32)buckets) continue;
+            // skip splits already known to be clearly worse, unless their measurement is stale
+            b32 known_bad = hy->step_ms[cand] > 1.25f * best_ms && hy->steps - hy->tried_at[cand] < 4096;
+            if (known_bad) continue;
+            next = (u32)cand;
+            hy->probing = 1;
+            break;
+        }
+        hy->next_probe = hy->steps + hy->explore_interval;
+    }
+    hy->split = next * 8;
+    return 0;
 }
 
 // Plug flow along the zone chain: zone i relaxes toward zone i-1 (zone 0
