@@ -469,6 +469,7 @@ int main(int argc, char **argv) {
     memory.config.view_layer = args.view_layer;
     memory.config.has_pick = args.has_pick;
     memory.config.bake_s = args.bake_s;
+    memory.config.water = args.water;
     memory.config.pick_x = args.pick_x;
     memory.config.pick_y = args.pick_y;
     memory.config.preset = args.preset;

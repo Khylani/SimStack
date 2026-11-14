@@ -100,7 +100,7 @@ internal void ui_pick_table(SimState *state, UiPick *p, b32 full) {
             for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_abs(s, g, j, k, l);
             ui_kv("film", "%.2f C, DO %.2f mg/L", c[NftF_T], c[NftF_DO]);
             ui_kv("rise vs inlet", "%+.3f K", (f64)s->group[g].rows[j].f[NftF_T][l]);
-            ui_kv("EC / pH", "%.2f mS/cm, pH %.2f", nft_ec_mS(c), nft_cell_ph(s, g, j, l, s->pH));
+            ui_kv("EC / pH", "%.2f mS/cm, pH %.2f", nft_ec_mS(c) + nft_salt_ec_mS(s), nft_cell_ph(s, g, j, l, s->pH));
             if (full) {
                 for (u32 i = 0; i < NFT_IONS; ++i) ui_kv(nft_field_names[NFT_ION0 + i], "%.2f mg/L", c[NFT_ION0 + i]);
                 NftCellCold *cc = s->group[g].cold + j;

@@ -96,6 +96,7 @@ struct SimConfig {
     b32 has_pick;         // windowed: hover + select the point at (pick_x, pick_y), fractions of the 3D view
     f32 pick_x, pick_y;
     f64 bake_s;           // windowed: bake this many simulated seconds at start-up, then play back
+    u32 water;            // nft: source water (NftWater: 0 design figure, 1 Moloaa W78)
 };
 
 struct SimMemory {

@@ -54,6 +54,7 @@ struct PlatformArgs {
     f32 pick_x, pick_y;
     b32 timeline_check;
     f64 bake_s;
+    u32 water;
 };
 
 internal void platform_print_usage(const char *exe) {
@@ -80,6 +81,7 @@ internal void platform_print_usage(const char *exe) {
            "  --frames N     windowed: quit after N frames\n"
            "  --screenshot F windowed: write the last frame as a binary PPM to F\n"
            "  --pick FX,FY   windowed: inspect the point at (FX, FY), fractions of the 3D view\n"
+           "  --water W      nft: source water, design (pH 10, KH 1.5) or moloaa (USGS well W78)\n"
            "  --bake T       windowed: bake T simulated seconds (nft: suffix d for days, e.g. 7d)\n"
            "                 at start-up, then play the recording back\n"
            "  --timeline-check  headless: keyframe at the half-way frame, finish, restore it,\n"
@@ -137,6 +139,11 @@ internal PlatformArgs platform_parse_args(int argc, char **argv) {
             if (strcmp(next, "default") == 0) args.preset = 0;
             else if (strcmp(next, "paw-skid") == 0) args.preset = 1;
             else { printf("unknown preset %s (default | paw-skid)\n", next); exit(1); }
+            ++i;
+        } else if (strcmp(a, "--water") == 0 && next) {
+            if (strcmp(next, "design") == 0) args.water = 0;
+            else if (strcmp(next, "moloaa") == 0) args.water = 1;
+            else { printf("unknown water %s (design | moloaa)\n", next); exit(1); }
             ++i;
         } else if (strcmp(a, "--bake") == 0 && next) {
             char *end = 0;

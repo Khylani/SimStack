@@ -870,6 +870,42 @@ internal void test_paw() {
           k->acc.nitrite_frac_last);
     CHECK(k->acc.batches >= 2 && k->acc.delivered_L > 0.0, "preset made no batches");
 
+    // 5b. the same on the Moloaa well water (USGS W78): its Ca / Mg / K / S enter the books,
+    // Na / Cl build up in the tank, the source pH is reproduced, books still close
+    {
+        static u8 wmem[Megabytes(64)] SIM_ALIGNED(64);
+        Arena warena = arena_make(wmem, sizeof(wmem));
+        NftParams wp = nft_preset(NftPreset_PawSkid);
+        wp.rails = 12;
+        wp.dump_days = 0.0f;
+        nft_set_water(&wp, NftWater_MoloaaW78);
+        NftSystem *w = push_struct(&warena, NftSystem);
+        nft_init(w, &warena, wp);
+        f64 src_ph = w->paw.drum.pH;
+        f64 init_w[NFT_IONS], na0 = w->salts.na_mg, vw0 = w->res.V_L + nft_rail_volume_L(w);
+        for (u32 i = 0; i < NFT_IONS; ++i) init_w[i] = nft_total_ion_mg(w, i);
+        nft_run<f32x8>(w, 30 * 1440);
+        f64 worst_w = 0.0;
+        for (u32 i = 0; i < NFT_IONS; ++i) {
+            f64 in = init_w[i] + w->acc.dosed_mg[i];
+            f64 out = nft_total_ion_mg(w, i) + w->acc.uptake_mg[i] + w->acc.dumped_mg[i];
+            worst_w = Maximum(worst_w, fabs(in - out) / in);
+        }
+        NftAccounts *aw = &w->acc;
+        f64 water_w = fabs((vw0 - aw->transpired_L - aw->evap_channel_L - aw->evap_tank_L + aw->topoff_L + aw->dosed_L +
+                            aw->acid_L + aw->base_L - aw->dumped_L) - (w->res.V_L + nft_rail_volume_L(w))) / vw0;
+        f64 na_err = fabs(w->salts.na_mg - (na0 + w->salts.na_in_mg)) / (na0 + w->salts.na_in_mg);
+        f64 na_mg_L = w->salts.na_mg / w->res.V_L;
+        printf("[water] Moloaa W78, 30 days: source pH %.4f, %.0f batches of %.1f h (design figure %.1f h); tank Na %.0f mg/L "
+               "(source 14), Cl %.0f; EC from Na %.2f mS/cm; NFT ions %.1e, water %.1e, Na books %.1e; NFT pH %.2f\n",
+               src_ph, w->paw.acc.batches, w->paw.acc.last_batch_h, k->acc.last_batch_h, na_mg_L, w->salts.cl_mg / w->res.V_L,
+               nft_salt_ec_mS(w), worst_w, water_w, na_err, w->pH);
+        CHECK(fabs(src_ph - 7.6) < 1e-6, "W78 source pH %.6f", src_ph);
+        CHECK(worst_w < 1e-6 && water_w < 1e-9 && na_err < 1e-12, "W78 books");
+        CHECK(na_mg_L > 14.0, "sodium did not build up: %.2f mg/L", na_mg_L);
+        CHECK(w->paw.acc.batches >= 2, "W78: no batches");
+    }
+
     // 6. gas from the M2 kinetics (one module's annulus): N books still close with the
     //    insoluble NO / N2O vented, and the batch runs on the kinetics' yields
     f64 design_batch_h = k->acc.last_batch_h;   // (the arena is reused below)
