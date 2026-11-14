@@ -16,6 +16,7 @@ enum NftCol {           // history columns (one row per simulated hour)
     NftCol_HoldupL, NftCol_FilmMaxMm,              // water held in the channels; deepest film (root mats)
     NftCol_PawPH, NftCol_PawNO3, NftCol_PawNO2,    // PAW drum: pH, nitrate / nitrite mM
     NftCol_PawO3, NftCol_PawW, NftCol_PawL,        // dissolved O3 mg/L, plasma W (window mean), drum L
+    NftCol_Na, NftCol_Cl,                          // tank sodium / chloride from the source water, mg/L
     NftCol_Count,
 };
 global const char *const nft_col_names[NftCol_Count] = {
@@ -26,6 +27,7 @@ global const char *const nft_col_names[NftCol_Count] = {
     "pH", "alkalinity_meq_L", "plant_water_L_day", "evaporation_L_day", "acid_mmol", "base_mmol",
     "channel_holdup_L", "film_max_mm",
     "paw_pH", "paw_NO3_mM", "paw_NO2_mM", "paw_O3_mg_L", "paw_plasma_W", "paw_drum_L",
+    "Na_mg_L", "Cl_mg_L",
 };
 
 #define NFT_HISTORY (24 * 730)    // two years of hourly rows
@@ -63,7 +65,9 @@ internal void nft_scene_sample(NftScene *sc) {
     row[NftCol_ChillerDuty] = (s->acc.chiller_on_s - sc->chiller_on_at_sample) / 3600.0;
     sc->chiller_on_at_sample = s->acc.chiller_on_s;
     row[NftCol_ChillerKWh] = s->acc.chiller_elec_J / 3.6e6;
-    row[NftCol_EC] = nft_ec_mS(c);
+    row[NftCol_EC] = nft_ec_mS(c) + nft_salt_ec_mS(s);
+    row[NftCol_Na] = s->res.V_L > 0.0 ? s->salts.na_mg / s->res.V_L : 0.0;
+    row[NftCol_Cl] = s->res.V_L > 0.0 ? s->salts.cl_mg / s->res.V_L : 0.0;
     for (u32 i = 0; i < NFT_IONS; ++i) row[NftCol_NO3 + i] = c[NFT_ION0 + i];
     row[NftCol_DO] = c[NftF_DO];
     row[NftCol_VRes] = s->res.V_L;
@@ -214,7 +218,7 @@ internal f64 nft_tank_buffer_meq(NftSystem *s) {
     NftWaterChem w = nft_water_chem(c, nft_R_conc(s));
     NftAcidBase ab = nft_acid_base(s->res.T_C, w.I);
     f64 pc = nft_pco2_atm(&s->params);
-    return (nft_alk_species(&ab, s->pH + 0.01, pc, w.PT, w.NT) - nft_alk_species(&ab, s->pH - 0.01, pc, w.PT, w.NT)) / 0.02 * 1e3;
+    return (nft_alk_species(&ab, s->pH + 0.01, pc, w.PT, w.NT, &w.pr) - nft_alk_species(&ab, s->pH - 0.01, pc, w.PT, w.NT, &w.pr)) / 0.02 * 1e3;
 }
 
 // Scalar of a layer at channel r, cell j.
@@ -232,7 +236,7 @@ internal f32 nft_layer_value(NftSystem *s, u32 layer, u32 r, u32 j) {
         case NftLayer_EC: {
             f64 c[NftF_Count];
             for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_abs(s, g, j, k, l);
-            return (f32)nft_ec_mS(c);
+            return (f32)(nft_ec_mS(c) + nft_salt_ec_mS(s));
         }
         case NftLayer_pH:           return nft_cell_ph_view(s, g, j, l);
         case NftLayer_Velocity:     return grp->cold[j].vel[l];
@@ -347,7 +351,7 @@ internal void nft_scene_summary(NftScene *sc, char *out, u32 size) {
              "pH %.2f, acid %.0f base %.0f mmol | water: plants %.1f L, evaporation %.1f L, film max %.1f mm, holdup %.1f L | "
              "plant dm A %.2f B %.2f g, harvests A %.0f (%.0f g, %.0f bolted) B %.0f (%.0f g, %.0f bolted) | %.3f ms/window",
              s->rails, s->sites, s->t / 86400.0, s->T_amb, s->res.T_C, nft_bank_cell_mean(s, 0, NftF_T, s->cells - 1),
-             nft_bank_cell_mean(s, 1, NftF_T, s->cells - 1), s->acc.chiller_elec_J / 3.6e6, nft_ec_mS(c), c[NftF_NO3],
+             nft_bank_cell_mean(s, 1, NftF_T, s->cells - 1), s->acc.chiller_elec_J / 3.6e6, nft_ec_mS(c) + nft_salt_ec_mS(s), c[NftF_NO3],
              c[NftF_K], c[NftF_Ca], c[NftF_DO], s->pH, s->acc.acid_mmol, s->acc.base_mmol, s->acc.transpired_L,
              s->acc.evap_channel_L + s->acc.evap_tank_L, s->max_depth_m * 1e3, s->acc.holdup_L, wa, wb, s->acc.harvests[0], s->acc.harvest_g[0], s->acc.bolted[0],
              s->acc.harvests[1], s->acc.harvest_g[1], s->acc.bolted[1],

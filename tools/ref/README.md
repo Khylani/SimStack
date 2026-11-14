@@ -10,6 +10,7 @@ what they produce: the G-value table and the numbers recorded in
 | --- | --- | --- |
 | [LoKI-B++](https://github.com/LoKI-Suite/LoKI-B-cpp) | two-term Boltzmann solution for dry air → energy partition → `src/sim/kinetics/air_source_table.h` | GPL-3.0 |
 | [ChemPlasKin](https://github.com/ShaoX96/ChemPlasKin) (Cantera 3.0 + CppBOLOS) | full electron + ion + excited-state kinetics of repeated micro-discharges | LGPL-2.1 |
+| [PHREEQC 3.8.6](https://www.usgs.gov/software/phreeqc-version-3) (USGS) | aqueous speciation: source water, PAW batch titration, NFT solution pH and acid demand (`phreeqc/`) | public domain |
 
 Everything below lives in `~/Play/ref`. The build tools (scons, cmake,
 ruamel.yaml) are in the shared `~/ComfyUI/.venv`. Builds are pinned with
@@ -116,3 +117,34 @@ Case: `chemplaskin_case/`, with `air_plasma_n2o5.yaml` made by `add_n2o5.py`.
 - **N₂(v) chemistry** (N₂(v) + O → NO + N) is in neither code; ChemPlasKin carries N₂
   vibrational energy only as a heat reservoir. The state-to-state reference in `n2vib/`
   covers it: T_v matches CARS, and vibrational NO is below 0.3 % at the skid's conditions.
+
+## PHREEQC → water chemistry
+
+```sh
+mkdir -p ~/Play/ref/phreeqc_dl && cd ~/Play/ref/phreeqc_dl
+curl -LO https://water.usgs.gov/water-resources/software/PHREEQC/phreeqc-3.8.6-17100.tar.gz
+# sha256 b5c4a6dfea1a6bb6a3436857a50346bb943904a49582714494b4f1b1e54e64e1
+mkdir -p ../phreeqc_src && tar -xzf phreeqc-3.8.6-17100.tar.gz -C ../phreeqc_src
+cd ../phreeqc_src/phreeqc-3.8.6-17100 && mkdir build && cd build
+../configure --prefix=$HOME/Play/ref/phreeqc && taskset -c 0-3,16-23 nice -n 19 make -j8 && make install
+
+cd ~/Play/SimStack
+tools/ref/phreeqc/build.sh                       # build/ref_sim_water: the sim's side
+python3 -I tools/ref/phreeqc/compare.py          # writes tools/ref/phreeqc/results.md
+```
+
+Nitrogen gets non-redox elements in the input (Nta nitrate, Ntb nitrite, Amm ammonium), so
+PHREEQC does not reduce nitrate at its default pe. HNO₂ uses llnl.dat's constants; everything
+else is phreeqc.dat. Results (`phreeqc/results.md`):
+
+- **Source water** (design figure and Moloaʻa W78): DIC within 0.4 %, CO₂ within 2 %, log pCO₂
+  within 0.01. The PAW model's ionic strength counts only the carbonate system and its
+  counter-ions (1.5 vs 2.8 mmol/L on W78), which moves the activities by under 0.01 pH.
+- **PAW batch** (closed, 85 % nitric / 15 % nitrous): the pH curve within 0.003 on W78
+  water and 0.06 at the steepest point on the design water; acid N to pH 5.5 within 0.5 %.
+- **NFT working solution** (open to 420 ppm CO₂): the comparison found that the free-ion
+  model put pH 0.11–0.17 high and nitric-acid demand to pH 5.8 4–5 % high, because Ca and Mg
+  pair with phosphate. With ion pairs in `nft_alk_species`: 0.002–0.009 pH, 0.2–0.5 % acid.
+- PHREEQC also shows the working solution supersaturated with hydroxyapatite before pH
+  adjustment (SI ≈ 9–10, kinetically inhibited) and well below gypsum (SI ≈ −1.7).
+  Precipitation is not modelled.

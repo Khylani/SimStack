@@ -150,6 +150,7 @@ internal void sim_reset_scene(SimState *state, SimMemory *memory) {
     } else if (state->scene == SimScene_Nft) {
         if (!state->nft_params_set) {
             state->nft_params = nft_preset(memory->config.preset);
+            if (memory->config.water) nft_set_water(&state->nft_params, memory->config.water);
             if (memory->config.zone_count) state->nft_params.rails = memory->config.zone_count;
             if (memory->config.channel_length_m > 0) state->nft_params.rail_length_m = memory->config.channel_length_m;
             if (memory->config.plants_per_channel) state->nft_params.plants_per_rail = memory->config.plants_per_channel;

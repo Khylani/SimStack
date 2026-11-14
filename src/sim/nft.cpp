@@ -222,6 +222,19 @@ struct NftBank {                // half of the rails: crop + wrap + planting sta
     f32 stagger_days;           // site ages are spread over this many days (0 = all planted at once)
 };
 
+// Source water (fill, top-off and the PAW skid's batches). Tracked ions go
+// into the solution's books; Na, Cl and silica are booked at the tank
+// (NftSalts). docs/SOURCE_WATER.md has the data and where it comes from.
+struct NftSourceWater {
+    f32 pH, alk_meq;            // pH at the tap, total alkalinity (meq/L)
+    f32 ion[NFT_IONS];          // mg/L: NO3-N, NH4-N, P, K, Ca, Mg, S (as S)
+    f32 na, cl, sio2;           // mg/L
+};
+enum NftWater { NftWater_Design, NftWater_MoloaaW78, NftWater_Custom, NftWater_Count };
+global const char *const nft_water_names[NftWater_Count] = {
+    "Design figure (pH 10, KH 1.5; ions unknown)", "Moloaa 2 well W78 (USGS, Kauai)", "Custom",
+};
+
 struct NftParams {
     // structure (rebuild): the system scales with these three
     u32 rails;                  // channels
@@ -256,6 +269,8 @@ struct NftParams {
     f32 ph_set, ph_band;
     f32 acid_mmol_per_h_max;    // HNO3 (1 M stock)
     f32 tap_alk_meq;            // alkalinity of top-off / fill water
+    u32 water_id;               // NftWater
+    NftSourceWater water;       // its composition (tap_alk_meq and the PAW source follow it)
     // plasma-activated water: batch skid that tops off the reservoir (paw.cpp)
     PawParams paw;
     // reservoir
@@ -332,6 +347,34 @@ internal NftParams nft_default_params() {
 }
 
 // Presets: whole-system starting points (selectable at launch and in the UI).
+// Applies a source water: the tracked ions, the tank salts, the top-off
+// alkalinity and the PAW skid's source pH / KH. The design figure keeps the
+// preset's own alkalinity values and carries no ions (they were not given).
+internal void nft_set_water(NftParams *p, u32 id) {
+    p->water_id = id;
+    if (id == NftWater_Design) {
+        f32 ph = p->water.pH > 0 ? p->water.pH : 10.0f;
+        p->water = {};
+        p->water.pH = ph; p->water.alk_meq = p->tap_alk_meq;
+        return;
+    }
+    if (id == NftWater_MoloaaW78) {
+        // USGS 2-1020-03 Moloaa 2 (W78), 700 ft basal well, same aquifer as State Moloaa Well No. 1
+        NftSourceWater w = {};
+        w.pH = 7.6f; w.alk_meq = 72.0f / 50.04f;            // 72 mg/L as CaCO3
+        w.ion[NftF_K - NFT_ION0] = 0.7f;
+        w.ion[NftF_Ca - NFT_ION0] = 11.0f;
+        w.ion[NftF_Mg - NFT_ION0] = 11.0f;
+        w.ion[NftF_S - NFT_ION0] = 3.4f * 32.06f / 96.06f;  // sulfate as S
+        w.na = 14.0f; w.cl = 20.0f; w.sio2 = 36.0f;
+        p->water = w;
+    }
+    // Custom keeps p->water as edited
+    p->tap_alk_meq = p->water.alk_meq;
+    p->paw.source_pH = p->water.pH;
+    p->paw.source_kh_meq = p->water.alk_meq;
+}
+
 enum NftPreset { NftPreset_Default, NftPreset_PawSkid, NftPreset_Count };
 global const char *const nft_preset_names[NftPreset_Count] = { "Default herb room", "PAW skid: 3x DBD, 50 gal batch, 300 gal NFT" };
 global const char *const nft_preset_keys[NftPreset_Count] = { "default", "paw-skid" };
@@ -352,6 +395,7 @@ internal NftParams nft_preset(u32 preset) {
         p.tap_alk_meq = 1.6f;                 // same municipal water if the PAW stock runs out (KH + hydroxide)
         p.fill_T_C = p.paw.source_T_C;
     }
+    nft_set_water(&p, NftWater_Design);
     return p;
 }
 
@@ -363,6 +407,14 @@ struct NftReservoir {
     f64 T_C;
     f64 mass_mg[NftF_Count];    // [DO..S]: mg in the tank ([T] unused)
     b32 chiller_running;
+};
+
+// Na, Cl and silica in the tank: hardly taken up, so a recirculating
+// reservoir concentrates what the top-off brings until a solution change.
+// Booked at tank level (the channels hold the same water); Na adds to EC.
+struct NftSalts {
+    f64 na_mg, cl_mg, si_mg;    // in the tank
+    f64 na_in_mg, cl_in_mg;     // brought in since reset
 };
 
 struct NftAccounts {            // cumulative since reset
@@ -408,6 +460,7 @@ struct NftSystem {
     u32 overflow_cells;                // cells whose film tops the channel wall (last solve)
     f32 max_depth_m;
     f64 evap_channel_L_s, evap_tank_L_s, transp_L_s;   // rates over the last window
+    NftSalts salts;                    // Na / Cl / SiO2 from the source water
     PawSkid paw;                       // plasma-activated water batch skid (params.paw)
     PawChem paw_chem;                  // its M2 kinetics workspace (one module's annulus)
     f32 ref[NftF_Count];               // rail cells store x - ref (deltas): ref = this window's inlet
@@ -415,6 +468,18 @@ struct NftSystem {
 
 internal f64 nft_reservoir_conc(NftSystem *s, u32 field) {
     return s->res.V_L > 0.0 ? s->res.mass_mg[field] / s->res.V_L : 0.0;
+}
+
+// EC added by the tank's sodium (same 0.1 x cation meq/L rule as nft_ec_mS).
+internal f64 nft_salt_ec_mS(NftSystem *s) {
+    return s->res.V_L > 0.0 ? 0.1 * s->salts.na_mg / s->res.V_L / 22.990 : 0.0;
+}
+
+// Brings `L` litres of source water's tank salts into the reservoir.
+internal void nft_salts_add(NftSystem *s, f64 L) {
+    NftSourceWater *w = &s->params.water;
+    s->salts.na_mg += w->na * L; s->salts.cl_mg += w->cl * L; s->salts.si_mg += w->sio2 * L;
+    s->salts.na_in_mg += w->na * L; s->salts.cl_in_mg += w->cl * L;
 }
 
 // EC from ion concentrations: 0.1 x cation meq/L (mS/cm), the usual rule of thumb.
@@ -706,7 +771,7 @@ internal void nft_ph_control(NftSystem *s, f64 dt, b32 makeup) {
     for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_reservoir_conc(s, k);
     NftWaterChem w = nft_water_chem(c, nft_R_conc(s));
     NftAcidBase ab = nft_acid_base(r->T_C, w.I);
-    f64 ta_set = nft_alk_species(&ab, p->ph_set, nft_pco2_atm(p), w.PT, w.NT) * 1e3;   // meq/L
+    f64 ta_set = nft_alk_species(&ab, p->ph_set, nft_pco2_atm(p), w.PT, w.NT, &w.pr) * 1e3;   // meq/L
     f64 need = (w.TA_meq - ta_set) * r->V_L;           // meq of acid (> 0) or base (< 0)
     f64 cap = makeup ? 1e30 : (f64)p->acid_mmol_per_h_max / 3600.0 * dt;
     f64 mmol = Minimum(fabs(need), cap);
@@ -732,7 +797,15 @@ internal void nft_ph_control(NftSystem *s, f64 dt, b32 makeup) {
 // the batch carries the tap water's alkalinity; R is whatever balances that.
 internal f64 nft_fill_R_conc(NftParams *p) {
     f64 m[NftF_Count] = {};
-    for (u32 i = 0; i < NFT_IONS; ++i) m[NFT_ION0 + i] = p->recipe[i];
+    for (u32 i = 0; i < NFT_IONS; ++i) m[NFT_ION0 + i] = p->recipe[i] + p->water.ion[i];
+    return (f64)p->tap_alk_meq - nft_ion_charge_meq(m);
+}
+
+// Untracked charge per litre of plain source water (its alkalinity minus the
+// charge of the ions the books track).
+internal f64 nft_water_R_conc(NftParams *p) {
+    f64 m[NftF_Count] = {};
+    for (u32 i = 0; i < NFT_IONS; ++i) m[NFT_ION0 + i] = p->water.ion[i];
     return (f64)p->tap_alk_meq - nft_ion_charge_meq(m);
 }
 
@@ -755,7 +828,7 @@ internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
 
     f64 c[NftF_Count] = {};
     c[NftF_DO] = nft_do_sat_f64(params.fill_T_C);
-    for (u32 i = 0; i < NFT_IONS; ++i) c[NFT_ION0 + i] = params.recipe[i];
+    for (u32 i = 0; i < NFT_IONS; ++i) c[NFT_ION0 + i] = params.recipe[i] + params.water.ion[i];
     for (u32 k = 1; k < NftF_Count; ++k) s->res.mass_mg[k] = c[k] * s->res.V_L;
     s->ref[NftF_T] = (f32)params.fill_T_C;
     for (u32 k = 1; k < NftF_Count; ++k) s->ref[k] = (f32)c[k];
@@ -790,6 +863,8 @@ internal void nft_init(NftSystem *s, Arena *arena, NftParams params) {
     f64 holdup = s->acc.holdup_L;
     memset(&s->acc, 0, sizeof(s->acc));   // the books start from the made-up batch
     s->acc.holdup_L = holdup;
+    nft_salts_add(s, s->res.V_L);
+    s->salts.na_in_mg = s->salts.cl_in_mg = 0.0;   // books start from the made-up batch
     paw_init(&s->paw, &params.paw);
     paw_chem_alloc(&s->paw_chem, arena);
     if (params.paw.enabled) paw_gas_compute(&s->paw_chem, &s->paw.gas, &params.paw, s->paw.drum.T_C);
@@ -1279,6 +1354,17 @@ internal void nft_reservoir_window(NftSystem *s) {
             r->mass_mg[NftF_NO3] += n_mg;
             s->acc.dosed_mg[NftF_NO3 - NFT_ION0] += n_mg;
             s->R_meq += w.R_meq;
+            // the source water's own ions ride through the plasma treatment unchanged
+            if (p->water_id != NftWater_Design) {
+                f64 m[NftF_Count] = {};
+                for (u32 i = 0; i < NFT_IONS; ++i) {
+                    m[NFT_ION0 + i] = (f64)p->water.ion[i] * paw_L;
+                    r->mass_mg[NFT_ION0 + i] += m[NFT_ION0 + i];
+                    s->acc.dosed_mg[i] += m[NFT_ION0 + i];
+                }
+                s->R_meq -= nft_ion_charge_meq(m);   // they were inside the PAW model's untracked charge
+                nft_salts_add(s, paw_L);
+            }
             s->acc.paw_L += paw_L;
             s->acc.paw_N_mg += n_mg;
             s->paw.acc.delivered_L += paw_L;
@@ -1288,7 +1374,17 @@ internal void nft_reservoir_window(NftSystem *s) {
         r->T_C = heat / p->reservoir_L;
         r->V_L = p->reservoir_L;
         s->acc.topoff_L += add;
-        s->R_meq += (f64)p->tap_alk_meq * tap_L;
+        if (p->water_id == NftWater_Design) {
+            s->R_meq += (f64)p->tap_alk_meq * tap_L;
+        } else if (tap_L > 0.0) {
+            for (u32 i = 0; i < NFT_IONS; ++i) {
+                f64 mg = (f64)p->water.ion[i] * tap_L;
+                r->mass_mg[NFT_ION0 + i] += mg;
+                s->acc.dosed_mg[i] += mg;
+            }
+            s->R_meq += nft_water_R_conc(p) * tap_L;
+            nft_salts_add(s, tap_L);
+        }
     }
     // EC dosing, rate-limited. Stock ion ratios: either the fill recipe, or
     // matched to what the plants actually take up (their tissue composition),
@@ -1298,7 +1394,7 @@ internal void nft_reservoir_window(NftSystem *s) {
     if (p->dosing_on) {
         f64 c[NftF_Count];
         for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_reservoir_conc(s, k);
-        f64 ec = nft_ec_mS(c);
+        f64 ec = nft_ec_mS(c) + nft_salt_ec_mS(s);
         f64 stock[NftF_Count] = {};
         nft_stock_composition(s, stock);
         f64 ec_stock = nft_ec_mS(stock);
@@ -1323,9 +1419,11 @@ internal void nft_reservoir_window(NftSystem *s) {
         f64 R_channels = nft_R_conc(s) * s->acc.holdup_L;
         for (u32 i = 0; i < NFT_IONS; ++i) {
             s->acc.dumped_mg[i] += r->mass_mg[NFT_ION0 + i];
-            r->mass_mg[NFT_ION0 + i] = (f64)p->recipe[i] * p->reservoir_L;
+            r->mass_mg[NFT_ION0 + i] = ((f64)p->recipe[i] + p->water.ion[i]) * p->reservoir_L;
             s->acc.dosed_mg[i] += r->mass_mg[NFT_ION0 + i];
         }
+        s->salts.na_mg = s->salts.cl_mg = s->salts.si_mg = 0.0;
+        nft_salts_add(s, p->reservoir_L);
         s->acc.dumped_L += r->V_L;
         s->acc.topoff_L += p->reservoir_L;
         r->V_L = p->reservoir_L;

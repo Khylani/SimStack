@@ -127,8 +127,11 @@ Reference: `--scene dbd --headless 30` gives 500 master steps and hash
 `32256818f6f35bc9` (f32 lanes, default) or `9beb634425faf2c2` (`--precision f64`)
 for clang and gcc, any `--threads`, `--gpu` and `--hybrid`.
 `--scene nft --headless 600 --speed 86400` (10 simulated days) gives
-`eb7ffcfe5642537a`, and with `--preset paw-skid` `1c457bfba2d1857e`, for any `--threads`.
+`2724682ab39bdb4c`, and with `--preset paw-skid` `af4bad4a7db20b76`, for any `--threads` (since the ion pairs in the
+pH speciation; before them `eb7ffcfe5642537a` / `1c457bfba2d1857e`).
 `--scene dbd --preset paw-skid --headless 30` (one skid module's annulus) gives `478e1b431919599a`.
+`--scene nft --headless 600 --speed 86400 --preset paw-skid --water moloaa` (the farm's well water,
+docs/SOURCE_WATER.md) gives `456192e3fbd1dbb6`.
 
 ASan with clang does not link under `-nostdlib++` (the ASan runtime needs
 `__cxa_begin_catch`); use `CXX=g++ ./build.sh debug --asan`. This predates M2.
@@ -225,6 +228,7 @@ third_party/                Dear ImGui (docking) + ImPlot, pinned (THIRD_PARTY.m
   gpu/kernels.cu            nvcc TU: GPU bump arena, kinetics kernel, point kernel
   tests/test_kinetics.cpp   solver/mechanism tests and benchmarks
 docs/BUILD.md               this file
+docs/SOURCE_WATER.md        Moloaʻa source water: suppliers, USGS / county chemistry, effect on the sim (data/water/)
 docs/UI.md                  the window: transport, timeline / baking, 3D view, Inspector, menus
 docs/M2_KINETICS.md         the DBD chemistry solver and UI: design, verification, measurements
 docs/M3_NFT.md              NFT channels, PVC hydraulics, reservoir/chiller, plants: model, exactness, layout

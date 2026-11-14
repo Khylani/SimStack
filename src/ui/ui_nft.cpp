@@ -31,6 +31,37 @@ internal b32 ui_slider_f32(const char *label, f32 *v, f32 lo, f32 hi, const char
     return ImGui::SliderFloat(label, v, lo, hi, fmt, log_scale ? ImGuiSliderFlags_Logarithmic : 0);
 }
 
+// Source water: preset or custom composition. Applies at once to top-off and
+// the PAW skid's next batch; the tank itself changes at the next solution
+// change (or Rebuild).
+internal void ui_nft_source_water(NftParams *p) {
+    s32 id = (s32)p->water_id;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##water", &id, nft_water_names, NftWater_Count)) nft_set_water(p, (u32)id);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Fill, top-off and PAW batch water (docs/SOURCE_WATER.md).\n"
+                          "Applies to top-off and the next PAW batch now; to the tank at the next solution change or Rebuild.");
+    NftSourceWater *w = &p->water;
+    if (p->water_id == NftWater_Custom) {
+        b32 ch = 0;
+        ch |= ui_slider_f32("pH", &w->pH, 5.0f, 11.0f, "%.2f");
+        ch |= ui_slider_f32("alkalinity meq/L", &w->alk_meq, 0.0f, 6.0f, "%.2f");
+        ch |= ui_slider_f32("Ca mg/L", &w->ion[NftF_Ca - NFT_ION0], 0.0f, 100.0f, "%.1f");
+        ch |= ui_slider_f32("Mg mg/L", &w->ion[NftF_Mg - NFT_ION0], 0.0f, 60.0f, "%.1f");
+        ch |= ui_slider_f32("K mg/L", &w->ion[NftF_K - NFT_ION0], 0.0f, 20.0f, "%.1f");
+        f32 so4 = w->ion[NftF_S - NFT_ION0] * 96.06f / 32.06f;
+        if (ui_slider_f32("SO4 mg/L", &so4, 0.0f, 100.0f, "%.1f")) { w->ion[NftF_S - NFT_ION0] = so4 * 32.06f / 96.06f; ch = 1; }
+        ch |= ui_slider_f32("NO3-N mg/L", &w->ion[NftF_NO3 - NFT_ION0], 0.0f, 10.0f, "%.2f");
+        ch |= ui_slider_f32("Na mg/L", &w->na, 0.0f, 150.0f, "%.1f");
+        ch |= ui_slider_f32("Cl mg/L", &w->cl, 0.0f, 250.0f, "%.1f");
+        ch |= ui_slider_f32("SiO2 mg/L", &w->sio2, 0.0f, 80.0f, "%.1f");
+        if (ch) nft_set_water(p, NftWater_Custom);
+    } else if (p->water_id != NftWater_Design) {
+        ImGui::TextDisabled("pH %.1f, alk %.2f meq/L, Ca %.0f Mg %.0f Na %.0f Cl %.0f SiO2 %.0f mg/L", w->pH, w->alk_meq,
+                            w->ion[NftF_Ca - NFT_ION0], w->ion[NftF_Mg - NFT_ION0], w->na, w->cl, w->sio2);
+    }
+}
+
 internal void ui_nft_controls(SimState *state, SimMemory *memory) {
     UiState *ui = &state->ui;
     NftScene *sc = state->nft;
@@ -274,8 +305,13 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
             bool st2 = pp->stage2_on != 0;
             if (ImGui::Checkbox("stage-2 bucket (next batch's water)", &st2)) pp->stage2_on = st2;
             ImGui::SeparatorText("Batch");
-            ui_slider_f32("source pH", &pp->source_pH, 6.0f, 11.0f, "%.1f");
-            ui_slider_f32("source KH meq/L", &pp->source_kh_meq, 0.0f, 5.0f, "%.2f");
+            ImGui::TextDisabled("source water (also in Nutrients):");
+            ui_nft_source_water(p);
+            if (p->water_id == NftWater_Design) {
+                b32 ch = ui_slider_f32("source pH", &pp->source_pH, 6.0f, 11.0f, "%.1f");
+                ch |= ui_slider_f32("source KH meq/L", &pp->source_kh_meq, 0.0f, 5.0f, "%.2f");
+                if (ch) p->water.pH = pp->source_pH;
+            }
             ui_slider_f32("batch target pH", &pp->batch_pH, 3.0f, 7.0f, "%.2f");
             ui_slider_f32("hold h", &pp->hold_h, 0.0f, 12.0f, "%.1f");
             ImGui::PopItemWidth();
@@ -326,6 +362,9 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
     // nutrients
     if (ImGui::CollapsingHeader("Nutrients", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushItemWidth(-130);
+        ImGui::SeparatorText("Source water");
+        ui_nft_source_water(p);
+        ImGui::SeparatorText("Solution");
         bool dose = p->dosing_on != 0, matched = p->dose_matched != 0, topoff = p->topoff_on != 0;
         if (ImGui::Checkbox("EC dosing", &dose)) p->dosing_on = dose;
         ImGui::SameLine();
@@ -336,7 +375,11 @@ internal void ui_nft_controls(SimState *state, SimMemory *memory) {
         ImGui::PopItemWidth();
         f64 c[NftF_Count];
         for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_reservoir_conc(s, k);
-        ImGui::Text("EC %.2f mS/cm, DO %.1f mg/L", nft_ec_mS(c), c[NftF_DO]);
+        ImGui::Text("EC %.2f mS/cm, DO %.1f mg/L", nft_ec_mS(c) + nft_salt_ec_mS(s), c[NftF_DO]);
+        if (s->salts.na_mg > 0.0 && s->res.V_L > 0.0)
+            ImGui::TextDisabled("tank Na %.0f, Cl %.0f, SiO2 %.0f mg/L (sodium is %.0f %% of EC)", s->salts.na_mg / s->res.V_L,
+                                s->salts.cl_mg / s->res.V_L, s->salts.si_mg / s->res.V_L,
+                                100.0 * nft_salt_ec_mS(s) / Maximum(nft_ec_mS(c) + nft_salt_ec_mS(s), 1e-9));
         if (ImGui::BeginTable("##ions", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             for (u32 i = 0; i < NFT_IONS; ++i) {
                 if (i % 2 == 0) ImGui::TableNextRow();
