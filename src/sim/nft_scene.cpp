@@ -218,7 +218,7 @@ internal f64 nft_tank_buffer_meq(NftSystem *s) {
     NftWaterChem w = nft_water_chem(c, nft_R_conc(s));
     NftAcidBase ab = nft_acid_base(s->res.T_C, w.I);
     f64 pc = nft_pco2_atm(&s->params);
-    return (nft_alk_species(&ab, s->pH + 0.01, pc, w.PT, w.NT) - nft_alk_species(&ab, s->pH - 0.01, pc, w.PT, w.NT)) / 0.02 * 1e3;
+    return (nft_alk_species(&ab, s->pH + 0.01, pc, w.PT, w.NT, &w.pr) - nft_alk_species(&ab, s->pH - 0.01, pc, w.PT, w.NT, &w.pr)) / 0.02 * 1e3;
 }
 
 // Scalar of a layer at channel r, cell j.

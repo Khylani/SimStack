@@ -163,14 +163,21 @@ All three are physics with closed books, not adjustment factors. The water code 
   - Constants: K0 (Weiss 1974), K1 and K2 (Plummer & Busenberg 1982), Kw (Harned & Owen),
     NH4⁺ (Emerson et al. 1975), phosphate by van't Hoff from 25 °C.
   - Activities by Davies, with A(T) from the dielectric constant of water.
+  - **Ion pairs:** Ca, Mg and K pair with phosphate (CaHPO₄⁰, CaH₂PO₄⁺, CaPO₄⁻ and the Mg
+    analogues, KHPO₄⁻), sulfate (CaSO₄⁰, MgSO₄⁰, KSO₄⁻) and carbonate (CaHCO₃⁺, CaCO₃⁰ and Mg),
+    with phreeqc.dat's constants. The free ions come from a fixed 10-step iteration on the
+    mass balances. About 10 % of the calcium is paired in a working solution. Without the
+    pairs the pH was 0.11–0.17 high and the acid demand 4–5 % high against PHREEQC; with
+    them, 0.002–0.009 and 0.2–0.5 % (`tools/ref/phreeqc`).
   - Bracketed Newton converges to 1e-10 in about 6 steps.
 - **Local pH in the 3D view:** solved exactly per cell up to 32k cells. Above that it is
   linearized through the tank's buffer capacity.
 - **Behaviour reproduced:**
   - With 10 mg/L NH4-N, ammonium takes about 22% of N uptake and nearly balances the plants'
     charge uptake. This is why growers add 5–15% NH4-N to steady the pH.
-  - All-nitrate feeding drives the pH up (5.80 → 6.40 in a day without control); an
-    ammonium-rich feed drives it down (5.80 → 5.43).
+  - All-nitrate feeding drives the pH up (5.80 → 6.26 in a day without control); an
+    ammonium-rich feed drives it down (5.80 → 5.58). The paired phosphate buffers more than
+    the free-ion model did (6.40 / 5.43).
   - With control on, the acid demand comes mostly from tap-water alkalinity and the batch
     make-up.
 
@@ -207,7 +214,8 @@ close:
 | pK1, pK2, pKw, pKa(NH4), pK2(P) at 25 °C vs reference | within 0.005 |
 | pH: pure water / rain at 420 ppm CO2 / 1 meq/L bicarbonate under air | 7.00 / 5.60 / 8.18 |
 | pH controller over 30 days | 5.80 at set 5.8 ± 0.2 |
-| pH drift without control, 1 day: all nitrate / 40 mg/L NH4-N | 5.80 → 6.40 / 5.80 → 5.43 |
+| pH drift without control, 1 day: all nitrate / 40 mg/L NH4-N | 5.80 → 6.26 / 5.80 → 5.58 |
+| pH and acid demand of the working solution vs PHREEQC 3.8.6 (W78 and design water, 20 / 30 °C) | 0.002–0.009 pH, 0.2–0.5 % acid |
 | Chiller holds its band (mylar) | 19.6..20.3 °C at set 20 ± 0.3 |
 | Mylar vs bare PVC at 28 ± 4 °C, 300 W/m² | chiller 2.8 vs 8.4 kWh/day |
 | Growth vs the analytic logistic curve (all limits 1) | 0.01% |

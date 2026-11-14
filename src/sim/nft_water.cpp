@@ -142,7 +142,14 @@ struct NftAcidBase {
     f64 Kn;            // NH4+ = NH3 + H+                                Emerson et al. 1975
     f64 P1, P2, P3;    // phosphoric acid, van't Hoff from 25 C          (pK 2.148, 7.198, 12.35)
     f64 g1, g2, g3;    // Davies activity coefficients, |z| = 1, 2, 3
+    // ion pairs (formation constants from the free ions; phreeqc.dat, Nordstrom et al. 1990)
+    f64 CaHP, CaH2P, CaP, MgHP, MgH2P, MgP, KHP;   // with HPO4--, H2PO4-, PO4---
+    f64 CaS, MgS, KS;                              // with SO4--
+    f64 CaHC, CaC, MgHC, MgC;                      // Ca/Mg + CO3-- + H+ = MHCO3+, M + CO3-- = MCO3
 };
+
+// Totals (mol/L) of the cations and sulfate that form the pairs above.
+struct NftPairs { f64 Ca, Mg, K, S; };
 
 internal f64 nft_vant_hoff_log(f64 logK25, f64 dH_J, f64 TK) {
     return logK25 - dH_J / (8.314462618 * 2.302585093) * (1.0 / TK - 1.0 / 298.15);
@@ -159,6 +166,21 @@ internal NftAcidBase nft_acid_base(f64 T_C, f64 I) {
     a.P1 = pow(10.0, nft_vant_hoff_log(-2.148, -8.0e3, TK));
     a.P2 = pow(10.0, nft_vant_hoff_log(-7.198, 3.6e3, TK));
     a.P3 = pow(10.0, nft_vant_hoff_log(-12.35, 16.0e3, TK));
+    const f64 kcal = 4184.0;
+    a.CaHP  = pow(10.0, nft_vant_hoff_log(2.739, 3.3 * kcal, TK));
+    a.CaH2P = pow(10.0, nft_vant_hoff_log(1.408, 3.4 * kcal, TK));
+    a.CaP   = pow(10.0, nft_vant_hoff_log(6.459, 3.1 * kcal, TK));
+    a.MgHP  = pow(10.0, nft_vant_hoff_log(2.87, 3.3 * kcal, TK));
+    a.MgH2P = pow(10.0, nft_vant_hoff_log(1.513, 3.4 * kcal, TK));
+    a.MgP   = pow(10.0, nft_vant_hoff_log(6.589, 3.1 * kcal, TK));
+    a.KHP   = pow(10.0, 0.29);
+    a.CaS   = pow(10.0, nft_vant_hoff_log(2.25, 1.325 * kcal, TK));
+    a.MgS   = pow(10.0, nft_vant_hoff_log(2.42, 19.0e3, TK));
+    a.KS    = pow(10.0, nft_vant_hoff_log(0.6, -10.4e3, TK));
+    a.CaHC  = pow(10.0, nft_vant_hoff_log(10.91, 4.38 * kcal, TK));
+    a.CaC   = pow(10.0, nft_vant_hoff_log(3.224, 3.545 * kcal, TK));
+    a.MgHC  = pow(10.0, nft_vant_hoff_log(11.399, -2.771 * kcal, TK));
+    a.MgC   = pow(10.0, nft_vant_hoff_log(2.98, 2.713 * kcal, TK));
     // Davies: log g = -A z^2 (sqrt I / (1 + sqrt I) - 0.3 I); A from the
     // dielectric constant of water (Malmberg & Maryott 1956).
     f64 eps = 87.74 - 0.40008 * T_C + 9.398e-4 * T_C * T_C - 1.41e-6 * T_C * T_C * T_C;
@@ -170,6 +192,51 @@ internal NftAcidBase nft_acid_base(f64 T_C, f64 I) {
 }
 
 // Alkalinity (mol/L) of the speciated solution at pH (activity scale).
+//
+// With `pr`, Ca, Mg and K pair with phosphate, sulfate and carbonate. In a
+// working nutrient solution (Ca ~4 mM, P ~1.3 mM) about 10 % of the calcium
+// is paired, and CaHPO4 / MgHPO4 pull the phosphate toward HPO4--, which
+// carries alkalinity: ignoring them put the pH 0.1-0.17 high and the acid
+// demand 4-5 % high against PHREEQC (tools/ref/phreeqc). The free ions follow
+// from a fixed-point iteration on the Ca / Mg / K / sulfate mass balances; a
+// fixed iteration count keeps the function smooth for the Newton solve.
+internal f64 nft_alk_species(const NftAcidBase *a, f64 pH, f64 pCO2_atm, f64 PT, f64 NT);   // free ions only (below)
+internal f64 nft_alk_species(const NftAcidBase *a, f64 pH, f64 pCO2_atm, f64 PT, f64 NT, const NftPairs *pr) {
+    if (pr && (pr->Ca > 0.0 || pr->Mg > 0.0 || pr->K > 0.0)) {
+        f64 aH = pow(10.0, -pH);
+        f64 g1 = a->g1, g2 = a->g2, g3 = a->g3;
+        f64 co2 = a->K0 * pCO2_atm;
+        f64 hco3 = a->K1 * co2 / (aH * g1);
+        f64 co3 = a->K1 * a->K2 * co2 / (aH * aH * g2);
+        f64 oh = a->Kw / (aH * g1), h = aH / g1;
+        f64 r1 = a->P1 / (aH * g1), r2 = a->P2 * g1 / (aH * g2), r3 = a->P3 * g2 / (aH * g3);
+        f64 rn = a->Kn * g1 / aH;
+        f64 nh3 = NT * rn / (1.0 + rn);
+        f64 g22 = g2 * g2, g23 = g2 * g3 / g1;
+        f64 ca = pr->Ca, mg = pr->Mg, k = pr->K, x = 0.0, hpo4 = 0.0, po4 = 0.0, so4 = pr->S;
+        for (u32 it = 0; it < 10; ++it) {
+            // phosphate relative to free H2PO4- (x)
+            f64 D = 1.0 / r1 + 1.0 + r2 * (1.0 + (a->CaHP * ca + a->MgHP * mg) * g22 + a->KHP * g2 * k) +
+                    r2 * r3 * (1.0 + (a->CaP * ca + a->MgP * mg) * g23) + (a->CaH2P * ca + a->MgH2P * mg) * g2;
+            x = PT / D;
+            hpo4 = x * r2; po4 = hpo4 * r3;
+            so4 = pr->S / (1.0 + (a->CaS * ca + a->MgS * mg) * g22 + a->KS * g2 * k);
+            f64 cpairs = a->CaHC * g22 * co3 * aH / g1 + a->CaC * g22 * co3;
+            f64 mpairs = a->MgHC * g22 * co3 * aH / g1 + a->MgC * g22 * co3;
+            ca = pr->Ca / (1.0 + a->CaHP * g22 * hpo4 + a->CaH2P * g2 * x + a->CaP * g23 * po4 + a->CaS * g22 * so4 + cpairs);
+            mg = pr->Mg / (1.0 + a->MgHP * g22 * hpo4 + a->MgH2P * g2 * x + a->MgP * g23 * po4 + a->MgS * g22 * so4 + mpairs);
+            k = pr->K / (1.0 + a->KS * g2 * so4 + a->KHP * g2 * hpo4);
+        }
+        f64 h3po4 = x / r1;
+        f64 hp_pairs = (a->CaHP * ca + a->MgHP * mg) * g22 * hpo4 + a->KHP * g2 * k * hpo4;   // count as HPO4--
+        f64 p_pairs = (a->CaP * ca + a->MgP * mg) * g23 * po4;                                // count as PO4---
+        f64 hc_pairs = (a->CaHC * ca + a->MgHC * mg) * g22 * co3 * aH / g1;                    // as HCO3-
+        f64 c_pairs = (a->CaC * ca + a->MgC * mg) * g22 * co3;                                 // as CO3--
+        return hco3 + hc_pairs + 2.0 * (co3 + c_pairs) + oh + hpo4 + hp_pairs + 2.0 * (po4 + p_pairs) + nh3 - h - h3po4;
+    }
+    return nft_alk_species(a, pH, pCO2_atm, PT, NT);
+}
+
 internal f64 nft_alk_species(const NftAcidBase *a, f64 pH, f64 pCO2_atm, f64 PT, f64 NT) {
     f64 aH = pow(10.0, -pH);
     f64 co2 = a->K0 * pCO2_atm;
@@ -191,6 +258,7 @@ struct NftWaterChem {
     f64 TA_meq;        // total alkalinity, meq/L
     f64 I;             // ionic strength, mol/L
     f64 PT, NT;        // total phosphate / ammonium, mol/L
+    NftPairs pr;       // pair-forming totals
 };
 
 // From the ion concentrations (mg/L, NftField order) and the untracked charge R (meq/L).
@@ -209,19 +277,23 @@ internal NftWaterChem nft_water_chem(const f64 *c, f64 R_meq) {
     w.I = I;
     w.PT = Maximum(c[NftF_P], 0.0) / 30974.0;
     w.NT = Maximum(c[NftF_NH4], 0.0) / 14007.0;
+    w.pr.Ca = Maximum(c[NftF_Ca], 0.0) / 40078.0;
+    w.pr.Mg = Maximum(c[NftF_Mg], 0.0) / 24305.0;
+    w.pr.K = Maximum(c[NftF_K], 0.0) / 39098.0;
+    w.pr.S = Maximum(c[NftF_S], 0.0) / 32065.0;
     return w;
 }
 
 // pH from TA: the species alkalinity rises monotonically with pH, so Newton on
 // a [0, 14] bracket with bisection fallback converges to 1e-10 in ~6 steps.
-internal f64 nft_solve_ph(const NftAcidBase *a, f64 TA_mol, f64 pCO2_atm, f64 PT, f64 NT, f64 guess) {
+internal f64 nft_solve_ph(const NftAcidBase *a, f64 TA_mol, f64 pCO2_atm, f64 PT, f64 NT, f64 guess, const NftPairs *pr = 0) {
     f64 lo = 0.0, hi = 14.0;
     f64 x = guess > lo && guess < hi ? guess : 6.0;
     for (u32 it = 0; it < 80; ++it) {
-        f64 f = nft_alk_species(a, x, pCO2_atm, PT, NT) - TA_mol;
+        f64 f = nft_alk_species(a, x, pCO2_atm, PT, NT, pr) - TA_mol;
         if (f > 0.0) hi = x; else lo = x;
         if (hi - lo < 1e-10) break;
-        f64 d = (nft_alk_species(a, x + 1e-6, pCO2_atm, PT, NT) - TA_mol - f) * 1e6;
+        f64 d = (nft_alk_species(a, x + 1e-6, pCO2_atm, PT, NT, pr) - TA_mol - f) * 1e6;
         f64 xn = d > 0.0 ? x - f / d : 0.5 * (lo + hi);
         if (!(xn > lo && xn < hi)) xn = 0.5 * (lo + hi);
         if (fabs(xn - x) < 1e-11) { x = xn; break; }
@@ -233,5 +305,5 @@ internal f64 nft_solve_ph(const NftAcidBase *a, f64 TA_mol, f64 pCO2_atm, f64 PT
 internal f64 nft_ph(const f64 *c, f64 T_C, f64 R_meq, f64 pCO2_atm, f64 guess) {
     NftWaterChem w = nft_water_chem(c, R_meq);
     NftAcidBase a = nft_acid_base(T_C, w.I);
-    return nft_solve_ph(&a, w.TA_meq * 1e-3, pCO2_atm, w.PT, w.NT, guess);
+    return nft_solve_ph(&a, w.TA_meq * 1e-3, pCO2_atm, w.PT, w.NT, guess, &w.pr);
 }

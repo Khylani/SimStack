@@ -771,7 +771,7 @@ internal void nft_ph_control(NftSystem *s, f64 dt, b32 makeup) {
     for (u32 k = 0; k < NftF_Count; ++k) c[k] = nft_reservoir_conc(s, k);
     NftWaterChem w = nft_water_chem(c, nft_R_conc(s));
     NftAcidBase ab = nft_acid_base(r->T_C, w.I);
-    f64 ta_set = nft_alk_species(&ab, p->ph_set, nft_pco2_atm(p), w.PT, w.NT) * 1e3;   // meq/L
+    f64 ta_set = nft_alk_species(&ab, p->ph_set, nft_pco2_atm(p), w.PT, w.NT, &w.pr) * 1e3;   // meq/L
     f64 need = (w.TA_meq - ta_set) * r->V_L;           // meq of acid (> 0) or base (< 0)
     f64 cap = makeup ? 1e30 : (f64)p->acid_mmol_per_h_max / 3600.0 * dt;
     f64 mmol = Minimum(fabs(need), cap);
